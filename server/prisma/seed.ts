@@ -1,0 +1,245 @@
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+import { BUILTIN_METHODS } from '../src/lib/costing';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  console.log('Seeding Saraswati ERP...');
+
+  // --- Users ---------------------------------------------------------------
+  const passwordHash = await bcrypt.hash('admin123', 10);
+  const admin = await prisma.user.upsert({
+    where: { email: 'admin@saraswati.local' },
+    update: {},
+    create: { name: 'Administrator', email: 'admin@saraswati.local', role: 'Admin', passwordHash },
+  });
+  await prisma.user.upsert({
+    where: { email: 'manager@saraswati.local' },
+    update: {},
+    create: { name: 'Production Manager', email: 'manager@saraswati.local', role: 'Manager', passwordHash: await bcrypt.hash('manager123', 10) },
+  });
+
+  // --- Currencies ----------------------------------------------------------
+  const currencies = [
+    { code: 'INR', name: 'Indian Rupee', symbol: '₹', rateToBase: 1, isBase: true },
+    { code: 'USD', name: 'US Dollar', symbol: '$', rateToBase: 83, isBase: false },
+    { code: 'EUR', name: 'Euro', symbol: '€', rateToBase: 90, isBase: false },
+  ];
+  for (const c of currencies) {
+    await prisma.currency.upsert({ where: { code: c.code }, update: { name: c.name, symbol: c.symbol, rateToBase: c.rateToBase, isBase: c.isBase }, create: c });
+  }
+  const inr = await prisma.currency.findUnique({ where: { code: 'INR' } });
+
+  // --- Cost methods (formulas) --------------------------------------------
+  for (const m of BUILTIN_METHODS) {
+    await prisma.costMethod.upsert({
+      where: { code: m.code },
+      update: { ...m, isBuiltIn: true },
+      create: { ...m, isBuiltIn: true },
+    });
+  }
+
+  // --- Units ---------------------------------------------------------------
+  const units = [
+    ['PCS', 'Pieces'], ['SET', 'Set'], ['KGS', 'Kilograms'], ['CFT', 'Cubic Feet'],
+    ['SQFT', 'Square Feet'], ['SQM', 'Square Metre'], ['MTR', 'Metre'], ['LTR', 'Litre'], ['LOT', 'Lot'],
+  ];
+  for (let i = 0; i < units.length; i++) {
+    const [code, name] = units[i];
+    await prisma.unit.upsert({ where: { code }, update: { name, sortOrder: i }, create: { code, name, sortOrder: i } });
+  }
+
+  // --- Attribute master lists ---------------------------------------------
+  const attributes: Record<string, string[]> = {
+    PRODUCT_TYPE: ['Almirah', 'Cabinet', 'Side Table', 'Dining Table', 'Chair', 'Bar Stool', 'Bench', 'Bookshelf'],
+    ITEM_TYPE: ['Finished Furniture', 'Knock-Down (KD)', 'Hardware Fitting'],
+    SIZE: ['Small', 'Medium', 'Large', 'XL'],
+    COLOUR: ['Natural', 'Walnut', 'Distressed White', 'Black', 'Honey'],
+    MATERIAL: ['Mango Wood', 'Oak Wood', 'Sheesham', 'Iron', 'Ply', 'Glass'],
+    FINISH: ['Matt', 'Glossy', 'Distressed', 'Powder Coated', 'Natural Wax'],
+  };
+  const attrId: Record<string, Record<string, number>> = {};
+  for (const [type, values] of Object.entries(attributes)) {
+    attrId[type] = {};
+    for (let i = 0; i < values.length; i++) {
+      const value = values[i];
+      const rec = await prisma.attributeValue.upsert({
+        where: { type_value: { type, value } },
+        update: { sortOrder: i },
+        create: { type, value, sortOrder: i },
+      });
+      attrId[type][value] = rec.id;
+    }
+  }
+
+  // --- Buyers --------------------------------------------------------------
+  const buyerDefs = [
+    { code: 'AB', name: 'Ashford & Barnes Ltd.', country: 'United Kingdom', contactName: 'James Ashford', email: 'buying@ashfordbarnes.co.uk' },
+    { code: 'HG', name: 'Heritage Home Goods', country: 'USA', contactName: 'Laura Chen', email: 'purchasing@heritagehome.com' },
+  ];
+  const buyerId: Record<string, number> = {};
+  for (const b of buyerDefs) {
+    const rec = await prisma.buyer.upsert({ where: { code: b.code }, update: b, create: b });
+    buyerId[b.code] = rec.id;
+  }
+
+  // --- Example product: CRAZY ALMIRAH (matches example.xlsx) ---------------
+  await prisma.product.deleteMany({ where: { factoryCode: 'AB-00123' } });
+
+  const L = (
+    name: string,
+    opts: Partial<{ qty: number; wastagePct: number; actualL: number; actualW: number; actualH: number; costL: number; costW: number; costH: number; actualWeight: number; unit: string; rate: number }>
+  ) => ({ name, qty: 1, wastagePct: 0, ...opts });
+
+  await prisma.product.create({
+    data: {
+      factoryCode: 'AB-00123',
+      name: 'Crazy Almirah',
+      alias: 'Crazy Almirah 2-Door',
+      status: 'Active',
+      description: 'Two-door mango & oak wood almirah with iron legs, glass door panel and powder-coated fittings.',
+      productTypeId: attrId.PRODUCT_TYPE['Almirah'],
+      itemTypeId: attrId.ITEM_TYPE['Knock-Down (KD)'],
+      sizeId: attrId.SIZE['Large'],
+      colourId: attrId.COLOUR['Distressed White'],
+      materialId: attrId.MATERIAL['Mango Wood'],
+      finishId: attrId.FINISH['Distressed'],
+      unitId: (await prisma.unit.findUnique({ where: { code: 'PCS' } }))!.id,
+      prodLengthIn: 36, prodWidthIn: 20, prodHeightIn: 72,
+      netWeightKg: 58, grossWeightKg: 66,
+      packLengthIn: 40, packWidthIn: 24, packHeightIn: 76, piecesPerCarton: 1,
+      volumeBeforePackingCbm: 0.68, volumeAfterPackingCbm: 0.96,
+      createdById: admin.id,
+      buyers: { create: [{ buyerId: buyerId['AB'], buyerCode: 'AB-00123' }] },
+      costSheets: {
+        create: [
+          {
+            version: 1,
+            isActive: true,
+            currencyId: inr!.id,
+            factoryExpensePct: 15,
+            marginPct: 15,
+            groups: {
+              create: [
+                {
+                  head: 'MAIN_COMPONENT', name: 'Mango Wood', method: 'CFT', dimUnit: 'IN', sortOrder: 0,
+                  lines: {
+                    create: [
+                      L('TOP', { actualL: 25, actualW: 32, actualH: 1, costL: 27, costW: 38.4, costH: 1, qty: 1, wastagePct: 20, rate: 560, unit: 'CFT' }),
+                      L('SIDE', { actualL: 59, actualW: 15, actualH: 1, costL: 63, costW: 18, costH: 1, qty: 2, wastagePct: 20, rate: 760, unit: 'CFT' }),
+                      L('PARTITION', { actualL: 56, actualW: 16, actualH: 1, costL: 60, costW: 19.2, costH: 1, qty: 1, wastagePct: 20, rate: 760, unit: 'CFT' }),
+                      L('SHELF', { actualL: 14, actualW: 17, actualH: 1, costL: 18, costW: 20.4, costH: 1, qty: 4, wastagePct: 20, rate: 560, unit: 'CFT' }),
+                      L('BOTTOM', { actualL: 24, actualW: 16, actualH: 1, costL: 27, costW: 19.2, costH: 1, qty: 1, wastagePct: 20, rate: 560, unit: 'CFT' }),
+                      L('DOOR FRAME', { actualL: 56, actualW: 13, actualH: 1.5, costL: 60, costW: 15.6, costH: 1.5, qty: 1, wastagePct: 20, rate: 760, unit: 'CFT' }),
+                    ],
+                  },
+                },
+                {
+                  head: 'MAIN_COMPONENT', name: 'Oak Wood', method: 'SQFT', dimUnit: 'IN', sortOrder: 1,
+                  lines: { create: [L('DOOR PANEL', { actualL: 34, actualW: 16, costL: 36, costW: 19.2, qty: 1, wastagePct: 20, rate: 490, unit: 'SQFT' })] },
+                },
+                {
+                  head: 'SUB_COMPONENT', name: 'Iron — Powdercoated Fitting', method: 'WEIGHT', sortOrder: 0,
+                  lines: { create: [L('PWDRFTG/133', { actualWeight: 14.38, wastagePct: 4.31, qty: 1, rate: 182, unit: 'KGS' })] },
+                },
+                {
+                  head: 'SUB_COMPONENT', name: 'Iron — Powdercoated Legs', method: 'QTY', sortOrder: 1,
+                  lines: { create: [L('PWDRCTDLGS/1452', { qty: 1, rate: 1200, unit: 'PCS' })] },
+                },
+                {
+                  head: 'SUB_COMPONENT', name: 'Ply 6mm', method: 'SQFT', dimUnit: 'IN', sortOrder: 2,
+                  lines: {
+                    create: [
+                      L('BACK PLY', { actualL: 18, actualW: 32, costL: 18, costW: 32, qty: 2, rate: 30, unit: 'SQFT' }),
+                      L('BOTTOM PLY', { actualL: 19, actualW: 12, costL: 19, costW: 12, qty: 5, rate: 30, unit: 'SQFT' }),
+                    ],
+                  },
+                },
+                {
+                  head: 'SUB_COMPONENT', name: 'Ply 8mm', method: 'SQMT', dimUnit: 'CM', sortOrder: 3,
+                  lines: { create: [L('BOTTOM SUPPORT', { actualL: 42, actualW: 30, costL: 42, costW: 30, qty: 1, rate: 960, unit: 'SQM' })] },
+                },
+                {
+                  head: 'SUB_COMPONENT', name: 'Glass 4mm', method: 'SQFT', dimUnit: 'IN', sortOrder: 4,
+                  lines: { create: [L('DOOR GLASS', { actualL: 12, actualW: 18, costL: 12, costW: 18, qty: 1, rate: 130, unit: 'SQFT' })] },
+                },
+                {
+                  head: 'HARDWARE', name: 'Hardware', method: 'QTY', sortOrder: 0,
+                  lines: {
+                    create: [
+                      L("11' HANDLE", { qty: 2, rate: 63, unit: 'PCS' }),
+                      L("1.5' SCREW", { qty: 30, rate: 0.82, unit: 'PCS' }),
+                      L('F35 NAILS', { qty: 2, rate: 50, unit: 'SET' }),
+                      L("2' BRASS KNOB", { qty: 1, rate: 112, unit: 'PCS' }),
+                      L('60N PAPER', { qty: 3, rate: 58, unit: 'PCS' }),
+                      L('120N PAPER', { qty: 3, rate: 39, unit: 'PCS' }),
+                      L("10' CHAIN", { qty: 1, rate: 12, unit: 'PCS' }),
+                    ],
+                  },
+                },
+                {
+                  head: 'POLISHING', name: 'Polishing', method: 'QTY', sortOrder: 0,
+                  lines: {
+                    create: [
+                      L('THINNER', { qty: 2, rate: 25, unit: 'LTR' }),
+                      L('SEALER', { qty: 2, rate: 28, unit: 'LTR' }),
+                      L('LACQUER', { qty: 2, rate: 30, unit: 'LTR' }),
+                      L('ROUGH CLOTH', { qty: 2, rate: 7, unit: 'PCS' }),
+                      L('SANDING PAPER', { qty: 1.5, rate: 80, unit: 'PCS' }),
+                    ],
+                  },
+                },
+                {
+                  head: 'PACKAGING', name: 'Packaging', method: 'QTY', sortOrder: 0,
+                  lines: {
+                    create: [
+                      L('BUBBLE', { qty: 0.88, rate: 230, unit: 'MTR' }),
+                      L('FOAM', { qty: 0.78, rate: 210, unit: 'MTR' }),
+                      L('CARTON 7PLY', { qty: 1, rate: 580, unit: 'PCS' }),
+                      L('CORNERS', { qty: 8, rate: 2.8, unit: 'PCS' }),
+                    ],
+                  },
+                },
+                {
+                  head: 'LABOUR', name: 'Labour', method: 'QTY', sortOrder: 0,
+                  lines: {
+                    create: [
+                      L('CNC LABOUR', { qty: 1, rate: 100, unit: 'LOT' }),
+                      L('CARVING LABOUR', { qty: 1, rate: 260, unit: 'LOT' }),
+                      L('MANUFACTURING LABOUR', { qty: 1, rate: 500, unit: 'LOT' }),
+                      L('POLISHING LABOUR', { qty: 1, rate: 428, unit: 'LOT' }),
+                      L('PACKAGING LABOUR', { qty: 1, rate: 180, unit: 'LOT' }),
+                      L('LOADING LABOUR', { qty: 1, rate: 110, unit: 'LOT' }),
+                    ],
+                  },
+                },
+                {
+                  head: 'FORWARDING', name: 'Forwarding', method: 'QTY', sortOrder: 0,
+                  lines: {
+                    create: [
+                      L('CHA', { qty: 1, rate: 98, unit: 'LOT' }),
+                      L('FORWARDER', { qty: 1, rate: 580, unit: 'LOT' }),
+                      L('ICD', { qty: 1, rate: 136, unit: 'LOT' }),
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  });
+
+  console.log('Seed complete.');
+  console.log('  Admin login : admin@saraswati.local / admin123');
+  console.log('  Manager login: manager@saraswati.local / manager123');
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(() => prisma.$disconnect());

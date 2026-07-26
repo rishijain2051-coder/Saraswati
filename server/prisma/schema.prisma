@@ -1,0 +1,287 @@
+// Saraswati Export ERP — Prisma schema (Phase 1: Product Management)
+// Provider is SQLite for local use. To scale later, change provider to
+// "postgresql" and the DATABASE_URL — the models below are portable.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users & access
+// ---------------------------------------------------------------------------
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         String   @default("Operator") // Admin | Manager | Operator | Viewer
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  productsCreated Product[] @relation("ProductCreatedBy")
+}
+
+// ---------------------------------------------------------------------------
+// Master data
+// ---------------------------------------------------------------------------
+
+model Currency {
+  id         Int      @id @default(autoincrement())
+  code       String   @unique // INR, USD, EUR
+  name       String
+  symbol     String   @default("")
+  // 1 unit of THIS currency = rateToBase units of the base currency (INR).
+  rateToBase Float    @default(1)
+  isBase     Boolean  @default(false)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  costSheets CostSheet[]
+}
+
+model Unit {
+  id        Int     @id @default(autoincrement())
+  code      String  @unique // PCS, SET, KGS, CFT, SQFT, SQM, MTR, LTR
+  name      String
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  products Product[]
+}
+
+/// Generic managed list powering product classification + filters.
+/// `type` groups values: PRODUCT_TYPE | SIZE | COLOUR | MATERIAL | FINISH | ITEM_TYPE
+model AttributeValue {
+  id        Int      @id @default(autoincrement())
+  type      String
+  value     String
+  code      String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  productsItemType Product[] @relation("ProductItemType")
+  productsType     Product[] @relation("ProductType")
+  productsSize     Product[] @relation("ProductSize")
+  productsColour   Product[] @relation("ProductColour")
+  productsMaterial Product[] @relation("ProductMaterial")
+  productsFinish   Product[] @relation("ProductFinish")
+
+  @@unique([type, value])
+}
+
+model Buyer {
+  id          Int      @id @default(autoincrement())
+  code        String   @unique
+  name        String
+  country     String?
+  contactName String?
+  email       String?
+  phone       String?
+  address     String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  products ProductBuyer[]
+}
+
+// ---------------------------------------------------------------------------
+// Product
+// ---------------------------------------------------------------------------
+
+model Product {
+  id          Int     @id @default(autoincrement())
+  factoryCode String  @unique
+  name        String // item description / name
+  alias       String?
+  status      String  @default("Draft") // Draft | Active | Discontinued
+  description String?
+  notes       String?
+
+  // classification (master-list relations)
+  itemTypeId    Int?
+  productTypeId Int?
+  sizeId        Int?
+  colourId      Int?
+  materialId    Int?
+  finishId      Int?
+  unitId        Int?
+
+  // physical — assembled product (inches)
+  prodLengthIn  Float?
+  prodWidthIn   Float?
+  prodHeightIn  Float?
+  netWeightKg   Float?
+  grossWeightKg Float?
+
+  // physical — packed / carton (inches)
+  packLengthIn    Float?
+  packWidthIn     Float?
+  packHeightIn    Float?
+  piecesPerCarton Int?
+
+  // differentiated volumes (CBM) — before vs after packing
+  volumeBeforePackingCbm Float?
+  volumeAfterPackingCbm  Float?
+
+  createdById Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  itemType    AttributeValue? @relation("ProductItemType", fields: [itemTypeId], references: [id])
+  productType AttributeValue? @relation("ProductType", fields: [productTypeId], references: [id])
+  size        AttributeValue? @relation("ProductSize", fields: [sizeId], references: [id])
+  colour      AttributeValue? @relation("ProductColour", fields: [colourId], references: [id])
+  material    AttributeValue? @relation("ProductMaterial", fields: [materialId], references: [id])
+  finish      AttributeValue? @relation("ProductFinish", fields: [finishId], references: [id])
+  unit        Unit?           @relation(fields: [unitId], references: [id])
+  createdBy   User?           @relation("ProductCreatedBy", fields: [createdById], references: [id])
+
+  buyers      ProductBuyer[]
+  costSheets  CostSheet[]
+  images      ProductImage[]
+  relatedFrom RelatedProduct[] @relation("RelatedFrom")
+  relatedTo   RelatedProduct[] @relation("RelatedTo")
+
+  @@index([productTypeId])
+  @@index([status])
+}
+
+model ProductBuyer {
+  id        Int     @id @default(autoincrement())
+  productId Int
+  buyerId   Int
+  buyerCode String? // buyer's own article/style code for THIS product
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  buyer   Buyer   @relation(fields: [buyerId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, buyerId])
+}
+
+model RelatedProduct {
+  id        Int     @id @default(autoincrement())
+  productId Int
+  relatedId Int
+  relation  String // VARIANT | PART | ACCESSORY | SET
+  note      String?
+
+  product Product @relation("RelatedFrom", fields: [productId], references: [id], onDelete: Cascade)
+  related Product @relation("RelatedTo", fields: [relatedId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, relatedId, relation])
+}
+
+model ProductImage {
+  id           Int      @id @default(autoincrement())
+  productId    Int
+  filename     String
+  originalName String?
+  url          String
+  isPrimary    Boolean  @default(false)
+  caption      String?
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Costing engine
+//   CostSheet -> CostGroup (material group, defines measurement method)
+//             -> CostLine  (individual part / item)
+// Measures (CFT/SQFT/...) and amounts are COMPUTED by the API, not stored,
+// to avoid drift.
+// ---------------------------------------------------------------------------
+
+model CostSheet {
+  id                Int      @id @default(autoincrement())
+  productId         Int
+  version           Int      @default(1)
+  name              String?  @default("Costing")
+  isActive          Boolean  @default(true)
+  currencyId        Int?
+  factoryExpensePct Float    @default(15)
+  marginPct         Float    @default(15)
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  product  Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  currency Currency?   @relation(fields: [currencyId], references: [id])
+  groups   CostGroup[]
+
+  @@unique([productId, version])
+}
+
+/// A costing measurement method with a user-editable formula.
+/// Variables available to `expression`: L, W, H (costing dims), AL, AW, AH
+/// (actual dims), QTY, WASTAGE, WEIGHT. Measure = expression; amount = measure × rate.
+model CostMethod {
+  id          Int      @id @default(autoincrement())
+  code        String   @unique
+  label       String
+  measureUnit String   @default("UNIT")
+  expression  String   @default("QTY")
+  usesL       Boolean  @default(false)
+  usesW       Boolean  @default(false)
+  usesH       Boolean  @default(false)
+  usesWeight  Boolean  @default(false)
+  usesWastage Boolean  @default(true)
+  dimUnit     String? // IN | CM
+  isBuiltIn   Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model CostGroup {
+  id          Int     @id @default(autoincrement())
+  costSheetId Int
+  head        String // MAIN_COMPONENT | SUB_COMPONENT | HARDWARE | POLISHING | PACKAGING | LABOUR | FORWARDING
+  name        String // e.g. "Mango Wood", "Iron", "Ply 6mm"
+  method      String // CFT | SQFT | SQMT | WEIGHT | QTY | RFT
+  dimUnit     String? // input dim unit hint for area/volume methods: IN | CM
+  sortOrder   Int     @default(0)
+  notes       String?
+
+  costSheet CostSheet  @relation(fields: [costSheetId], references: [id], onDelete: Cascade)
+  lines     CostLine[]
+}
+
+model CostLine {
+  id         Int    @id @default(autoincrement())
+  groupId    Int
+  name       String
+  qty        Float  @default(1)
+  wastagePct Float  @default(0)
+
+  // actual dimensions (as measured)
+  actualL Float?
+  actualW Float?
+  actualH Float?
+
+  // costing dimensions (drive the measure; auto-suggested from actual+wastage, editable)
+  costL Float?
+  costW Float?
+  costH Float?
+
+  // weight method
+  actualWeight Float?
+
+  unit      String? // display unit for this line
+  rate      Float   @default(0) // cost per measure unit (per CFT / SQFT / kg / piece ...)
+  sortOrder Int     @default(0)
+
+  group CostGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+}

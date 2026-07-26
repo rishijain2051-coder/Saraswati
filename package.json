@@ -1,0 +1,21 @@
+{
+  "name": "saraswati-erp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ERP for Saraswati Export — Phase 1: Product Management",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "db:setup": "npm --workspace server run db:setup",
+    "dev": "concurrently -k -n SERVER,CLIENT -c blue,green \"npm --workspace server run dev\" \"npm --workspace client run dev\"",
+    "dev:server": "npm --workspace server run dev",
+    "dev:client": "npm --workspace client run dev",
+    "build": "npm --workspace server run build && npm --workspace client run build",
+    "start": "npm --workspace server run start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

@@ -1,0 +1,23 @@
+node_modules/
+dist/
+build/
+*.log
+
+# env
+.env
+server/.env
+
+# database
+*.db
+*.db-journal
+server/prisma/*.db
+server/prisma/*.db-journal
+
+# uploads (user data)
+server/uploads/*
+!server/uploads/.gitkeep
+
+# misc
+.DS_Store
+.vite/
+coverage/
