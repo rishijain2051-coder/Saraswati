@@ -13,6 +13,8 @@ import productsRoutes from './routes/products.routes';
 import opsSuppliersRoutes from './routes/ops.suppliers.routes';
 import opsOrdersRoutes from './routes/ops.orders.routes';
 import opsProductionRoutes from './routes/ops.production.routes';
+import manforceRoutes from './routes/manforce.routes';
+import suggestRoutes from './routes/suggest.routes';
 
 const app = express();
 
@@ -65,6 +67,8 @@ app.use('/api/products', authenticate, productsRoutes);
 app.use('/api', authenticate, opsSuppliersRoutes);
 app.use('/api', authenticate, opsOrdersRoutes);
 app.use('/api', authenticate, opsProductionRoutes);
+app.use('/api', authenticate, manforceRoutes);
+app.use('/api', authenticate, suggestRoutes);
 
 app.use(errorHandler);
 

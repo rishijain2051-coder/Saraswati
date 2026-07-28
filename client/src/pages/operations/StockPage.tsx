@@ -8,6 +8,7 @@ import dayjs from 'dayjs';
 import { api, apiError } from '../../api/client';
 import { useRawItems, useStockTxns, useSuppliers, type RawItem, type StockTxn } from '../../api/ops';
 import { num } from '../../util/format';
+import { RateHint } from '../../components/HistoryHint';
 
 const { Title, Text } = Typography;
 
@@ -33,6 +34,12 @@ export default function StockPage() {
   const [editItem, setEditItem] = useState<RawItem | null>(null);
 
   const [moveForm] = Form.useForm();
+  // Watched so the rate hint follows the item and supplier as they are picked.
+  const moveWatch = {
+    rawItemId: Form.useWatch('rawItemId', moveForm) as number | undefined,
+    supplierId: Form.useWatch('supplierId', moveForm) as number | undefined,
+    rate: Form.useWatch('rate', moveForm) as number | undefined,
+  };
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveType, setMoveType] = useState<'IN' | 'OUT'>('IN');
 
@@ -134,7 +141,27 @@ export default function StockPage() {
           </Row>
           {moveType === 'IN' ? (
             <Row gutter={12}>
-              <Col span={12}><Form.Item name="rate" label="Rate (₹/unit)"><InputNumber style={{ width: '100%' }} min={0} /></Form.Item></Col>
+              <Col span={12}>
+                <Form.Item
+                  name="rate"
+                  label="Rate (₹/unit)"
+                  /* What this supplier, then anyone, has billed for it before — and
+                     what it is costed at inside product sheets. */
+                  extra={
+                    <RateHint
+                      compact={false}
+                      kind="PURCHASE"
+                      rawItemId={moveWatch.rawItemId}
+                      supplierId={moveWatch.supplierId}
+                      value={moveWatch.rate}
+                      unitSuffix={`/${items?.find((i) => i.id === moveWatch.rawItemId)?.unit ?? 'unit'}`}
+                      onApply={(v) => moveForm.setFieldsValue({ rate: v })}
+                    />
+                  }
+                >
+                  <InputNumber style={{ width: '100%' }} min={0} />
+                </Form.Item>
+              </Col>
               <Col span={12}><Form.Item name="supplierId" label="Supplier"><Select allowClear options={(suppliers ?? []).map((s) => ({ label: s.name, value: s.id }))} /></Form.Item></Col>
             </Row>
           ) : (

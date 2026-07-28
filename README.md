@@ -2,17 +2,19 @@
 
 A modular ERP for **Saraswati Export**, a furniture and hardware exporter in Jodhpur.
 
-Two modules are live:
+Three modules are live:
 
 | Module | State |
 |---|---|
 | **Product Management** — products, multi-method costing, images | ✅ live |
 | **Operations** — proformas, orders, production board, accounting | ✅ live |
-| Manforce Management | planned |
+| **Manforce** — workers, muster roll, wages, advances, statutory dues | ✅ live |
 | Finished Product & Sales *(container planning)* | planned |
 
 Product data feeds Operations: a product's costing drives quoted prices and its
 material sheets, and its stage line drives how pieces travel the factory floor.
+Manforce closes the loop: a worker named on a stage hand-over earns for it, and what
+the workforce is owed joins the same payables view as vendors and suppliers.
 
 ## Tech stack
 
@@ -151,6 +153,106 @@ Every party — buyer, jobwork vendor, material supplier, worker — has a runni
 **statement** showing what created each charge, what settled it, and how each payment
 was split.
 
+## Manforce
+
+**Nobody is on a pay cycle.** The factory pays people when it pays them — a worker may
+draw an advance, or go two months without a payment — so a worker is a running
+**account**, exactly like a jobwork vendor. Earnings accrue as dated events, payments
+are ad-hoc for any amount on any date, and there is no period to close, so nothing can
+ever be late or half-run.
+
+**Nothing that can be worked out is typed in.** A worker's earnings are
+(working days x their rate) + (overtime hours x OT rate) + (pieces cleared x that
+stage's labour rate). No wage table, no balance column, no stored day count — which is
+why adding a festival to the holiday calendar, even a past one, corrects the money
+immediately instead of leaving a wrong number behind.
+
+**Attendance is exceptions-only.** Every active worker is presumed present on every
+working day; a row exists only to say otherwise, or to pay someone who came in on a
+day off. An untouched muster is already a full day's attendance. Which days count is
+the Admin's decision (weekly offs plus a holiday calendar), not a hard-coded rule.
+
+Three pay types coexist, one per worker: **daily wage** (rate x days present, plus
+overtime), **piece rate** (earned on the board, so attendance never pays them), and
+**monthly salary** (accrued pro-rata across the month's working days, never as a lump,
+so the balance is right mid-month too).
+
+**Who did the work is recorded on the hand-over.** A clearance out of an in-house
+stage may name workers with a piece count each, which must add up to the pieces that
+moved — so every rupee is attributable and the total still reconciles with the board's
+`cleared` figure. A clearance crossing several stages cannot say who did which, and is
+refused rather than guessed at. Rates come from the order's own stage
+(`OrderLineStage.labourRate`), defaulted from the product's LABOUR cost lines, which
+are reference only.
+
+**Contractors are paid, not their gangs.** A worker may belong to a labour contractor;
+their earnings then roll up into the contractor's balance with the per-worker
+breakdown behind it, and paying the worker directly is refused — otherwise the same
+wages would be owed twice.
+
+**Advances are recovered from earnings.** An advance is cash out with a monthly
+recovery cap; earnings absorb at most that much a month. Two figures come out, and
+their difference is exactly the advance still outstanding:
+
+```
+balance = earned - deductions - statutory - payments - advances   (the party balance)
+dueNow  = earned - deductions - statutory - payments - recovered  (cash due today)
+dueNow - advanceOutstanding === balance
+```
+
+A cap of zero means "absorb as fast as they earn", which makes an advance behave
+exactly like a payment that outran the wages. The identity above is asserted in
+`npm run verify`.
+
+**Statutory dues are data, and are incurred when you say so.** PF, ESI, professional
+tax and statutory bonus ship as *editable* components — employee %, employer %, what
+they apply to, contribution and eligibility ceilings — the same approach as the cost
+formulas, so a change in the law is an edit rather than a release. A period's liability
+is computed from the wages actually earned in it and shown as a preview; **nothing is
+owed to anyone until it is posted.** Posting deducts the employee share from each
+worker and raises the total as a payable; two postings may not overlap for the same
+levy. A component marked as a *provision* accrues as a cost but is never counted as a
+debt.
+
+Workers, contractors and statutory levies appear in the same **payables** view and
+dashboard total as vendors and suppliers, each with a running statement.
+
+## What the app remembers
+
+Beside a rate, a price or a wage, the app shows what it was **last time** — and where
+that figure came from.
+
+Ask about `CARVING LABOUR` and it answers with more than one fact, because more than one
+is relevant:
+
+- **Costed before** — the same line in other products, with the product and the date.
+- **A supplier billed** — for a material line, what was actually paid for that item, so
+  the gap between the costed ₹560/CFT and the real ₹612/CFT is visible at the moment you
+  are typing.
+- **Vendors charged / in-house piece rate** — for a labour line mapped to a production
+  stage, what that stage has really paid out.
+- **This buyer paid** — on a proforma or order line, what they last paid for the product,
+  then every buyer's range, always in the same currency.
+
+Each source is shown separately and never averaged together, because they are different
+facts. One click fills the field in.
+
+**Nothing is stored to make this work.** Every figure is read from the live records when
+asked, so a correction to the original shows up immediately and there is no second copy
+to go stale. Names are matched ignoring case and spacing, so `CARVING LABOUR` and
+`Carving Labour` are one item. History reaches back a year by default — Master Data →
+**Memory** sets the window.
+
+**A figure well out of line gets a quiet amber note** — "917% above the average of 9 past
+uses" — never a block. It only appears once there are at least two past uses to compare
+with, so it does not cry wolf on a new item. The tolerance is 25% by default.
+
+**Separately, every change to a rate, price or wage is recorded** — who changed it, what
+it was before, and when — on the **History** tab of the product, order or worker it
+belongs to. That is the one thing the suggestions cannot tell you, because an edit
+overwrites the old value. Only figures are logged, so the list stays readable; a save
+that changed nothing records nothing.
+
 ## Project layout
 
 ```
@@ -158,25 +260,33 @@ server/
   prisma/schema.prisma     data model
   prisma/seed.ts           masters + the example.xlsx product
   prisma/demoSeed.ts       the worked demo (npm run db:demo)
+  prisma/manforceSeed.ts   trades, levies + the migration off typed wage names
   prisma/verify.ts         self-checks (npm run verify)
   src/lib/costing.ts       costing engine  (mirrored in client/src/util)
   src/lib/production.ts    the board: movement ledger -> buckets
   src/lib/finance.ts       FIFO allocation, jobwork events, statements
+  src/lib/workforce.ts     attendance -> wages, piece work, advances, statutory
+  src/lib/manforce.ts      loads the above into positions and statements
+  src/lib/suggest.ts       "what did we use last time" — derived, never stored
+  src/lib/changeLog.ts     who changed which figure, and what it was
   src/lib/docPdf.ts        proforma PDF
   src/lib/mailDraft.ts     .eml draft with attachment
 client/
   src/pages/operations/    proformas, orders, board, payments, statements
   src/pages/product/       catalogue, details, wizard
-server/uploads/            product images + hand-over photos (git-ignored)
+  src/pages/manforce/      workers, muster roll, wages, statutory
+  src/components/HistoryHint.tsx   the "last time" marker beside a figure
+server/uploads/            product images, hand-over photos, worker documents (git-ignored)
 ```
 
 ## Scripts
 
 ```bash
 npm run dev              # both apps
-npm run verify           # costing, board and allocation self-checks
+npm run verify           # costing, board, allocation and workforce self-checks
 npm run db:setup         # push schema + seed masters
 npm run db:demo          # load the worked demo
+npm run db:workers       # turn typed wage names into worker records (idempotent)
 npm run build            # type-check + build both apps
 npm --workspace server run db:studio   # browse the database
 ```
@@ -215,8 +325,15 @@ Copy `server/.env.example` to `server/.env` before deploying.
 - **Stock is deliberately decoupled from production.** Material sheets say what a job
   needs, but issuing pieces does not consume raw material; stock movements are
   recorded separately. Reconciling the two is not yet automatic.
-- **Wages are recorded against a typed worker name** until the Manforce module lands,
-  so a spelling change starts a new account.
+- **Wages recorded before Manforce stay against a typed name** until `npm run db:workers`
+  turns them into worker records. Such a worker's `accrualFrom` is set to the day after
+  their last hand-typed entry, so the engine never invents presumed-present days for a
+  period that was already paid by hand.
+- **In-house labour is not attributed to an order's cost.** Worker money is a
+  factory-level account by design; the board records who did the work, but the cost per
+  order still counts only jobwork and material.
+- **A bulk stage clearance names nobody**, so it accrues no piece wages. Use a single
+  bucket on the board to record who did the work.
 - **Receivables convert at the rate snapshotted on the order**, not today's rate.
 - **Money is stored as `Float`** and rounded at every boundary by a shared `round()`
   helper (mirrored on the client, asserted in `npm run verify`). Exact decimal storage

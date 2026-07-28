@@ -8,12 +8,20 @@ import type { ColumnsType } from 'antd/es/table';
 import { api, apiError } from '../../api/client';
 import { OPS_KEYS, useFinanceParties, useFinanceSummary, useOrders, usePayables, usePayments, useReceivables, useSuppliers, type AllocatedPayment, type LedgerEntry, type Payable, type PartyRow, type Receivable } from '../../api/ops';
 import { useBuyers } from '../../api/hooks';
+import { useContractors, useStatutoryComponents, useWorkers } from '../../api/manforce';
 import { useAuth } from '../../auth/AuthContext';
 import { money } from '../../util/format';
 
 const { Title, Text } = Typography;
-const PARTY_COLOR: Record<string, string> = { SUPPLIER: 'brown', JOBWORK: 'volcano', BUYER: 'green', WORKER: 'blue' };
-const PARTY_LABEL: Record<string, string> = { SUPPLIER: 'Material supplier', JOBWORK: 'Jobwork vendor', BUYER: 'Buyer', WORKER: 'Worker' };
+const PARTY_COLOR: Record<string, string> = { SUPPLIER: 'brown', JOBWORK: 'volcano', BUYER: 'green', WORKER: 'blue', CONTRACTOR: 'geekblue', STATUTORY: 'purple' };
+const PARTY_LABEL: Record<string, string> = {
+  SUPPLIER: 'Material supplier',
+  JOBWORK: 'Jobwork vendor',
+  BUYER: 'Buyer',
+  WORKER: 'Worker',
+  CONTRACTOR: 'Labour contractor',
+  STATUTORY: 'Statutory levy',
+};
 
 /**
  * Money, worked out rather than typed in.
@@ -35,6 +43,9 @@ export default function PaymentsPage() {
   const { data: suppliers } = useSuppliers();
   const { data: buyers } = useBuyers();
   const { data: orders } = useOrders();
+  const { data: workers } = useWorkers({ active: '1' });
+  const { data: contractors } = useContractors();
+  const { data: components } = useStatutoryComponents();
   const [form] = Form.useForm();
   const [open, setOpen] = useState(false);
   const [ptype, setPtype] = useState('BUYER');
@@ -47,13 +58,25 @@ export default function PaymentsPage() {
     mutationFn: (v: any) => {
       const supplierId = ['SUPPLIER', 'JOBWORK'].includes(v.partyType) ? v.partyRef : null;
       const buyerId = v.partyType === 'BUYER' ? v.partyRef : null;
+      const workerId = v.partyType === 'WORKER' ? v.partyRef ?? null : null;
+      const contractorId = v.partyType === 'CONTRACTOR' ? v.partyRef ?? null : null;
+      const statutoryComponentId = v.partyType === 'STATUTORY' ? v.partyRef ?? null : null;
       let partyName = v.partyName;
       if (supplierId) partyName = suppliers?.find((s) => s.id === supplierId)?.name ?? partyName;
       if (buyerId) partyName = buyers?.find((b) => b.id === buyerId)?.name ?? partyName;
+      if (workerId) partyName = workers?.find((w) => w.id === workerId)?.name ?? partyName;
+      if (contractorId) partyName = contractors?.find((c) => c.id === contractorId)?.name ?? partyName;
+      if (statutoryComponentId) {
+        const c = components?.find((x) => x.id === statutoryComponentId);
+        partyName = c ? c.payeeName || c.code : partyName;
+      }
       return api.post('/payments', {
         partyType: v.partyType,
         supplierId,
         buyerId,
+        workerId,
+        contractorId,
+        statutoryComponentId,
         orderId: v.orderId ?? null,
         partyName,
         kind: v.kind,
@@ -145,28 +168,75 @@ export default function PaymentsPage() {
 
   const payableCols: ColumnsType<Payable> = [
     { title: 'Type', dataIndex: 'partyType', width: 150, render: (t) => <Tag color={PARTY_COLOR[t]}>{PARTY_LABEL[t] ?? t}</Tag> },
-    { title: 'Party', dataIndex: 'partyName' },
+    {
+      title: 'Party',
+      dataIndex: 'partyName',
+      render: (v, r) => (
+        <span>
+          {v}
+          {r.unlinked && (
+            <Tooltip title="A wage account still recorded against a typed name. Run npm run db:workers to turn it into a real worker record.">
+              <Tag color="orange" style={{ marginLeft: 6 }}>
+                not linked
+              </Tag>
+            </Tooltip>
+          )}
+          {r.isProvision && (
+            <Tooltip title="A provision: accrued as a cost, but not owed to anyone until it is declared.">
+              <Tag style={{ marginLeft: 6 }}>provision</Tag>
+            </Tooltip>
+          )}
+        </span>
+      ),
+    },
     {
       title: 'Owed',
       dataIndex: 'accrued',
       align: 'right',
       width: 130,
       render: (v, r) => (
-        <Tooltip title={r.partyType === 'JOBWORK' ? `${r.pieces} pc(s) cleared across ${r.jobs.length} job(s)` : undefined}>
+        <Tooltip
+          title={
+            r.partyType === 'JOBWORK'
+              ? `${r.pieces} pc(s) cleared across ${r.jobs.length} job(s)`
+              : r.partyType === 'WORKER'
+                ? `Earned from attendance and the board across ${r.events} entry/entries`
+                : r.partyType === 'CONTRACTOR'
+                  ? `Earned by ${r.events} worker(s) in the gang`
+                  : undefined
+          }
+        >
           <span>{money(v, '₹')}</span>
         </Tooltip>
       ),
     },
     { title: 'Paid', dataIndex: 'paid', align: 'right', width: 130, render: (v) => <span style={{ color: '#389e0d' }}>{money(v, '₹')}</span> },
-    { title: 'Balance', dataIndex: 'balance', align: 'right', width: 130, render: (v) => <b style={{ color: v > 0 ? '#cf1322' : '#999' }}>{money(v, '₹')}</b> },
+    {
+      title: 'Balance',
+      dataIndex: 'balance',
+      align: 'right',
+      width: 160,
+      render: (v, r) => (
+        <span>
+          <b style={{ color: v > 0 ? '#cf1322' : v < 0 ? '#1677ff' : '#999' }}>{money(v, '₹')}</b>
+          {(r.advanceOutstanding ?? 0) > 0 && (
+            <Tooltip title="Advance handed over that their earnings have not yet absorbed. Due now is the balance plus this.">
+              <Tag color="volcano" style={{ marginLeft: 6 }}>
+                adv {money(r.advanceOutstanding!, '₹', 0)}
+              </Tag>
+            </Tooltip>
+          )}
+        </span>
+      ),
+    },
     {
       title: '',
       key: 'a',
       width: 180,
       render: (_: unknown, r: Payable) => (
         <Space>
-          {hasRole('Manager') && (
-            <Button size="small" onClick={() => openForm(r.partyType, 'PAYMENT', undefined, r.supplierId ?? undefined, r.partyName)}>
+          {hasRole('Manager') && !r.unlinked && (
+            <Button size="small" onClick={() => openForm(r.partyType, 'PAYMENT', undefined, r.partyId ?? undefined, r.partyName)}>
               Pay
             </Button>
           )}
@@ -175,8 +245,8 @@ export default function PaymentsPage() {
             type="link"
             onClick={() =>
               navigate(
-                r.supplierId != null
-                  ? `/operations/payments/${r.partyType.toLowerCase()}/${r.supplierId}`
+                r.partyId != null
+                  ? `/operations/payments/${r.partyType.toLowerCase()}/${r.partyId}`
                   : `/operations/payments/${r.partyType.toLowerCase()}/by-name?name=${encodeURIComponent(r.partyName)}`
               )
             }
@@ -217,7 +287,14 @@ export default function PaymentsPage() {
     ? (suppliers ?? []).filter((s) => (ptype === 'JOBWORK' ? s.type !== 'MATERIAL' : s.type !== 'JOBWORK')).map((s) => ({ label: `${s.code} · ${s.name}`, value: s.id }))
     : ptype === 'BUYER'
       ? (buyers ?? []).map((b) => ({ label: `${b.code} · ${b.name}`, value: b.id }))
-      : [];
+      : ptype === 'WORKER'
+        ? // A gang member is paid through their contractor, so they are not offered here.
+          (workers ?? []).filter((w) => !w.contractorId).map((w) => ({ label: `${w.code} · ${w.name}`, value: w.id }))
+        : ptype === 'CONTRACTOR'
+          ? (contractors ?? []).map((c) => ({ label: `${c.code} · ${c.name}`, value: c.id }))
+          : ptype === 'STATUTORY'
+            ? (components ?? []).filter((c) => !c.isProvision).map((c) => ({ label: `${c.code} · ${c.payeeName || c.name}`, value: c.id }))
+            : [];
 
   const orderOptions = (orders ?? []).filter((o) => o.status !== 'Cancelled').map((o) => ({ label: `${o.number} — ${o.buyer.name} (${o.currency?.code ?? 'INR'})`, value: o.id }));
 
@@ -532,15 +609,20 @@ export default function PaymentsPage() {
             </Col>
           </Row>
 
-          {ptype === 'WORKER' ? (
-            <Form.Item name="partyName" label="Worker name" rules={[{ required: true, message: 'Whose wages?' }]}>
-              <Input placeholder="Worker name" />
-            </Form.Item>
-          ) : (
-            <Form.Item name="partyRef" label={PARTY_LABEL[ptype]} rules={[{ required: true, message: 'Pick the party.' }]}>
-              <Select showSearch optionFilterProp="label" options={partyOptions} />
-            </Form.Item>
-          )}
+          <Form.Item
+            name="partyRef"
+            label={PARTY_LABEL[ptype]}
+            rules={[{ required: true, message: 'Pick the party.' }]}
+            extra={
+              ptype === 'WORKER'
+                ? 'Only workers the factory pays directly — a gang member is paid through their contractor.'
+                : ptype === 'STATUTORY'
+                  ? 'Settles what a posted levy owes the authority.'
+                  : undefined
+            }
+          >
+            <Select showSearch optionFilterProp="label" options={partyOptions} />
+          </Form.Item>
 
           <Form.Item
             name="orderId"

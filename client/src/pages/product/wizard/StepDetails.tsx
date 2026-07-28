@@ -152,10 +152,21 @@ export default function StepDetails({
               options={(stageLines ?? [])
                 .filter((l) => l.isActive || l.id === draft.stageLineId)
                 .map((l) => ({ label: `${l.code} — ${l.name}  (${l.steps.map((s) => s.name).join(' → ')})`, value: l.id }))}
-              onChange={(v) => set({ stageLineId: v ?? null })}
+              onChange={(v) => {
+                // Labour lines map onto the steps of THIS line, so a different route
+                // makes those mappings meaningless — drop them rather than let the
+                // save fail on a stage that belongs to another line.
+                const mapped = draft.costSheet.groups.some((g) => g.head === 'LABOUR' && g.lines.some((l) => l.stageStepId != null));
+                set({
+                  stageLineId: v ?? null,
+                  ...(mapped
+                    ? { costSheet: { ...draft.costSheet, groups: draft.costSheet.groups.map((g) => (g.head === 'LABOUR' ? { ...g, lines: g.lines.map((l) => ({ ...l, stageStepId: null })) } : g)) } }
+                    : {}),
+                });
+              }}
             />
             <Text type="secondary" style={{ fontSize: 12 }}>
-              The stages every order of this product moves through. Manage the lines in Master Data → Stage Lines.
+              The stages every order of this product moves through. Manage the lines in Master Data → Stage Lines. Changing it clears any labour lines mapped to the old stages.
             </Text>
           </Col>
         </Row>

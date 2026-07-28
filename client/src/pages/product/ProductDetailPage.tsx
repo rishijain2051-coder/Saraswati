@@ -1,4 +1,5 @@
 import { Breadcrumb, Button, Card, Col, Descriptions, Empty, Result, Row, Skeleton, Space, Tabs, Tag, Tooltip, Typography } from 'antd';
+import ChangeLogList from '../../components/ChangeLogList';
 import { HomeOutlined, EditOutlined, ArrowLeftOutlined } from '@ant-design/icons';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useProduct } from '../../api/hooks';
@@ -165,6 +166,8 @@ export default function ProductDetailPage({ catalogueMode = false }: { catalogue
               }]
             : []),
           { key: 'related', label: `Related (${p.related.length})`, children: relatedTab },
+          // Rate changes are money, so they stay out of the price-free catalogue view.
+          ...(!catalogueMode ? [{ key: 'history', label: 'History', children: <ChangeLogList rootType="Product" rootId={p.id} what="product" /> }] : []),
           {
             key: 'images',
             label: `Images (${p.images.length})`,

@@ -8,6 +8,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { api, apiError } from '../../api/client';
 import { useBuyers, useCurrencies, useProducts } from '../../api/hooks';
 import { useOrder, suggestPrice } from '../../api/ops';
+import { PriceHint } from '../../components/HistoryHint';
 import { money, num } from '../../util/format';
 
 const { Title, Text } = Typography;
@@ -167,6 +168,15 @@ export default function OrderEditPage() {
         <Space.Compact>
           <InputNumber min={0} step={0.01} value={v} onChange={(val) => setLine(i, { unitPrice: val ?? 0 })} style={{ width: 115 }} />
           <Button icon={<ThunderboltOutlined />} title="Suggest from FOB" disabled={!r.productId} onClick={() => r.productId && suggest(i, r.productId)} />
+          {/* What it actually sold for before, which the FOB figure cannot know. */}
+          <PriceHint
+            productId={r.productId}
+            buyerId={buyerId}
+            currency={currencies?.find((c) => c.id === currencyId)?.code}
+            symbol={symbol}
+            value={r.unitPrice}
+            onApply={(val) => setLine(i, { unitPrice: val })}
+          />
         </Space.Compact>
       ),
     },

@@ -19,6 +19,8 @@ import {
   FileTextOutlined,
   ShopOutlined,
   WalletOutlined,
+  CalendarOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
@@ -60,7 +62,18 @@ export default function AppLayout() {
         { key: '/products/list', icon: <TableOutlined />, label: <Link to="/products/list">Product Details</Link> },
       ],
     },
-    { key: '/manforce', icon: <TeamOutlined />, label: <Link to="/manforce">Manforce</Link> },
+    {
+      key: 'manforce',
+      icon: <TeamOutlined />,
+      label: 'Manforce',
+      children: [
+        { key: '/manforce', icon: <DashboardOutlined />, label: <Link to="/manforce">Dashboard</Link> },
+        { key: '/manforce/workers', icon: <TeamOutlined />, label: <Link to="/manforce/workers">Workers</Link> },
+        { key: '/manforce/muster', icon: <CalendarOutlined />, label: <Link to="/manforce/muster">Muster Roll</Link> },
+        { key: '/manforce/wages', icon: <WalletOutlined />, label: <Link to="/manforce/wages">Wages</Link> },
+        ...(hasRole('Manager') ? [{ key: '/manforce/statutory', icon: <SafetyCertificateOutlined />, label: <Link to="/manforce/statutory">Statutory</Link> }] : []),
+      ],
+    },
     {
       key: 'operations',
       icon: <ToolOutlined />,
@@ -124,7 +137,7 @@ export default function AppLayout() {
       </Header>
       <Layout>
         <Sider width={230} breakpoint="lg" collapsedWidth={0} theme="dark">
-          <Menu theme="dark" mode="inline" selectedKeys={selected} defaultOpenKeys={['products', 'operations']} items={items} style={{ paddingTop: 8 }} />
+          <Menu theme="dark" mode="inline" selectedKeys={selected} defaultOpenKeys={['products', 'manforce', 'operations']} items={items} style={{ paddingTop: 8 }} />
         </Sider>
         <Content style={{ padding: 24, overflow: 'auto' }}>
           <Outlet />

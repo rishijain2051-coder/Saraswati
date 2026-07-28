@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, App, Breadcrumb, Button, Card, Col, Descriptions, Empty, Image, Modal, Popconfirm, Progress, Result, Row, Select, Skeleton, Space, Statistic, Tag, Timeline, Typography } from 'antd';
+import { Alert, App, Breadcrumb, Button, Card, Col, Descriptions, Empty, Image, Modal, Popconfirm, Progress, Result, Row, Select, Skeleton, Space, Statistic, Tag, Timeline, Tooltip, Typography } from 'antd';
 import {
   HomeOutlined,
   EditOutlined,
@@ -25,6 +25,7 @@ import StageStrip from './board/StageStrip';
 import MoveDrawer, { type MoveTarget } from './board/MoveDrawer';
 import RoutingDrawer from './board/RoutingDrawer';
 import BulkClearDrawer from './board/BulkClearDrawer';
+import ChangeLogList from '../../components/ChangeLogList';
 
 const { Title, Text } = Typography;
 
@@ -369,6 +370,12 @@ export default function OrderDetailPage() {
               </Descriptions.Item>
             </Descriptions>
           </Card>
+
+          {/* Who changed a price or a stage rate, and what it was before — the one
+              question the live order cannot answer, because an edit overwrites it. */}
+          <Card size="small" title="Change history" style={{ marginTop: 16 }}>
+            <ChangeLogList rootType="Order" rootId={o.id} what="order" compact />
+          </Card>
         </Col>
         <Col xs={24} lg={10}>
           {o.jobwork.length > 0 && (
@@ -445,6 +452,22 @@ export default function OrderDetailPage() {
                       </Text>
                     </Space>
                     {h.note && <div style={{ fontSize: 12, whiteSpace: 'pre-line', margin: '2px 0' }}>{h.note}</div>}
+                    {h.workers.length > 0 && (
+                      <Space size={4} wrap style={{ marginTop: 2 }}>
+                        {h.workers.map((w) => (
+                          <Tooltip key={w.workerId} title={`${w.pieces} pc by ${w.name}`}>
+                            <Tag color="cyan" style={{ margin: 0 }}>
+                              <Link to={`/manforce/workers/${w.workerId}`}>{w.name}</Link> · {w.pieces}
+                            </Tag>
+                          </Tooltip>
+                        ))}
+                        {h.labourValue > 0 && (
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            earned {money(h.labourValue, '₹', 0)}
+                          </Text>
+                        )}
+                      </Space>
+                    )}
                     {h.photos.length > 0 && (
                       <Image.PreviewGroup>
                         <Space size={6} wrap style={{ marginTop: 4 }}>

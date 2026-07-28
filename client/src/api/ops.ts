@@ -4,7 +4,7 @@ import type { Buyer, Currency } from './types';
 
 export const ORDER_STATUSES = ['Confirmed', 'Production', 'Ready', 'Shipped', 'Closed', 'Cancelled'] as const;
 export const PROFORMA_STATUSES = ['Draft', 'Sent', 'Accepted', 'Rejected'] as const;
-export const PARTY_TYPES = ['SUPPLIER', 'JOBWORK', 'BUYER', 'WORKER'] as const;
+export const PARTY_TYPES = ['SUPPLIER', 'JOBWORK', 'BUYER', 'WORKER', 'CONTRACTOR', 'STATUTORY'] as const;
 
 export const ORDER_STATUS_COLOR: Record<string, string> = {
   Confirmed: 'blue',
@@ -104,6 +104,8 @@ export interface StageCell {
   vendorId: number | null;
   vendor?: { id: number; name: string } | null;
   jobworkRate: number;
+  /** ₹ per piece an in-house worker earns for clearing this stage. 0 = day-wage work. */
+  labourRate: number;
   note?: string | null;
   /** Pieces sitting here right now. */
   at: number;
@@ -143,6 +145,10 @@ export interface StageMoveHistory {
   /** The hand-over comment written when the pieces were passed on. */
   note?: string | null;
   photos: StageMovePhoto[];
+  /** Who did the work, with their piece counts. Empty when nobody was named. */
+  workers: { workerId: number; code: string; name: string; pieces: number }[];
+  /** What this movement earned in in-house labour, at the stage's current rate. */
+  labourValue: number;
 }
 
 export interface OrderLineDto {
@@ -385,17 +391,27 @@ export interface ReceivablesResponse {
   credits: { buyerId: number; buyerName: string; currency: string; symbol: string; amount: number }[];
 }
 
-/** One party's payable position; jobwork accrual comes off the board. */
+/** One party's payable position; jobwork and wages both accrue off the board. */
 export interface Payable {
   partyType: string;
+  /** Canonical id for the party, whatever its type. */
+  partyId: number | null;
   supplierId: number | null;
   partyName: string;
+  code?: string | null;
   accrued: number;
   paid: number;
   balance: number;
   credit: number;
   pieces: number;
   events: number;
+  /** Workers only: cash due now, and any advance not yet worked off. */
+  dueNow?: number;
+  advanceOutstanding?: number;
+  /** A provision is a cost, not a debt — shown but never counted as payable. */
+  isProvision?: boolean;
+  /** A wage row still keyed to a typed name, awaiting migration. */
+  unlinked?: boolean;
   jobs: { orderId: number | null; orderNumber: string; product: string; stages: string[]; pieces: number; amount: number; paid: number; balance: number }[];
 }
 
@@ -410,14 +426,21 @@ export interface FinanceSummary {
   materialBilled: number;
   materialPaid: number;
   materialDue: number;
+  /** Wages ACCRUED from attendance and the board, plus any pre-Manforce entries. */
   wagesBilled: number;
   wagesPaid: number;
   wagesDue: number;
+  headcount: number;
+  contractorCount: number;
+  contractorDue: number;
+  statutoryDue: number;
+  statutoryProvision: number;
+  advanceOutstanding: number;
   payableInr: number;
   jobworkEvents: number;
 }
 
-export type PartyType = 'BUYER' | 'JOBWORK' | 'SUPPLIER' | 'WORKER';
+export type PartyType = 'BUYER' | 'JOBWORK' | 'SUPPLIER' | 'WORKER' | 'CONTRACTOR' | 'STATUTORY';
 
 export interface PartyRow {
   partyType: PartyType;
@@ -488,6 +511,32 @@ export interface PartyStatement {
   supplied?: { id: number; date: string; item: string; qty: number; unit: string; rate: number; value: number; note?: string | null; billed: boolean; billId: number | null }[];
   unbilledValue?: number;
   statement?: StatementRow[];
+  /**
+   * Present for WORKER, CONTRACTOR and STATUTORY parties, whose position is derived
+   * from attendance, the board and what has been posted rather than from bills.
+   */
+  workforce?: {
+    payType?: string;
+    trade?: string | null;
+    contractor?: string | null;
+    dueNow?: number;
+    deducted?: number;
+    statutoryDeducted?: number;
+    earnedDays?: number;
+    overtimeEarned?: number;
+    advanced?: number;
+    advanceRecovered?: number;
+    advanceOutstanding?: number;
+    advances?: { id: number; date: string; amount: number; recoveryPerMonth: number; note?: string | null; recovered: number; outstanding: number }[];
+    gang?: number;
+    workers?: { id: number; code: string; name: string; payType: string; earned: number; days: number; pieces: number }[];
+    isProvision?: boolean;
+    employee?: number;
+    employer?: number;
+    payeeName?: string;
+    workersCovered?: number;
+    lines?: { id: number; posting: string; workerCode: string; workerName: string; wages: number; employeeAmt: number; employerAmt: number; postedOn: string }[];
+  };
 }
 
 export interface OpsDashboard {

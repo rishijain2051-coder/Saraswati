@@ -8,6 +8,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { api, apiError } from '../../api/client';
 import { useBuyers, useCurrencies, useProduct, useProducts } from '../../api/hooks';
 import { useProforma, suggestPrice, type ProformaLineDto } from '../../api/ops';
+import { PriceHint } from '../../components/HistoryHint';
 import { money } from '../../util/format';
 
 const { Title, Text } = Typography;
@@ -217,6 +218,15 @@ export default function ProformaEditPage() {
         <Space.Compact>
           <InputNumber min={0} step={0.01} value={v} style={{ width: 105 }} onChange={(val) => setLine(r.key, { unitPrice: val ?? 0 })} />
           <Button icon={<ThunderboltOutlined />} disabled={!r.productId} title="Suggest from FOB" onClick={() => r.productId && pickProduct(r.key, r.productId)} />
+          {/* What this buyer, then anyone, has actually paid for it before. */}
+          <PriceHint
+            productId={r.productId}
+            buyerId={f.buyerId}
+            currency={currencies?.find((c) => c.id === f.currencyId)?.code}
+            symbol={symbol}
+            value={r.unitPrice}
+            onApply={(val) => setLine(r.key, { unitPrice: val })}
+          />
         </Space.Compact>
       ),
     },

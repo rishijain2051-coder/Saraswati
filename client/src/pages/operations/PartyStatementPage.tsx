@@ -1,5 +1,5 @@
 import { App, Alert, Breadcrumb, Button, Card, Col, Descriptions, Empty, Result, Row, Skeleton, Space, Statistic, Table, Tabs, Tag, Tooltip, Typography } from 'antd';
-import { HomeOutlined, ArrowLeftOutlined, PrinterOutlined, ShopOutlined, InboxOutlined, TeamOutlined, UserOutlined, FileDoneOutlined } from '@ant-design/icons';
+import { HomeOutlined, ArrowLeftOutlined, PrinterOutlined, ShopOutlined, InboxOutlined, TeamOutlined, UserOutlined, FileDoneOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import dayjs from 'dayjs';
@@ -16,6 +16,8 @@ const PARTY_META: Record<PartyType, { label: string; icon: JSX.Element; owed: st
   JOBWORK: { label: 'Jobwork vendor', icon: <ShopOutlined />, owed: 'We owe', settle: 'Payment' },
   SUPPLIER: { label: 'Material supplier', icon: <InboxOutlined />, owed: 'We owe', settle: 'Payment' },
   WORKER: { label: 'Worker', icon: <TeamOutlined />, owed: 'We owe', settle: 'Payment' },
+  CONTRACTOR: { label: 'Labour contractor', icon: <TeamOutlined />, owed: 'We owe', settle: 'Payment' },
+  STATUTORY: { label: 'Statutory levy', icon: <SafetyCertificateOutlined />, owed: 'We owe', settle: 'Payment' },
 };
 
 const TYPE_COLOR: Record<StatementRow['type'], string> = { ACCRUAL: 'gold', BILL: 'orange', INVOICE: 'blue', PAYMENT: 'green', RECEIPT: 'green' };
@@ -239,10 +241,12 @@ export default function PartyStatementPage() {
     );
   }
 
-  // --- vendor / supplier / worker -----------------------------------------
+  // --- vendor / supplier / worker / contractor / statutory ------------------
   const s = data.summary!;
   const symbol = '₹';
   const isJobwork = type === 'JOBWORK';
+  /** Extra figures the workforce parties carry — derived, so only they have them. */
+  const wf = data.workforce;
 
   const eventCols: ColumnsType<JobworkEvent> = [
     { title: 'Date', dataIndex: 'date', width: 100, render: (d) => dayjs(d).format('DD MMM YY') },
@@ -296,7 +300,32 @@ export default function PartyStatementPage() {
               <Statistic title="Delivered, not billed" value={money(data.unbilledValue ?? 0, symbol)} valueStyle={{ fontSize: 18, color: '#d48806' }} />
             </Col>
           )}
+          {wf?.dueNow != null && (
+            <Col xs={12} md={4}>
+              <Tooltip title="What can be handed over today, after each advance's monthly recovery. Due now less the advance outstanding is exactly the balance.">
+                <Statistic title="Due now" value={money(wf.dueNow, symbol)} valueStyle={{ fontSize: 18, color: wf.dueNow > 0 ? '#cf1322' : '#389e0d' }} />
+              </Tooltip>
+            </Col>
+          )}
+          {(wf?.advanceOutstanding ?? 0) > 0 && (
+            <Col xs={12} md={4}>
+              <Statistic title="Advance outstanding" value={money(wf!.advanceOutstanding!, symbol)} valueStyle={{ fontSize: 18, color: '#d4380d' }} />
+            </Col>
+          )}
         </Row>
+        {wf && (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {type === 'WORKER' &&
+              `Earned from attendance and the board — nothing here was typed in.${wf.earnedDays ? ` ${num(wf.earnedDays, 1)} day(s) paid.` : ''}${
+                wf.deducted ? ` ${money(wf.deducted, symbol)} deducted.` : ''
+              }${wf.statutoryDeducted ? ` ${money(wf.statutoryDeducted, symbol)} statutory.` : ''}${wf.contractor ? ` Paid through ${wf.contractor}.` : ''}`}
+            {type === 'CONTRACTOR' && `Rolled up from ${wf.gang ?? 0} worker(s) in the gang. One payment settles the lot; the breakdown below explains it.`}
+            {type === 'STATUTORY' &&
+              `${money(wf.employee ?? 0, symbol)} deducted from workers plus ${money(wf.employer ?? 0, symbol)} of the factory's own cost, over ${wf.workersCovered ?? 0} worker(s).${
+                wf.isProvision ? ' A provision — owed to nobody until declared.' : ''
+              }`}
+          </Text>
+        )}
       </Card>
 
       <Card size="small">

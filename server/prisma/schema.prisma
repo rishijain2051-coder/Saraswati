@@ -297,7 +297,14 @@ model CostLine {
   rate      Float   @default(0) // cost per measure unit (per CFT / SQFT / kg / piece ...)
   sortOrder Int     @default(0)
 
-  group CostGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  /// Which production stage this line pays for. Only meaningful on LABOUR lines, and
+  /// purely a REFERENCE: it defaults the in-house piece rate when an order snapshots
+  /// its stages, but the rate that actually pays sits on OrderLineStage.labourRate.
+  /// Costing itself never reads this — the roll-up is unchanged.
+  stageStepId Int?
+
+  group     CostGroup      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  stageStep StageLineStep? @relation(fields: [stageStepId], references: [id])
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +397,8 @@ model StageLineStep {
   name        String
   sortOrder   Int    @default(0)
 
-  stageLine StageLine @relation(fields: [stageLineId], references: [id], onDelete: Cascade)
+  stageLine StageLine  @relation(fields: [stageLineId], references: [id], onDelete: Cascade)
+  costLines CostLine[]
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +458,10 @@ model OrderLineStage {
   sortOrder   Int     @default(0)
   vendorId    Int? // null = in-house
   jobworkRate Float   @default(0) // ₹ per piece payable to the vendor for this stage
+  /// ₹ per piece earned by an in-house worker who clears this stage. Defaulted from
+  /// the product's LABOUR lines mapped to this step, then editable per order.
+  /// Zero is allowed (day-wage work), but naming workers on a move then requires one.
+  labourRate  Float   @default(0)
   note        String?
 
   orderLine OrderLine   @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
@@ -482,12 +494,33 @@ model StageMove {
   createdById Int?
   createdAt   DateTime @default(now())
 
-  orderLine OrderLine        @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
-  fromStage OrderLineStage?  @relation("MoveFrom", fields: [fromStageId], references: [id])
-  toStage   OrderLineStage?  @relation("MoveTo", fields: [toStageId], references: [id])
+  orderLine OrderLine         @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
+  fromStage OrderLineStage?   @relation("MoveFrom", fields: [fromStageId], references: [id])
+  toStage   OrderLineStage?   @relation("MoveTo", fields: [toStageId], references: [id])
   photos    StageMovePhoto[]
+  workers   StageMoveWorker[]
 
   @@index([orderLineId])
+}
+
+/// Who did the work this movement records, and how many pieces each of them did.
+///
+/// Optional — the board never needed it and history without it stays valid. When
+/// present the piece counts must sum to the movement's qty, so every rupee of
+/// in-house labour is attributable and the total still reconciles with the board's
+/// `cleared` figure. Earnings are pieces × the stage's CURRENT labourRate, exactly
+/// as vendor jobwork is priced, so there is no rate to snapshot here.
+model StageMoveWorker {
+  id       Int @id @default(autoincrement())
+  moveId   Int
+  workerId Int
+  pieces   Int
+
+  move   StageMove @relation(fields: [moveId], references: [id], onDelete: Cascade)
+  worker Worker    @relation(fields: [workerId], references: [id])
+
+  @@unique([moveId, workerId])
+  @@index([workerId])
 }
 
 /// Photos attached to a hand-over — proof of condition when pieces change hands.
@@ -577,40 +610,425 @@ model OperationSheet {
 /// So BUYER and JOBWORK rows are PAYMENT rows only; SUPPLIER (material) and WORKER
 /// rows may be BILL or PAYMENT because nothing else knows those amounts.
 model LedgerEntry {
-  id          Int      @id @default(autoincrement())
-  partyType   String // SUPPLIER | JOBWORK | BUYER | WORKER
-  supplierId  Int?
-  buyerId     Int?
+  id                   Int      @id @default(autoincrement())
+  partyType            String // SUPPLIER | JOBWORK | BUYER | WORKER | CONTRACTOR | STATUTORY
+  supplierId           Int?
+  buyerId              Int?
+  /// Set on WORKER rows once the Manforce module owns the worker. Wages used to be
+  /// recorded against a typed name, so `partyName` remains the fallback for history
+  /// that predates the worker master.
+  workerId             Int?
+  contractorId         Int?
+  /// Set on STATUTORY rows: which levy this payment settles (PF, ESI, …).
+  statutoryComponentId Int?
   /// The order this money is aimed at. Optional: a payment with no order — or one
   /// larger than that order's balance — is spread oldest-first across whatever the
   /// party still owes or is owed (see lib/finance.ts). Allocation is computed on
   /// read, never stored, so it cannot go stale when values change.
-  orderId     Int?
-  stockTxnId  Int?     @unique // set when this bill covers a specific stock receipt
-  partyName   String // snapshot / for WORKER
-  kind        String // BILL | PAYMENT
-  amount      Float
-  currency    String?  @default("INR")
-  date        DateTime @default(now())
-  ref         String?
-  note        String?
-  createdById Int?
-  createdAt   DateTime @default(now())
+  orderId              Int?
+  stockTxnId           Int?     @unique // set when this bill covers a specific stock receipt
+  /// Set when this payment IS the handing over of an advance. The advance record holds
+  /// the recovery terms; the cash lives here, so it is counted exactly once.
+  advanceId            Int?     @unique
+  partyName            String // snapshot / for WORKER
+  kind                 String // BILL | PAYMENT
+  amount               Float
+  currency             String?  @default("INR")
+  date                 DateTime @default(now())
+  ref                  String?
+  note                 String?
+  createdById          Int?
+  createdAt            DateTime @default(now())
 
-  supplier Supplier? @relation("SupplierLedger", fields: [supplierId], references: [id])
-  buyer    Buyer?    @relation("BuyerLedger", fields: [buyerId], references: [id])
-  order    Order?    @relation(fields: [orderId], references: [id])
-  stockTxn StockTxn? @relation(fields: [stockTxnId], references: [id])
+  supplier   Supplier?           @relation("SupplierLedger", fields: [supplierId], references: [id])
+  buyer      Buyer?              @relation("BuyerLedger", fields: [buyerId], references: [id])
+  order      Order?              @relation(fields: [orderId], references: [id])
+  stockTxn   StockTxn?           @relation(fields: [stockTxnId], references: [id])
+  worker     Worker?             @relation(fields: [workerId], references: [id])
+  contractor Contractor?         @relation(fields: [contractorId], references: [id])
+  component  StatutoryComponent? @relation(fields: [statutoryComponentId], references: [id])
+  advance    WorkerAdvance?      @relation(fields: [advanceId], references: [id])
 
   @@index([orderId])
   @@index([partyType, supplierId])
   @@index([partyType, buyerId])
+  @@index([partyType, workerId])
+  @@index([partyType, contractorId])
 }
 
 model DocSequence {
   id      Int     @id @default(autoincrement())
-  key     String  @unique // PI | ORD | OP
+  key     String  @unique // PI | ORD | OP | WRK | CTR | STP
   prefix  String
   useYear Boolean @default(false)
   lastNo  Int     @default(0)
+}
+
+/// App-wide settings that belong to no single module. Singleton (id = 1).
+model AppSetting {
+  id Int @id @default(1)
+
+  /// How far back a "what did we use last time" suggestion looks. Older figures are
+  /// not shown at all — a two-year-old rate is worse than no rate.
+  suggestionWindowDays Int   @default(365)
+  /// A typed figure this far from the window's average is flagged as out of line.
+  outlierPct           Float @default(25)
+
+  updatedAt DateTime @updatedAt
+}
+
+/// An edit to a figure that matters: a rate, a price, a wage.
+///
+/// Suggestions are DERIVED from the live records, so they answer "what did we use".
+/// This answers the different question "who changed it, and what was it before" —
+/// which nothing else can reconstruct, because an edit overwrites the old value.
+/// Only money and rates are logged; ordinary edits are not worth the noise.
+model ChangeLog {
+  id Int @id @default(autoincrement())
+
+  /// The record that actually changed, e.g. CostLine.
+  entity   String
+  entityId Int?
+  /// The record a person would go looking at — the product, order or worker that owns
+  /// it. Cost lines are replaced wholesale on save, so their own ids are not stable.
+  rootType String
+  rootId   Int
+
+  field    String
+  /// Human-readable subject, e.g. `CARVING LABOUR — rate`.
+  label    String
+  /// Stored as text so one table can hold money, percentages and names alike.
+  oldValue String?
+  newValue String?
+  note     String?
+
+  userId   Int?
+  userName String   @default("")
+  at       DateTime @default(now())
+
+  @@index([rootType, rootId, at])
+  @@index([entity, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Manforce module (Phase 3) — workers, attendance, wages, statutory dues.
+//
+// THERE ARE NO PAY PERIODS. The factory pays people when it pays them: a worker
+// may draw an advance, or go unpaid for two months. So a worker is a running
+// ACCOUNT, exactly like a jobwork vendor — earnings accrue as dated events and
+// payments are ad-hoc for any amount on any date. Nothing is ever "run" or closed.
+//
+// Consequently NO BALANCE IS EVER STORED. What a worker has earned is derived from
+// (attendance × their rate) + (pieces cleared × the stage's labour rate), the same
+// discipline the production board follows. See lib/workforce.ts.
+// ---------------------------------------------------------------------------
+
+model Trade {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique // Carpenter | Polisher | Helper | Packer …
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workers Worker[]
+}
+
+/// A labour contractor. Their gang's earnings roll up here and one payment settles
+/// the lot, with the per-worker breakdown kept behind it — so a contractor is a
+/// party with its own ledger, not a label on a worker.
+model Contractor {
+  id           Int      @id @default(autoincrement())
+  code         String   @unique
+  name         String
+  contactName  String?
+  phone        String?
+  email        String?
+  gstNo        String?
+  panNo        String?
+  address      String?
+  paymentTerms String?
+  isActive     Boolean  @default(true)
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workers Worker[]
+  ledger  LedgerEntry[]
+}
+
+model Worker {
+  id           Int    @id @default(autoincrement())
+  code         String @unique
+  name         String
+  tradeId      Int?
+  /// null = paid directly by the factory; set = part of a contractor's gang.
+  contractorId Int?
+
+  /// DAY (daily rate × days present) | PIECE (board clearances) | MONTHLY (salary
+  /// accrued pro-rata across working days). One worker earns by exactly one of these,
+  /// so attendance can never double-pay a piece-rate worker.
+  payType       String @default("DAY")
+  dailyRate     Float  @default(0)
+  otHourlyRate  Float  @default(0)
+  monthlySalary Float  @default(0)
+
+  joinedOn   DateTime  @default(now())
+  exitOn     DateTime?
+  exitReason String?
+  isActive   Boolean   @default(true)
+
+  /// Wages are DERIVED from this date onwards; before it only hand-recorded entries
+  /// count. Wages used to be typed against a name, so a worker migrated from that
+  /// history starts accruing after their last manual entry — otherwise the engine
+  /// would invent presumed-present days for a period that was already paid.
+  /// Null means "derive from joinedOn", which is the case for every new worker.
+  accrualFrom DateTime?
+
+  // contact / personal
+  phone          String?
+  altPhone       String?
+  address        String?
+  guardianName   String?
+  emergencyName  String?
+  emergencyPhone String?
+  dateOfBirth    DateTime?
+  gender         String?
+
+  // identity and payout — sensitive, only served to Manager and above
+  aadhaarNo     String?
+  panNo         String?
+  uanNo         String? // PF universal account number
+  esicNo        String? // ESIC insured-person number
+  bankName      String?
+  bankAccountNo String?
+  bankIfsc      String?
+  upiId         String?
+
+  notes       String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  trade      Trade?      @relation(fields: [tradeId], references: [id])
+  contractor Contractor? @relation(fields: [contractorId], references: [id])
+
+  documents    WorkerDocument[]
+  attendance   Attendance[]
+  advances     WorkerAdvance[]
+  deductions   WorkerDeduction[]
+  statutory    WorkerStatutory[]
+  moveWorkers  StageMoveWorker[]
+  postingLines StatutoryPostingLine[]
+  ledger       LedgerEntry[]
+
+  @@index([isActive])
+  @@index([contractorId])
+}
+
+/// Worker photo and ID scans. Same content-checked pipeline as product images:
+/// the magic bytes are verified and anything that is not really an image is unlinked.
+model WorkerDocument {
+  id           Int      @id @default(autoincrement())
+  workerId     Int
+  kind         String   @default("PHOTO") // PHOTO | ID
+  label        String?
+  filename     String
+  originalName String?
+  url          String
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId])
+}
+
+/// Which levies a worker is covered by. Absence of a row means not covered, so
+/// casual labour costs nothing to leave out.
+model WorkerStatutory {
+  id          Int     @id @default(autoincrement())
+  workerId    Int
+  componentId Int
+  covered     Boolean @default(true)
+
+  worker    Worker             @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  component StatutoryComponent @relation(fields: [componentId], references: [id], onDelete: Cascade)
+
+  @@unique([workerId, componentId])
+}
+
+/// Attendance is EXCEPTIONS-ONLY: a row exists to say something other than the
+/// presumption. Everyone active is presumed present on a working day, so absences,
+/// half-days, leave and overtime are what get recorded — plus an explicit PRESENT to
+/// pay someone who came in on a weekly off or holiday.
+///
+/// Which days are working days is Admin-configured (WorkforceSetting + Holiday), and
+/// because the accrual is derived, adding a festival to the calendar retroactively
+/// corrects the money.
+model Attendance {
+  id          Int      @id @default(autoincrement())
+  workerId    Int
+  date        DateTime // midnight, date-only
+  status      String // PRESENT | ABSENT | HALF_DAY | LEAVE | PAID_LEAVE
+  otHours     Float    @default(0)
+  note        String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@unique([workerId, date])
+  @@index([date])
+}
+
+/// A non-working day for the whole factory. Deleting one restates the accrual, which
+/// is the point of deriving rather than storing.
+model Holiday {
+  id        Int      @id @default(autoincrement())
+  date      DateTime @unique
+  name      String
+  createdAt DateTime @default(now())
+}
+
+/// Singleton (id = 1) holding the rules the Admin decides.
+model WorkforceSetting {
+  id Int @id @default(1)
+
+  /// CSV of JS day numbers that are weekly offs — "0" = Sunday.
+  weeklyOffDays          String  @default("0")
+  /// When true an active worker is presumed present on every working day unless a
+  /// row says otherwise. When false only explicitly marked days earn.
+  presumePresent         Boolean @default(true)
+  shiftHours             Float   @default(8)
+  /// Used to derive an OT rate for a worker who has no otHourlyRate of their own:
+  /// (dailyRate ÷ shiftHours) × this.
+  otMultiplier           Float   @default(2)
+  halfDayFactor          Float   @default(0.5)
+  /// How a monthly salary is spread over a month: WORKING (working days in that
+  /// month) | FIXED_26 | FIXED_30 | CALENDAR.
+  monthlyDivisor         String  @default("WORKING")
+  /// Default ₹/month recovered from earnings against a new advance; 0 = no cap.
+  defaultAdvanceRecovery Float   @default(0)
+
+  updatedAt DateTime @updatedAt
+}
+
+/// Money handed to a worker ahead of their earnings.
+///
+/// The CASH lives on the linked LedgerEntry PAYMENT row, so it is counted once. This
+/// record holds the recovery terms: earnings absorb the advance at most
+/// `recoveryPerMonth` per calendar month (0 = absorb as fast as earnings allow, which
+/// is the same thing as a payment that simply outran the earnings).
+model WorkerAdvance {
+  id               Int      @id @default(autoincrement())
+  workerId         Int
+  date             DateTime @default(now())
+  amount           Float
+  recoveryPerMonth Float    @default(0)
+  ref              String?
+  note             String?
+  createdById      Int?
+  createdAt        DateTime @default(now())
+
+  worker  Worker       @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  payment LedgerEntry?
+
+  @@index([workerId])
+}
+
+/// A charge against a worker — canteen, damage, tool loss, fine. Reduces what is
+/// owed without any cash moving.
+model WorkerDeduction {
+  id          Int      @id @default(autoincrement())
+  workerId    Int
+  date        DateTime @default(now())
+  reason      String
+  amount      Float
+  note        String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId])
+}
+
+/// A statutory levy, defined as DATA exactly as CostMethod defines cost formulas —
+/// so a change in the law is an edit, not a release. PF, ESI, PT and bonus ship as
+/// editable defaults.
+model StatutoryComponent {
+  id   Int    @id @default(autoincrement())
+  code String @unique // PF | ESI | PT | BONUS …
+  name String
+
+  employeePct Float @default(0) // deducted from the worker
+  employerPct Float @default(0) // the factory's own cost
+  /// A flat amount instead of a percentage (professional tax). Applied when the wage
+  /// base reaches `minWages`.
+  flatAmount  Float @default(0)
+
+  /// What the percentages apply to: GROSS (everything earned) | BASIC (excluding
+  /// overtime, which is how PF is normally computed).
+  basis String @default("GROSS")
+
+  /// Contribution is computed on min(wages, wageCeiling) — PF's ₹15,000 today.
+  wageCeiling        Float?
+  /// A worker earning more than this in the period is not covered at all — ESI's
+  /// ₹21,000 today.
+  eligibilityCeiling Float?
+  minWages           Float?
+
+  /// Who the money is owed to once posted.
+  payeeName   String   @default("")
+  /// A provision (bonus, gratuity) accrues as a cost but is not a payable until
+  /// declared, so it stays out of the payables total.
+  isProvision Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  coverage WorkerStatutory[]
+  lines    StatutoryPostingLine[]
+  ledger   LedgerEntry[]
+}
+
+/// Liability is incurred only when the Admin posts it. Until then the screen shows
+/// what is unposted and nothing exists in the accounts. Two postings of the same
+/// component may not cover overlapping dates.
+model StatutoryPosting {
+  id          Int      @id @default(autoincrement())
+  number      String   @unique
+  periodFrom  DateTime
+  periodTo    DateTime
+  postedOn    DateTime @default(now())
+  note        String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  lines StatutoryPostingLine[]
+}
+
+model StatutoryPostingLine {
+  id          Int   @id @default(autoincrement())
+  postingId   Int
+  componentId Int
+  workerId    Int
+  /// The wage base the contribution was worked out on, kept because the earnings it
+  /// came from can be restated later (a holiday added, a rate corrected) and a posted
+  /// liability must not silently change.
+  wages       Float
+  employeeAmt Float @default(0)
+  employerAmt Float @default(0)
+
+  posting   StatutoryPosting   @relation(fields: [postingId], references: [id], onDelete: Cascade)
+  component StatutoryComponent @relation(fields: [componentId], references: [id])
+  worker    Worker             @relation(fields: [workerId], references: [id])
+
+  @@unique([postingId, componentId, workerId])
+  @@index([componentId])
+  @@index([workerId])
 }

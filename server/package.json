@@ -15,7 +15,8 @@
     "db:reset": "prisma db push --force-reset && tsx prisma/seed.ts",
     "db:demo": "tsx prisma/demoSeed.ts",
     "verify": "tsx prisma/verify.ts",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "db:workers": "tsx prisma/migrateWorkers.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

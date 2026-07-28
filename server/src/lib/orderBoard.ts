@@ -37,7 +37,10 @@ export const orderInclude = {
       stages: { orderBy: { sortOrder: 'asc' as const }, include: { vendor: { select: { id: true, name: true } } } },
       moves: {
         orderBy: [{ date: 'desc' as const }, { id: 'desc' as const }],
-        include: { photos: { orderBy: { sortOrder: 'asc' as const }, select: { id: true, url: true, caption: true } } },
+        include: {
+          photos: { orderBy: { sortOrder: 'asc' as const }, select: { id: true, url: true, caption: true } },
+          workers: { include: { worker: { select: { id: true, code: true, name: true } } } },
+        },
       },
     },
   },
@@ -77,6 +80,10 @@ export function serializeOrder(o: OrderWithBoard, ctx: FinanceContext) {
         date: m.date,
         note: m.note,
         photos: m.photos,
+        /** Who did this piece of work, and how much of it each of them did. */
+        workers: m.workers.map((w) => ({ workerId: w.workerId, code: w.worker.code, name: w.worker.name, pieces: w.pieces })),
+        /** In-house labour this movement earned, at the stage's current rate. */
+        labourValue: round(m.workers.reduce((a, w) => a + w.pieces, 0) * (l.stages.find((s) => s.id === m.fromStageId)?.labourRate ?? 0)),
       })),
       moves: undefined,
     };
@@ -233,8 +240,31 @@ export async function resolveStageLineId(tx: Tx, productId: number): Promise<num
 }
 
 /**
+ * The in-house piece rate each step of a stage line is worth for a product, taken
+ * from the LABOUR lines of its live cost sheet.
+ *
+ * The costed figure is a REFERENCE — it seeds the rate on a new order and nothing
+ * more, because what a worker is actually paid is agreed per order. A step with
+ * several labour lines mapped to it sums them; a step with none is worth zero, which
+ * simply means that stage is day-wage work.
+ */
+export async function labourRatesForProduct(tx: Tx, productId: number): Promise<Map<number, number>> {
+  const lines = await tx.costLine.findMany({
+    where: { stageStepId: { not: null }, group: { head: 'LABOUR', costSheet: { productId, isActive: true } } },
+    select: { stageStepId: true, qty: true, rate: true },
+  });
+  const map = new Map<number, number>();
+  for (const l of lines) {
+    if (l.stageStepId == null) continue;
+    map.set(l.stageStepId, round((map.get(l.stageStepId) ?? 0) + l.qty * l.rate));
+  }
+  return map;
+}
+
+/**
  * Create (or recreate) an order line's stage snapshot from its stage line. Stages
- * start in-house; who does what is set per stage afterwards.
+ * start in-house, with the piece rate defaulted from the product's costed labour;
+ * who does what — and what they are really paid — is set per stage afterwards.
  *
  * Refuses to wipe stages once pieces have started moving — history is sacred.
  */
@@ -246,9 +276,12 @@ export async function materializeStages(tx: Tx, orderLineId: number, stageLineId
   await tx.orderLineStage.deleteMany({ where: { orderLineId } });
   if (!stageLineId) return 0;
 
+  const line = await tx.orderLine.findUnique({ where: { id: orderLineId }, select: { productId: true } });
+  const rates = line ? await labourRatesForProduct(tx, line.productId) : new Map<number, number>();
+
   const steps = await tx.stageLineStep.findMany({ where: { stageLineId }, orderBy: { sortOrder: 'asc' } });
   for (let i = 0; i < steps.length; i++) {
-    await tx.orderLineStage.create({ data: { orderLineId, name: steps[i].name, sortOrder: i } });
+    await tx.orderLineStage.create({ data: { orderLineId, name: steps[i].name, sortOrder: i, labourRate: rates.get(steps[i].id) ?? 0 } });
   }
   return steps.length;
 }

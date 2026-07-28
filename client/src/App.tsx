@@ -25,10 +25,13 @@ import SheetsPage from './pages/operations/SheetsPage';
 import SheetDetailPage from './pages/operations/SheetDetailPage';
 import PaymentsPage from './pages/operations/PaymentsPage';
 import PartyStatementPage from './pages/operations/PartyStatementPage';
-import {
-  TeamOutlined,
-  ShoppingOutlined,
-} from '@ant-design/icons';
+import ManforceHome from './pages/manforce/ManforceHome';
+import WorkersPage from './pages/manforce/WorkersPage';
+import WorkerDetailPage from './pages/manforce/WorkerDetailPage';
+import MusterPage from './pages/manforce/MusterPage';
+import WagesPage from './pages/manforce/WagesPage';
+import StatutoryPage from './pages/manforce/StatutoryPage';
+import { ShoppingOutlined } from '@ant-design/icons';
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const { user, loading } = useAuth();
@@ -86,8 +89,15 @@ export default function AppRoutes() {
         <Route path="operations/payments" element={<PaymentsPage />} />
         <Route path="operations/payments/:partyType/:partyId" element={<PartyStatementPage />} />
 
+        {/* Manforce (Phase 3) */}
+        <Route path="manforce" element={<ManforceHome />} />
+        <Route path="manforce/workers" element={<WorkersPage />} />
+        <Route path="manforce/workers/:id" element={<WorkerDetailPage />} />
+        <Route path="manforce/muster" element={<MusterPage />} />
+        <Route path="manforce/wages" element={<WagesPage />} />
+        <Route path="manforce/statutory" element={<StatutoryPage />} />
+
         {/* Placeholder modules (future phases) */}
-        <Route path="manforce" element={<PlaceholderModule title="Manforce Management" icon={<TeamOutlined />} />} />
         <Route path="sales" element={<PlaceholderModule title="Finished Product & Sales Management" icon={<ShoppingOutlined />} />} />
 
         <Route path="*" element={<Navigate to="/" replace />} />

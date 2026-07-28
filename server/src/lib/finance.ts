@@ -15,7 +15,7 @@
  *    never leave a stale allocation behind — there is nothing to go stale.
  */
 import { round } from './costing';
-import { buildBoard, type MoveRow, type StageRow } from './production';
+import { buildBoard, clearances, type MoveRow, type StageRow } from './production';
 
 // ---------------------------------------------------------------------------
 // FIFO allocation
@@ -278,27 +278,9 @@ interface LineForEvents {
  * changing a rate afterwards restates the earnings for that stage.
  */
 export function jobworkEvents(order: { id: number; number: string }, line: LineForEvents): JobworkEvent[] {
-  const stageById = new Map(line.stages.map((s) => [s.id, s]));
   const events: JobworkEvent[] = [];
-  /** Pieces sent back INTO a stage that have not yet been cleared out again. */
-  const awaitingRedo = new Map<number, number>();
-
-  // Walk oldest-first so "was this a re-do?" can be answered as we go: a clearance
-  // counts as rework only while pieces are known to have come back to that stage.
-  const chronological = [...line.moves].sort((a, b) => byDate({ date: a.date!, id: a.id }, { date: b.date!, id: b.id }));
-  for (const m of chronological) {
-    if (m.kind === 'REJECT' && m.toStageId != null) {
-      awaitingRedo.set(m.toStageId, (awaitingRedo.get(m.toStageId) ?? 0) + m.qty);
-    }
-    if (m.kind !== 'ADVANCE' && m.kind !== 'COMPLETE') continue;
-    if (m.fromStageId == null) continue;
-    const stage = stageById.get(m.fromStageId);
-    if (!stage?.vendorId) continue;
-
-    const pending = awaitingRedo.get(stage.id) ?? 0;
-    const isRedo = pending > 0;
-    if (isRedo) awaitingRedo.set(stage.id, Math.max(pending - m.qty, 0));
-
+  for (const { move: m, stage, rework } of clearances(line.stages, line.moves)) {
+    if (!stage.vendorId) continue;
     events.push({
       moveId: m.id,
       date: m.date!,
@@ -315,7 +297,7 @@ export function jobworkEvents(order: { id: number; number: string }, line: LineF
       rate: stage.jobworkRate ?? 0,
       amount: round(m.qty * (stage.jobworkRate ?? 0)),
       note: m.note ?? null,
-      rework: isRedo,
+      rework,
     });
   }
   return events;

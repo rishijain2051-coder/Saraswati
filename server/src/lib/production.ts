@@ -163,6 +163,56 @@ export function buildBoard(qty: number, stages: StageRow[], moves: MoveRow[]): L
   };
 }
 
+/** A movement that cleared pieces out of a stage, i.e. work that was actually done. */
+export interface Clearance<S extends StageRow = StageRow, M extends MoveRow = MoveRow> {
+  move: M;
+  /** The stage the pieces left — the one whose work is being paid for. */
+  stage: S;
+  /** True while pieces are known to have come back to this stage after a rejection. */
+  rework: boolean;
+}
+
+/**
+ * Every clearance out of a stage, oldest first, with rework flagged.
+ *
+ * This is the one walk over the move ledger that answers "what work was done, and was
+ * it a re-do?". Both vendor jobwork (lib/finance.ts) and in-house labour
+ * (lib/workforce.ts) are priced from it, so the two can never disagree about what
+ * counted as a clearance.
+ *
+ * Work done twice counts twice — pieces rejected and re-done were genuinely worked on
+ * again — which is why this counts movements rather than distinct pieces, and why the
+ * totals agree with the board's `cleared` figure.
+ */
+export function clearances<S extends StageRow, M extends MoveRow>(stages: S[], moves: M[]): Clearance<S, M>[] {
+  const byId = new Map(stages.map((s) => [s.id, s]));
+  /** Pieces sent back INTO a stage that have not yet been cleared out of it again. */
+  const awaitingRedo = new Map<number, number>();
+  const out: Clearance<S, M>[] = [];
+
+  const chronological = [...moves].sort((a, b) => {
+    const d = new Date(a.date ?? 0).getTime() - new Date(b.date ?? 0).getTime();
+    return d !== 0 ? d : a.id - b.id;
+  });
+
+  for (const m of chronological) {
+    if (m.kind === 'REJECT' && m.toStageId != null) {
+      awaitingRedo.set(m.toStageId, (awaitingRedo.get(m.toStageId) ?? 0) + m.qty);
+    }
+    if (m.kind !== 'ADVANCE' && m.kind !== 'COMPLETE') continue;
+    if (m.fromStageId == null) continue;
+    const stage = byId.get(m.fromStageId);
+    if (!stage) continue;
+
+    const pending = awaitingRedo.get(stage.id) ?? 0;
+    const rework = pending > 0;
+    if (rework) awaitingRedo.set(stage.id, Math.max(pending - m.qty, 0));
+
+    out.push({ move: m, stage, rework });
+  }
+  return out;
+}
+
 export interface MoveRequest {
   kind: MoveKind;
   fromStageId?: number | null;

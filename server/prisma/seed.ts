@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { BUILTIN_METHODS } from '../src/lib/costing';
+import { migrateTypedWorkers, seedManforceDefaults } from './manforceSeed';
 
 const prisma = new PrismaClient();
 
@@ -287,6 +288,13 @@ async function main() {
   ];
   for (const r of rawItems) {
     await prisma.rawItem.upsert({ where: { code: r.code }, update: r, create: r });
+  }
+
+  // --- Manforce: settings, trades, statutory components -------------------
+  await seedManforceDefaults(prisma);
+  const migrated = await migrateTypedWorkers(prisma);
+  if (migrated.workers || migrated.entries) {
+    console.log(`  Manforce: created ${migrated.workers} worker(s) from ${migrated.entries} typed wage entr(ies).`);
   }
 
   console.log('Seed complete.');

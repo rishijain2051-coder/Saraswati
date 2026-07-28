@@ -7,6 +7,7 @@ import { ApiError, asyncHandler } from '../lib/http';
 import { authenticate, requireRole } from '../middleware/auth';
 import { computeCostSheet } from '../lib/productCosting';
 import { loadMethodMap } from '../lib/methods';
+import { diffCostSheet, logChanges } from '../lib/changeLog';
 import type { MethodMap } from '../lib/costing';
 import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
 
@@ -38,6 +39,12 @@ const lineSchema = z.object({
   unit: z.string().nullable().optional(),
   rate: z.number().default(0),
   sortOrder: z.number().int().optional().default(0),
+  /**
+   * Which production stage a LABOUR line pays for. Reference only: it seeds the
+   * in-house piece rate when an order snapshots its stages (see
+   * `labourRatesForProduct`) and has no effect whatsoever on the costing roll-up.
+   */
+  stageStepId: z.number().int().nullable().optional(),
 });
 
 const groupSchema = z.object({
@@ -140,7 +147,32 @@ function lineData(ln: z.infer<typeof lineSchema>) {
     unit: ln.unit ?? null,
     rate: ln.rate,
     sortOrder: ln.sortOrder ?? 0,
+    stageStepId: ln.stageStepId ?? null,
   };
+}
+
+/**
+ * A labour line may only point at a stage of the route the product actually travels.
+ *
+ * Otherwise the mapping is meaningless — an order snapshots the stages of its own
+ * stage line, so a rate hung off some other line's step would never be found and the
+ * stage would silently pay nothing.
+ */
+async function checkStageSteps(data: z.infer<typeof productSchema>) {
+  const wanted = [...new Set((data.costSheet?.groups ?? []).flatMap((g) => g.lines.map((l) => l.stageStepId).filter((v): v is number => v != null)))];
+  if (wanted.length === 0) return;
+  if (!data.stageLineId) throw new ApiError(400, 'Assign a stage line to the product before mapping labour to its stages.');
+
+  const steps = await prisma.stageLineStep.findMany({ where: { id: { in: wanted } }, select: { id: true, name: true, stageLineId: true } });
+  for (const id of wanted) {
+    const step = steps.find((s) => s.id === id);
+    if (!step) throw new ApiError(404, 'A labour line points at a production stage that no longer exists.');
+    if (step.stageLineId !== data.stageLineId) throw new ApiError(400, `"${step.name}" is not a stage of this product's stage line.`);
+  }
+  for (const g of data.costSheet?.groups ?? []) {
+    if (g.head === 'LABOUR') continue;
+    if (g.lines.some((l) => l.stageStepId != null)) throw new ApiError(400, `Only labour lines can be mapped to a production stage — "${g.name}" is ${g.head.toLowerCase().replace('_', ' ')}.`);
+  }
 }
 
 function costSheetCreate(cs: z.infer<typeof costSheetSchema>) {
@@ -327,6 +359,7 @@ router.post(
   canEdit,
   asyncHandler(async (req, res) => {
     const data = productSchema.parse(req.body);
+    await checkStageSteps(data);
     const product = await prisma.product.create({
       data: {
         ...scalarData(data),
@@ -353,6 +386,14 @@ router.put(
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const data = productSchema.parse(req.body);
+    await checkStageSteps(data);
+
+    // Read the old costing BEFORE the sheet is replaced, or its rates are gone and
+    // "what was this before?" becomes unanswerable.
+    const previous = await prisma.costSheet.findFirst({
+      where: { productId: id, isActive: true },
+      select: { factoryExpensePct: true, marginPct: true, groups: { select: { head: true, name: true, lines: { select: { name: true, rate: true, qty: true, wastagePct: true, unit: true } } } } },
+    });
 
     await prisma.$transaction(async (tx) => {
       await tx.product.update({ where: { id }, data: scalarData(data) });
@@ -371,6 +412,8 @@ router.put(
       if (data.costSheet) {
         await tx.costSheet.create({ data: { productId: id, ...costSheetCreate(data.costSheet) } });
       }
+
+      await logChanges(tx, { type: 'Product', id }, { id: req.user!.sub, name: req.user!.name }, diffCostSheet(previous, data.costSheet ?? null));
     });
 
     const product = await prisma.product.findUnique({ where: { id }, include: fullInclude });

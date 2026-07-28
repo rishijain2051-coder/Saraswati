@@ -6,9 +6,10 @@ Guidance for working in this repo.
 
 Modular ERP for Saraswati Export (furniture/hardware exporter). **Phase 1 =
 Product Management**, **Phase 2 = Operations** (proformas → orders → production
-board → payments). Manforce and Sales are still placeholders that route to
-`PlaceholderModule`. Product data (costing, dimensions, differentiated volumes)
-feeds Operations; Sales (container planning) comes later.
+board → payments), **Phase 3 = Manforce** (workers → muster → wages → statutory).
+Sales is still a placeholder that routes to `PlaceholderModule`. Product data
+(costing, dimensions, differentiated volumes) feeds Operations; the Operations board
+feeds Manforce; Sales (container planning) comes later.
 
 ## Architecture
 
@@ -150,6 +151,122 @@ Endpoints: `/finance/receivables` (per order + buyer credits), `/finance/payable
 `/finance/summary`. `financeTotals()` is shared with the dashboard so the two can
 never disagree.
 
+## Manforce — a worker is a running account
+
+**There are no pay periods.** The factory pays people when it pays them: a worker may
+draw an advance or go unpaid for two months. So a worker is an account like a jobwork
+vendor — earnings accrue as dated events, payments are ad-hoc, nothing is ever "run" or
+closed. Do not add a payroll-period model; it would be wrong on day one.
+
+- `server/src/lib/workforce.ts` is the **pure engine** (no DB) and
+  `server/src/lib/manforce.ts` is the **seam** that loads data into it — the same split
+  as `production.ts` / `orderBoard.ts`. Nothing derivable is stored: no wage table, no
+  balance column, no day count.
+- **Attendance is exceptions-only.** Every active worker is presumed present on a
+  working day; a row exists only to say otherwise (or to pay someone on a day off).
+  Which days count is Admin config (`WorkforceSetting.weeklyOffDays` + `Holiday`), and
+  `presumePresent` can switch the presumption off. Adding a holiday RESTATES past
+  accrual, which is the point of deriving it.
+- **Pay type decides which accrual applies** — DAY (rate × days), PIECE (board only,
+  so attendance can never double-pay), MONTHLY (pro-rata per working day, never a
+  lump). `monthlyPerDay()` honours the Admin's divisor; WORKING is exact, the FIXED_*
+  bases are conventional and documented as such.
+- **`Worker.accrualFrom` exists to stop double-paying history.** Wages used to be typed
+  against a name; a migrated worker starts accruing after their last manual entry.
+  Never default it to `joinedOn` for a migrated worker.
+- **Two figures, one identity.** `balance` = earned − deductions − statutory −
+  payments − advances (the party balance, used everywhere). `dueNow` is the same but with
+  advance *recovery* in place of the advance, honouring each advance's monthly cap.
+  `dueNow − advanceOutstanding === balance` — asserted in `verify.ts`. Break that and the
+  worker page and the payables page start disagreeing.
+- **Advance cash is ONE ledger row** (`LedgerEntry.advanceId @unique`, the same pattern
+  as `stockTxnId`). `WorkerAdvance` holds only the recovery terms. Deleting the payment
+  alone is refused; delete the advance and the cash goes with it.
+- **Piece work comes off the board.** `StageMoveWorker` names who cleared a stage with a
+  piece count each, which must sum to the movement's qty (`validateMoveWorkers`,
+  mirrored in `client/src/pages/operations/board/moveLogic.ts` — **keep those in sync**).
+  Priced at the stage's current `OrderLineStage.labourRate`, exactly as vendor jobwork is
+  priced, so rework earns again and the totals reconcile with the board's `cleared`
+  figure. `clearances()` in `production.ts` is the ONE walk over the move ledger that
+  both `jobworkEvents` and `labourEvents` are built on — do not fork it.
+- **Only a single-hop clearance can be attributed.** A move spanning several stages is
+  refused rather than guessed at, because each hop is a different stage's work. A vendor
+  stage refuses workers, and an in-house stage with workers named requires a rate (a zero
+  rate elsewhere is normal — that stage is day-wage work).
+- **Product LABOUR lines are REFERENCE only.** `CostLine.stageStepId` maps a labour line
+  to a step of the product's stage line; `labourRatesForProduct()` seeds
+  `OrderLineStage.labourRate` when an order snapshots its stages. Costing itself never
+  reads it — the roll-up and the example.xlsx FOB must stay byte-identical.
+- **Contractors are paid, gangs are not.** `Worker.contractorId` set = their earnings
+  roll into the contractor's balance, and paying the worker directly is refused. A gang
+  member is deliberately NOT a payable row of their own, or the money would count twice.
+- **Statutory is admin-defined data** (`StatutoryComponent`, seeded from
+  `BUILTIN_STATUTORY` exactly as `BUILTIN_METHODS` seeds cost formulas) and is incurred
+  **only when posted**. `StatutoryPostingLine` stores the wage base it used, because the
+  earnings behind it can legitimately be restated later and a posted liability must not
+  move. Overlapping periods for one component are refused. `isProvision` accrues a cost
+  that is never a payable.
+- **Worker money stays out of order costing** (a deliberate decision) but workers,
+  contractors and levies DO appear in `/finance/payables`, `/finance/parties`,
+  `/finance/statement` and the dashboard total.
+- **Dates are calendar facts.** Always go through `dayStart` / `dayKey` / `monthKey`.
+  `toISOString().slice(0,10)` on a local midnight names the day BEFORE east of UTC and
+  would shift a whole muster or statutory period; `verify.ts` guards this.
+- RBAC: Operator marks the muster, Manager+ for workers, rates, money and postings.
+  Identity and bank fields are redacted below Manager (`redact()` in the routes).
+
+## Remembering figures — suggestions vs the change log
+
+Two different questions, answered by two deliberately different mechanisms. Do not
+merge them.
+
+**"What did we use last time?" is DERIVED, never stored.** `server/src/lib/suggest.ts`
+holds the pure maths and `routes/suggest.routes.ts` reads it out of the live records —
+cost sheets, stock receipts, stage rates, orders and proformas — on every request.
+There is no price-memory table on purpose: a stored copy would drift the moment
+somebody corrected the original, and the correction is exactly what you want to see.
+
+- **Matching is by name, case- and space-insensitive** (`normalizeKey`). `CARVING
+  LABOUR`, `Carving Labour` and `carving  labour` are one item, because that is how the
+  sheets were actually typed. Nothing cleverer — fuzzy matching would silently merge
+  two genuinely different lines.
+- **Sources are kept SEPARATE, never averaged.** What a line was *costed* at and what a
+  supplier actually *billed* are different facts and the gap between them is the
+  interesting part. `assemble()` orders them most-comparable first and drops the empty
+  ones so the UI never shows a heading with nothing under it.
+- Everything relative is connected: a cost line reaches its own history in other
+  products, the **supplier receipts** for the matching raw item (matched on the GROUP
+  name, which is the material), and — when the line is mapped to a stage — what
+  **vendors charged** and **workers earned** for that stage. A product line on a
+  proforma or order reaches what that buyer, then any buyer, paid in the same currency.
+- **The window is a hard cut-off** (`AppSetting.suggestionWindowDays`, 365). Older
+  figures are not shown at all — a two-year-old rate is worse than no rate. A cost
+  sheet's date is its `createdAt`, because saving a product REPLACES the sheet, which
+  makes it the moment those rates were set.
+- **`outlier()` compares against the window's AVERAGE, not the last value**, and stays
+  silent below two past uses — one previous use is not a pattern. It never blocks; it is
+  a note beside a field to catch ₹2,600 typed for ₹260. `outlierOf()` in
+  `client/src/api/suggest.ts` mirrors it so the note updates as you type — **keep the
+  two in step.**
+- The costing wizard asks **once for the whole sheet** (`POST /suggest/cost-lines`).
+  Forty fields asking individually would be forty round-trips.
+
+**"Who changed this, and what was it?" is STORED, because nothing else can reconstruct
+it** — an edit destroys the old value. `server/src/lib/changeLog.ts`, surfaced as a
+History tab on the product, order and worker.
+
+- **Only money and rates are logged.** A log of every keystroke would bury the one entry
+  anybody ever needs.
+- `rootType`/`rootId` is the record a person would *open* to look. A cost line's own id
+  is useless for that, because saving a product replaces the whole sheet — so a rate
+  change is logged against the **product**.
+- `diffCostSheet()` must run **BEFORE** the sheet is replaced, or the old rates are
+  already gone. Lines are matched on group + line name, the same key suggestions use.
+- `differs()` ignores sub-paisa differences, which are rounding, not edits — so a save
+  that changed nothing logs nothing.
+- `wipeOperational()` in the demo seed clears the log FIRST: rows point at records by
+  id, and left behind they would resurface on whichever new record reuses that id.
+
 ## Proforma → order
 
 Accepting a PI is the only thing that creates an order (`POST /proformas/:id/accept`,
@@ -190,7 +307,11 @@ Undoing any of these reopens a hole that was closed deliberately:
 - `POST /orders/:id/moves` validates **inside** the write transaction; so does undo.
 - Delete routes report what references a record instead of letting a foreign key
   surface as a 500 — products, buyers, suppliers, raw items, currencies, units,
-  attributes, stage lines, stock receipts, users.
+  attributes, stage lines, stock receipts, users, trades, contractors, workers,
+  statutory components and postings.
+- **Worker identity and bank details are withheld below Manager** (`redact()` in
+  `manforce.routes.ts`). Filtering them in the client only would still ship them over
+  the wire to anyone with an Operator login.
 - `round()` nudges the magnitude, not the signed value, so negatives round
   symmetrically; `client/src/util/costing.ts` mirrors it exactly.
 
@@ -200,9 +321,10 @@ Undoing any of these reopens a hole that was closed deliberately:
 - `nextDocNumber(key, tx?)` — **pass the caller's `tx` when already inside
   `$transaction`.** A nested transaction deadlocks: SQLite serialises writes, so the
   inner one can never start until the outer commits (it times out after 5 s).
-- Uploads (product images and hand-over photos) share `server/uploads`, served at
-  `/uploads`. Hand-over photos are named `move-*` so the two are distinguishable on
-  disk; deleting a movement unlinks its files as well as its rows.
+- Uploads (product images, hand-over photos and worker documents) share
+  `server/uploads`, served at `/uploads`. Hand-over photos are named `move-*` and worker
+  photos/IDs `worker-*` so they are distinguishable on disk; deleting a movement or a
+  worker unlinks its files as well as its rows.
 - Product create uses Prisma *unchecked* input: scalar FKs (`productTypeId`, `createdById`, …)
   + nested child creates. Do NOT mix a scalar FK with a relation `connect` in one create.
 - Product update **replaces** buyers / related / cost sheet in a transaction.
@@ -220,13 +342,18 @@ npm run build        # type-check + build both (run before declaring done)
 ```bash
 npm run verify       # DB-free self-checks — run these before declaring done
 npm run db:demo      # rebuild the investor demo (wipes operational data first)
+npm run db:workers   # migrate typed wage names onto worker records (idempotent)
 ```
 
 `prisma/verify.ts` holds the invariants as pure-function assertions with fixed inputs:
 the example.xlsx FOB (₹19,180.60), board conservation, the move rules, hop expansion,
-jobwork reconciliation and FIFO allocation. It needs no database, so it survives any
-wipe — **this is now the authority for the costing formulas**, not a seeded product.
-Add a case here whenever you touch `costing.ts`, `production.ts` or `finance.ts`.
+jobwork reconciliation, FIFO allocation, and the whole workforce engine — the
+working-day calendar, exceptions-only accrual, pro-rata salary, piece attribution,
+statutory maths and the `dueNow − advanceOutstanding === balance` identity, plus the
+suggestion maths (name normalisation, which source leads, the outlier threshold). It
+needs no database, so it survives any wipe — **this is now the authority for the costing
+formulas**, not a seeded product. Add a case here whenever you touch `costing.ts`,
+`production.ts`, `finance.ts`, `workforce.ts` or `suggest.ts`.
 
 `prisma/demoSeed.ts` builds a whole factory mid-season — 10 photographed products
 with real costing, three buyers in GBP/USD/EUR, proformas at every stage of the sales

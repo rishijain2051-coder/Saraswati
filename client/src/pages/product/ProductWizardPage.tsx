@@ -111,7 +111,7 @@ export default function ProductWizardPage() {
 
   const steps = [
     { title: 'Product Detail', content: <StepDetails draft={draft} set={set} errors={errors} /> },
-    { title: 'Costing Sheet', content: <StepCosting draft={draft} set={set} /> },
+    { title: 'Costing Sheet', content: <StepCosting draft={draft} set={set} productId={editing ? Number(id) : undefined} /> },
     { title: 'Related Products', content: <StepRelated draft={draft} set={set} currentId={editing ? Number(id) : undefined} /> },
     {
       title: 'Images',

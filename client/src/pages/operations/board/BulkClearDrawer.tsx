@@ -191,7 +191,8 @@ export default function BulkClearDrawer({ order, open, onClose }: { order: Order
             <Text strong>Hand-over note</Text>
             <Input.TextArea rows={3} placeholder="Applies to every movement in this batch" value={comment} onChange={(e) => setComment(e.target.value)} />
             <Text type="secondary" style={{ fontSize: 12 }}>
-              Photos are attached per item — open a single bucket on the board for that.
+              Photos are attached per item, and so is who did the work — open a single bucket on the board for either. A bulk clearance records the pieces moving but names nobody, so it
+              accrues no in-house piece wages.
             </Text>
           </div>
         </Space>

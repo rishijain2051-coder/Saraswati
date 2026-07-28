@@ -19,6 +19,7 @@ import { PrismaClient } from '@prisma/client';
 import { BUILTIN_METHODS, round } from '../src/lib/costing';
 import { computeCostSheet } from '../src/lib/productCosting';
 import { loadMethodMap } from '../src/lib/methods';
+import { seedManforceDefaults } from './manforceSeed';
 
 const prisma = new PrismaClient();
 
@@ -415,8 +416,148 @@ const CBM_PER_CUBIC_INCH = 0.0000163871;
 const cbmOf = (d: { l: number; w: number; h: number }) => round(d.l * d.w * d.h * CBM_PER_CUBIC_INCH, 4);
 
 // ---------------------------------------------------------------------------
+// The workforce
+// ---------------------------------------------------------------------------
+
+/** Trades, a gang, eight workers, some exceptions on the muster, and their money. */
+async function seedWorkforce(adminId: number) {
+  await seedManforceDefaults(prisma);
+  const trades = await prisma.trade.findMany();
+  const tradeId = (name: string) => trades.find((t) => t.name === name)?.id ?? null;
+  const components = await prisma.statutoryComponent.findMany();
+  const componentId = (code: string) => components.find((c) => c.code === code)!.id;
+
+  const contractor = await prisma.contractor.create({
+    data: { code: 'CTR-0001', name: 'Ismail Bhai (gang)', contactName: 'Ismail Khan', phone: '98290 11223', paymentTerms: 'Settled weekly, cash', notes: 'Supplies helpers for sanding and packing.' },
+  });
+
+  const defs = [
+    { name: 'Ramesh Suthar', trade: 'Carpenter', payType: 'DAY', dailyRate: 750, otHourlyRate: 190, phone: '98280 45511', joined: 400, cover: ['PF', 'ESI'] },
+    { name: 'Mahesh Jangid', trade: 'Polisher', payType: 'PIECE', phone: '99280 77341', joined: 260, cover: ['ESI'] },
+    { name: 'Suresh Prajapat', trade: 'Sander', payType: 'DAY', dailyRate: 620, phone: '94140 22190', joined: 210, cover: ['ESI'] },
+    { name: 'Kailash Meghwal', trade: 'Packer', payType: 'DAY', dailyRate: 560, joined: 150, cover: [] },
+    { name: 'Dinesh Khatri', trade: 'Fitter', payType: 'PIECE', phone: '90240 55178', joined: 120, cover: [] },
+    { name: 'Gopal Vishnoi', trade: 'Supervisor', payType: 'MONTHLY', monthlySalary: 27000, phone: '90010 33456', joined: 520, cover: ['PF'] },
+    { name: 'Pooja Devi', trade: 'Helper', payType: 'DAY', dailyRate: 480, joined: 95, gang: true, cover: [] },
+    { name: 'Bhanwar Lal', trade: 'Helper', payType: 'DAY', dailyRate: 480, joined: 80, gang: true, cover: [] },
+  ] as const;
+
+  const workers: Record<string, number> = {};
+  let n = 0;
+  for (const d of defs) {
+    const w = await prisma.worker.create({
+      data: {
+        code: `WRK-${String(++n).padStart(4, '0')}`,
+        name: d.name,
+        tradeId: tradeId(d.trade),
+        contractorId: 'gang' in d && d.gang ? contractor.id : null,
+        payType: d.payType,
+        dailyRate: 'dailyRate' in d ? d.dailyRate : 0,
+        otHourlyRate: 'otHourlyRate' in d ? d.otHourlyRate : 0,
+        monthlySalary: 'monthlySalary' in d ? d.monthlySalary : 0,
+        phone: 'phone' in d ? d.phone : null,
+        joinedOn: ago(d.joined),
+        createdById: adminId,
+      },
+    });
+    workers[d.name] = w.id;
+    for (const code of d.cover) {
+      await prisma.workerStatutory.create({ data: { workerId: w.id, componentId: componentId(code), covered: true } });
+    }
+  }
+  await prisma.docSequence.update({ where: { key: 'WRK' }, data: { lastNo: n } });
+  await prisma.docSequence.update({ where: { key: 'CTR' }, data: { lastNo: 1 } });
+
+  // A handful of exceptions — the rest of the calendar is presumed present.
+  const mark = (name: string, days: number, status: string, otHours = 0, note?: string) => {
+    const d = ago(days);
+    return prisma.attendance.create({
+      data: { workerId: workers[name], date: new Date(d.getFullYear(), d.getMonth(), d.getDate()), status, otHours, note: note ?? null, createdById: adminId },
+    });
+  };
+  await mark('Kailash Meghwal', 2, 'ABSENT', 0, 'Family function');
+  await mark('Suresh Prajapat', 3, 'HALF_DAY', 0, 'Left after lunch');
+  await mark('Ramesh Suthar', 3, 'PRESENT', 3, 'Stayed back for the QC lot');
+  await mark('Bhanwar Lal', 4, 'LEAVE', 0, 'Unpaid — village');
+  await mark('Pooja Devi', 5, 'PAID_LEAVE', 0, 'Approved');
+  await mark('Ramesh Suthar', 9, 'PRESENT', 2, 'Overtime on the almirah doors');
+  await mark('Gopal Vishnoi', 10, 'ABSENT', 0, 'Sick');
+
+  // Piece rates on the in-house stages that have actually cleared pieces, then name
+  // who did the work. Priced off the board, exactly as jobwork is.
+  const RATES: Record<string, number> = { 'Raw joining': 55, 'Raw sanding': 30, 'Accessory fitting': 45, Packaging: 22, Packing: 22 };
+  const stages = await prisma.orderLineStage.findMany({ where: { vendorId: null, name: { in: Object.keys(RATES) } } });
+  for (const s of stages) await prisma.orderLineStage.update({ where: { id: s.id }, data: { labourRate: RATES[s.name] } });
+
+  const crews: Record<string, string[]> = {
+    'Raw joining': ['Ramesh Suthar'],
+    'Raw sanding': ['Suresh Prajapat', 'Pooja Devi'],
+    'Accessory fitting': ['Dinesh Khatri'],
+    Packaging: ['Kailash Meghwal', 'Bhanwar Lal'],
+    Packing: ['Kailash Meghwal'],
+  };
+  const stageById = new Map(stages.map((s) => [s.id, s]));
+  const cleared = await prisma.stageMove.findMany({ where: { kind: { in: ['ADVANCE', 'COMPLETE'] }, fromStageId: { in: stages.map((s) => s.id) } } });
+  let attributed = 0;
+  for (const move of cleared) {
+    const stage = stageById.get(move.fromStageId!);
+    const crew = stage ? crews[stage.name] ?? [] : [];
+    if (!crew.length) continue;
+    // Split the pieces across the crew, remainder to the first of them, so the counts
+    // always add up to the movement exactly.
+    const each = Math.floor(move.qty / crew.length);
+    const split = crew.map((_, i) => (i === 0 ? move.qty - each * (crew.length - 1) : each)).filter((q) => q > 0);
+    if (split.reduce((a, q) => a + q, 0) !== move.qty) continue;
+    for (const [i, pieces] of split.entries()) {
+      await prisma.stageMoveWorker.create({ data: { moveId: move.id, workerId: workers[crew[i]], pieces } });
+    }
+    attributed++;
+  }
+
+  // Money: one part payment, one capped advance still being worked off, one charge
+  // back, and a payment to the gang.
+  const pay = (name: string, amount: number, days: number, note: string, ref?: string) =>
+    prisma.ledgerEntry.create({
+      data: { partyType: 'WORKER', workerId: workers[name], partyName: name, kind: 'PAYMENT', amount, currency: 'INR', date: ago(days), ref: ref ?? null, note, createdById: adminId },
+    });
+  await pay('Ramesh Suthar', 240000, 12, 'Wages on account', 'UPI-88213');
+  await pay('Kailash Meghwal', 60000, 9, 'Wages on account', 'CASH');
+  await pay('Gopal Vishnoi', 180000, 15, 'Salary on account', 'NEFT');
+
+  const advance = await prisma.workerAdvance.create({
+    data: { workerId: workers['Suresh Prajapat'], amount: 8000, date: ago(40), recoveryPerMonth: 1500, note: 'Advance for a wedding', createdById: adminId },
+  });
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'WORKER', workerId: workers['Suresh Prajapat'], partyName: 'Suresh Prajapat', kind: 'PAYMENT', amount: 8000, currency: 'INR', date: ago(40), note: 'Advance for a wedding', advanceId: advance.id, createdById: adminId },
+  });
+  await prisma.workerDeduction.create({ data: { workerId: workers['Kailash Meghwal'], amount: 320, reason: 'Canteen', date: ago(6), createdById: adminId } });
+  await prisma.workerDeduction.create({ data: { workerId: workers['Dinesh Khatri'], amount: 750, reason: 'Damaged glass panel', date: ago(18), createdById: adminId } });
+
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'CONTRACTOR', contractorId: contractor.id, partyName: contractor.name, kind: 'PAYMENT', amount: 45000, currency: 'INR', date: ago(11), ref: 'CASH', note: 'Part payment to the gang', createdById: adminId },
+  });
+
+  console.log(`  ${defs.length} workers (1 gang of 2), ${attributed} clearances attributed, wages left derived`);
+}
+
+// ---------------------------------------------------------------------------
 
 async function wipeOperational() {
+  // Change-log rows point at records by id. Left behind, they would resurface on
+  // whichever new product or order happens to be given the same id.
+  await prisma.changeLog.deleteMany();
+  // The workforce goes next: its rows reference movements and the ledger, and a
+  // worker left behind would carry attendance for a factory that no longer exists.
+  await prisma.statutoryPostingLine.deleteMany();
+  await prisma.statutoryPosting.deleteMany();
+  await prisma.workerDeduction.deleteMany();
+  await prisma.workerAdvance.deleteMany();
+  await prisma.attendance.deleteMany();
+  await prisma.workerStatutory.deleteMany();
+  await prisma.workerDocument.deleteMany();
+  await prisma.stageMoveWorker.deleteMany();
+  await prisma.worker.deleteMany();
+  await prisma.contractor.deleteMany();
   await prisma.stageMovePhoto.deleteMany();
   await prisma.stageMove.deleteMany();
   await prisma.orderLineStage.deleteMany();
@@ -639,7 +780,31 @@ async function main() {
     fs.copyFileSync(src, path.join(UPLOADS, filename));
     await prisma.productImage.create({ data: { productId: created.id, filename, originalName: p.image, url: `/uploads/${filename}`, isPrimary: true, caption: p.name, sortOrder: 0 } });
   }
-  console.log(`  ${PRODUCTS.length} products with photos and costing`);
+  // Map each product's LABOUR lines onto the stages of the route it travels. This is
+  // REFERENCE only — it seeds the in-house piece rate when an order snapshots its
+  // stages, and lets the costing wizard show what that stage really paid.
+  const LABOUR_TO_STAGE: Record<string, string[]> = {
+    'CNC / CUTTING': ['Raw joining'],
+    'CARCASS ASSEMBLY': ['Raw joining'],
+    SANDING: ['Raw sanding'],
+    'POLISHING LABOUR': ['Polishing', 'Powder coating'],
+    'FITTING & QC': ['Accessory fitting', 'Fitting'],
+    'PACKING LABOUR': ['Packaging', 'Packing'],
+  };
+  let mapped = 0;
+  for (const product of await prisma.product.findMany({ where: { stageLineId: { not: null } }, select: { id: true, stageLineId: true } })) {
+    const steps = await prisma.stageLineStep.findMany({ where: { stageLineId: product.stageLineId! }, select: { id: true, name: true } });
+    const lines = await prisma.costLine.findMany({ where: { group: { head: 'LABOUR', costSheet: { productId: product.id, isActive: true } } }, select: { id: true, name: true } });
+    for (const l of lines) {
+      const wanted = LABOUR_TO_STAGE[l.name] ?? [];
+      const step = steps.find((s) => wanted.includes(s.name));
+      if (!step) continue;
+      await prisma.costLine.update({ where: { id: l.id }, data: { stageStepId: step.id } });
+      mapped++;
+    }
+  }
+
+  console.log(`  ${PRODUCTS.length} products with photos and costing, ${mapped} labour lines mapped to stages`);
 
   // Variants inside a collection.
   for (const [a, b] of [
@@ -904,12 +1069,13 @@ async function main() {
   await prisma.ledgerEntry.create({
     data: { partyType: 'SUPPLIER', supplierId: sup['SUP-TIMBER'], partyName: 'Sharma Timber Traders', kind: 'PAYMENT', amount: 50000, currency: 'INR', date: ago(30), ref: 'RTGS part payment', createdById: admin.id },
   });
-  await prisma.ledgerEntry.create({
-    data: { partyType: 'WORKER', partyName: 'Floor wages — week 31', kind: 'BILL', amount: 86400, currency: 'INR', date: ago(7), ref: 'WK31', note: '18 workers × 6 days', createdById: admin.id },
-  });
-  await prisma.ledgerEntry.create({
-    data: { partyType: 'WORKER', partyName: 'Floor wages — week 31', kind: 'PAYMENT', amount: 86400, currency: 'INR', date: ago(6), ref: 'CASH WK31', createdById: admin.id },
-  });
+  // --- the workforce ------------------------------------------------------
+  //
+  // Wages are DERIVED here, exactly as they are in the running app: nothing is billed.
+  // Attendance is exceptions-only, so these workers earn for every working day since
+  // they joined unless a row below says otherwise, and the piece workers earn from the
+  // clearances they are named on.
+  await seedWorkforce(admin.id);
 
   // Document counters continue from what the demo used.
   await prisma.docSequence.update({ where: { key: 'PI' }, data: { lastNo: piNo } });

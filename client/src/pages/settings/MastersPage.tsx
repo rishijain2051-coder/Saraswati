@@ -5,6 +5,9 @@ import { Link } from 'react-router-dom';
 import MasterCrud, { type FieldDef } from '../../components/MasterCrud';
 import FormulasTab from './FormulasTab';
 import StageLinesTab from './StageLinesTab';
+import WorkforceTab from './WorkforceTab';
+import StatutoryTab from './StatutoryTab';
+import SuggestionsTab from './SuggestionsTab';
 import CurrencyRatesImport from './CurrencyRatesImport';
 import { useCurrencies, useMeta } from '../../api/hooks';
 import { useAuth } from '../../auth/AuthContext';
@@ -34,6 +37,25 @@ const buyerFields: FieldDef[] = [
   { name: 'contactName', label: 'Contact', type: 'text' },
   { name: 'email', label: 'Email', type: 'text' },
   { name: 'phone', label: 'Phone', type: 'text' },
+  { name: 'isActive', label: 'Active', type: 'switch', defaultValue: true, width: 90 },
+];
+
+const tradeFields: FieldDef[] = [
+  { name: 'name', label: 'Trade', type: 'text', required: true },
+  { name: 'sortOrder', label: 'Order', type: 'number', defaultValue: 0, width: 90 },
+  { name: 'isActive', label: 'Active', type: 'switch', defaultValue: true, width: 90 },
+];
+
+/** A labour contractor: their gang's earnings roll up here and one payment settles it. */
+const contractorFields: FieldDef[] = [
+  { name: 'code', label: 'Code', type: 'text', width: 100 },
+  { name: 'name', label: 'Name', type: 'text', required: true },
+  { name: 'contactName', label: 'Contact', type: 'text' },
+  { name: 'phone', label: 'Phone', type: 'text', width: 130 },
+  { name: 'gstNo', label: 'GST', type: 'text', hideInTable: true },
+  { name: 'panNo', label: 'PAN', type: 'text', hideInTable: true },
+  { name: 'address', label: 'Address', type: 'text', hideInTable: true },
+  { name: 'paymentTerms', label: 'Terms', type: 'text', hideInTable: true },
   { name: 'isActive', label: 'Active', type: 'switch', defaultValue: true, width: 90 },
 ];
 
@@ -95,6 +117,11 @@ export default function MastersPage() {
             { key: 'attributes', label: 'Attributes', children: <AttributesTab /> },
             { key: 'stage-lines', label: 'Stage Lines', children: <StageLinesTab /> },
             { key: 'formulas', label: 'Cost Formulas', children: <FormulasTab /> },
+            { key: 'trades', label: 'Trades', children: <MasterCrud endpoint="/trades" queryKey={['trades']} fields={tradeFields} /> },
+            { key: 'contractors', label: 'Contractors', children: <MasterCrud endpoint="/contractors" queryKey={['contractors']} fields={contractorFields} /> },
+            { key: 'working-days', label: 'Working Days', children: <WorkforceTab /> },
+            { key: 'statutory', label: 'Statutory', children: <StatutoryTab /> },
+            { key: 'suggestions', label: 'Memory', children: <SuggestionsTab /> },
           ]}
         />
       </Card>

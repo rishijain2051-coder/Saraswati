@@ -5,6 +5,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, apiError } from '../../../api/client';
 import { OPS_KEYS, useStageLines, useSuppliers, type Order, type OrderLineDto, type StageCell } from '../../../api/ops';
 import { money } from '../../../util/format';
+import { RateHint } from '../../../components/HistoryHint';
 
 const { Text } = Typography;
 
@@ -14,6 +15,8 @@ interface StageEdit {
   sortOrder: number;
   vendorId: number | null;
   jobworkRate: number;
+  /** In-house piece rate. Zero is normal: that stage is day-wage work. */
+  labourRate: number;
 }
 
 /**
@@ -37,7 +40,7 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
   useEffect(() => {
     if (!line) return;
     setStageLineId(line.stageLineId ?? null);
-    setStages(line.board.stages.map((s: StageCell) => ({ id: s.id, name: s.name, sortOrder: s.sortOrder, vendorId: s.vendorId, jobworkRate: s.jobworkRate })));
+    setStages(line.board.stages.map((s: StageCell) => ({ id: s.id, name: s.name, sortOrder: s.sortOrder, vendorId: s.vendorId, jobworkRate: s.jobworkRate, labourRate: s.labourRate })));
     setBulkVendor(0);
     setBulkFrom(undefined);
     setBulkTo(undefined);
@@ -47,7 +50,7 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
     mutationFn: () =>
       api.patch(`/order-lines/${line!.id}/routing`, {
         ...(stageLineId !== (line!.stageLineId ?? null) ? { stageLineId } : {}),
-        stages: stages.map((s) => ({ id: s.id, vendorId: s.vendorId, jobworkRate: s.jobworkRate })),
+        stages: stages.map((s) => ({ id: s.id, vendorId: s.vendorId, jobworkRate: s.jobworkRate, labourRate: s.labourRate })),
       }),
     onSuccess: () => {
       message.success('Saved.');
@@ -61,12 +64,15 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
 
   const changingLine = stageLineId !== (line.stageLineId ?? null);
   const missingRate = stages.find((s) => s.vendorId && s.jobworkRate <= 0);
+  // A vendor is paid for the stage, so an in-house piece rate on it would be a second
+  // charge for the same work.
+  const doublePaid = stages.find((s) => s.vendorId && s.labourRate > 0);
 
   const applyRange = () => {
     if (bulkFrom == null || bulkTo == null) return;
     const lo = Math.min(bulkFrom, bulkTo);
     const hi = Math.max(bulkFrom, bulkTo);
-    setStages((prev) => prev.map((s) => (s.sortOrder >= lo && s.sortOrder <= hi ? { ...s, vendorId: bulkVendor || null } : s)));
+    setStages((prev) => prev.map((s) => (s.sortOrder >= lo && s.sortOrder <= hi ? { ...s, vendorId: bulkVendor || null, labourRate: bulkVendor ? 0 : s.labourRate } : s)));
   };
 
   const cols = [
@@ -81,7 +87,7 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
           size="small"
           style={{ width: 200 }}
           value={v ?? 0}
-          onChange={(val) => setStages((prev) => prev.map((s) => (s.id === r.id ? { ...s, vendorId: val || null } : s)))}
+          onChange={(val) => setStages((prev) => prev.map((s) => (s.id === r.id ? { ...s, vendorId: val || null, labourRate: val ? 0 : s.labourRate } : s)))}
           options={[
             { label: 'In-house', value: 0 },
             ...(vendors ?? []).map((x) => ({ label: x.name, value: x.id })),
@@ -106,9 +112,56 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
         />
       ),
     },
+    {
+      title: '',
+      key: 'jobworkHistory',
+      width: 34,
+      render: (_: unknown, r: StageEdit) => (
+        <RateHint
+          kind="JOBWORK"
+          stage={r.name}
+          vendorId={r.vendorId}
+          value={r.jobworkRate}
+          unitSuffix="/pc"
+          onApply={(v) => setStages((prev) => prev.map((s) => (s.id === r.id ? { ...s, jobworkRate: v } : s)))}
+        />
+      ),
+    },
+    {
+      title: 'Labour ₹/pc',
+      dataIndex: 'labourRate',
+      width: 130,
+      render: (v: number, r: StageEdit) => (
+        <InputNumber
+          size="small"
+          min={0}
+          step={1}
+          style={{ width: 110 }}
+          value={v}
+          disabled={!!r.vendorId}
+          placeholder="day wage"
+          onChange={(val) => setStages((prev) => prev.map((s) => (s.id === r.id ? { ...s, labourRate: val ?? 0 } : s)))}
+        />
+      ),
+    },
+    {
+      title: '',
+      key: 'labourHistory',
+      width: 34,
+      render: (_: unknown, r: StageEdit) => (
+        <RateHint
+          kind="LABOUR"
+          stage={r.name}
+          value={r.labourRate}
+          unitSuffix="/pc"
+          onApply={(v) => setStages((prev) => prev.map((s) => (s.id === r.id ? { ...s, labourRate: v } : s)))}
+        />
+      ),
+    },
   ];
 
   const jobworkTotal = stages.reduce((a, s) => a + (s.vendorId ? s.jobworkRate * line.qty : 0), 0);
+  const labourTotal = stages.reduce((a, s) => a + (!s.vendorId ? s.labourRate * line.qty : 0), 0);
 
   // A readable summary of the split, e.g. "1-3 in-house · 4 Shakti · 5-6 in-house".
   const runs: { label: string; from: number; to: number }[] = [];
@@ -135,7 +188,7 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
       footer={
         <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
           <Button onClick={onClose}>Cancel</Button>
-          <Button type="primary" loading={save.isPending} disabled={(changingLine && started) || !!missingRate} onClick={() => save.mutate()}>
+          <Button type="primary" loading={save.isPending} disabled={(changingLine && started) || !!missingRate || !!doublePaid} onClick={() => save.mutate()}>
             Save routing
           </Button>
         </Space>
@@ -186,6 +239,14 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
         <Table<StageEdit> rowKey="id" size="small" columns={cols as any} dataSource={stages} pagination={false} />
 
         {missingRate && <Alert type="error" showIcon message={`Set a jobwork rate for "${missingRate.name}" — a vendor stage at ₹0 would bill nothing.`} />}
+        {doublePaid && (
+          <Alert
+            type="error"
+            showIcon
+            message={`Clear the labour rate on "${doublePaid.name}"`}
+            description="It is going to a vendor, so the vendor is paid for that stage — leaving an in-house piece rate on it would pay for the same work twice."
+          />
+        )}
 
         {stages.length > 0 && (
           <Alert
@@ -200,7 +261,14 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
                 ))}
               </Space>
             }
-            description={jobworkTotal > 0 ? `Jobwork at full quantity: ${money(jobworkTotal, '₹')}` : 'Nothing outsourced — all in-house.'}
+            description={
+              <span>
+                {jobworkTotal > 0 ? `Jobwork at full quantity: ${money(jobworkTotal, '₹')}. ` : 'Nothing outsourced — all in-house. '}
+                {labourTotal > 0
+                  ? `In-house piece work at full quantity: ${money(labourTotal, '₹')} — earned by whoever is named on each clearance.`
+                  : 'No in-house piece rates, so those stages are day-wage work.'}
+              </span>
+            }
           />
         )}
       </Space>

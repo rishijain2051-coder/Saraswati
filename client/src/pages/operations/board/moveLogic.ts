@@ -120,6 +120,42 @@ export function suggestedTarget(board: LineBoard, from: Endpoint): Endpoint {
   return next ? { kind: 'STAGE', stage: next } : DONE;
 }
 
+/**
+ * Whether this move can say who did the work, and why not when it cannot.
+ *
+ * Mirrors the server: only a clearance is work done, a clearance crossing several
+ * stages cannot attribute each one, and an outsourced stage pays its vendor instead.
+ */
+export function attributionState(board: LineBoard, from: Endpoint | null, to: Endpoint | null): { allowed: boolean; stage: StageCell | null; reason?: string } {
+  if (!from || !to) return { allowed: false, stage: null };
+  const kind = deriveKind(from, to);
+  if (kind !== 'ADVANCE' && kind !== 'COMPLETE') return { allowed: false, stage: null, reason: 'Only clearing pieces forward, or finishing them, counts as work done.' };
+  if (from.kind !== 'STAGE') return { allowed: false, stage: null };
+  const stage = board.stages.find((s) => s.id === from.stage.id) ?? from.stage;
+  if (stage.vendorId) return { allowed: false, stage, reason: `${stage.name} is outsourced — ${stage.vendor?.name ?? 'the vendor'} is paid for it.` };
+  if (hopsBetween(board, from, to).length > 1) {
+    return { allowed: false, stage, reason: 'This clearance crosses several stages, so it cannot say who did which. Clear one stage at a time to record the workers.' };
+  }
+  return { allowed: true, stage };
+}
+
+/** Mirror of the server's `validateMoveWorkers` — keep the two in step. */
+export function validateWorkers(qty: number, workers: { workerId?: number; pieces?: number }[], stage: StageCell | null): string | null {
+  const filled = workers.filter((w) => w.workerId != null);
+  if (filled.length === 0) return null;
+  if (!stage) return 'Pick the stage the work was done at.';
+  const ids = new Set<number>();
+  for (const w of filled) {
+    if (!w.pieces || !Number.isInteger(w.pieces) || w.pieces <= 0) return 'Give each worker a whole number of 1 piece or more.';
+    if (ids.has(w.workerId!)) return 'The same worker is listed twice — combine their pieces into one line.';
+    ids.add(w.workerId!);
+  }
+  const total = filled.reduce((a, w) => a + (w.pieces ?? 0), 0);
+  if (total !== qty) return `The pieces per worker add up to ${total}, but ${qty} pc are being moved.`;
+  if (!(stage.labourRate > 0)) return `${stage.name} has no piece rate, so there is nothing to pay the workers named on it. Set a labour rate on the stage first.`;
+  return null;
+}
+
 /** True when the pieces are changing hands between us and a vendor (or vice versa). */
 export function crossesHands(from: Endpoint | null, to: Endpoint | null): boolean {
   const fromVendor = from?.kind === 'STAGE' ? from.stage.vendorId : null;

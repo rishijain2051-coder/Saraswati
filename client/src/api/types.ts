@@ -79,6 +79,12 @@ export interface CostLine {
   unit?: string | null;
   rate: number;
   sortOrder?: number;
+  /**
+   * Which production stage a LABOUR line pays for. Reference only — it seeds the
+   * in-house piece rate when an order snapshots its stages, and has no effect at all
+   * on the costing roll-up.
+   */
+  stageStepId?: number | null;
   measure?: number;
   amount?: number;
 }

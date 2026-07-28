@@ -14,6 +14,8 @@ import { loadOrder, loadSerializedOrder, materializeStages, orderInclude, resolv
 import { proformaPdf } from '../lib/docPdf';
 import { buildEml, mailtoUrl, proformaMail } from '../lib/mailDraft';
 import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
+import { validateMoveWorkers } from '../lib/workforce';
+import { diffFields, logChanges } from '../lib/changeLog';
 
 const router = Router();
 router.use(authenticate);
@@ -185,6 +187,15 @@ router.put(
         if (l.id) {
           const prev = existing.lines.find((x) => x.id === l.id)!;
           await tx.orderLine.update({ where: { id: l.id }, data: { productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i } });
+          await logChanges(
+            tx,
+            { type: 'Order', id },
+            { id: req.user!.sub, name: req.user!.name },
+            diffFields('OrderLine', l.id, prev, { unitPrice: l.unitPrice, qty: l.qty }, [
+              { field: 'unitPrice', label: 'unit price' },
+              { field: 'qty', label: 'quantity' },
+            ], prev.product.factoryCode)
+          );
           if (l.productId !== prev.productId) {
             const stageLineId = await resolveStageLineId(tx, l.productId);
             await tx.orderLine.update({ where: { id: l.id }, data: { stageLineId } });
@@ -239,6 +250,8 @@ const routingSchema = z.object({
         id: z.number().int(),
         vendorId: z.number().int().nullable().optional(),
         jobworkRate: z.number().min(0).optional(),
+        /** ₹ per piece for in-house workers. Zero is normal — that stage is day-wage. */
+        labourRate: z.number().min(0).optional(),
         note: z.string().nullable().optional(),
       })
     )
@@ -276,6 +289,17 @@ router.patch(
       const vendorId = s.vendorId !== undefined ? s.vendorId : current.vendorId;
       const rate = s.jobworkRate !== undefined ? s.jobworkRate : current.jobworkRate;
       if (vendorId && rate <= 0) throw new ApiError(400, `Set a jobwork rate for "${current.name}" — an outsourced stage with a zero rate would bill nothing.`);
+
+      // Handing a stage to a vendor means workers are no longer paid for it, so any
+      // piece rate that had already been earned there must not be silently rewritten.
+      const labourRate = s.labourRate !== undefined ? s.labourRate : current.labourRate;
+      if (vendorId && labourRate > 0) throw new ApiError(400, `"${current.name}" is going to a vendor, so clear its in-house piece rate first — the vendor is paid for it now, not the workers.`);
+      if (s.labourRate !== undefined && s.labourRate !== current.labourRate) {
+        const earned = await prisma.stageMoveWorker.count({ where: { move: { fromStageId: s.id } } });
+        if (earned > 0 && s.labourRate <= 0) {
+          throw new ApiError(409, `Workers have already been paid for ${earned} piece movement(s) at "${current.name}". Clearing its rate would wipe what they earned.`);
+        }
+      }
     }
 
     await prisma.$transaction(async (tx) => {
@@ -285,14 +309,34 @@ router.patch(
         return; // the old stage rows are gone, so per-stage edits no longer apply
       }
       for (const s of data.stages ?? []) {
+        const prev = line.stages.find((x) => x.id === s.id)!;
         await tx.orderLineStage.update({
           where: { id: s.id },
           data: {
             ...(s.vendorId !== undefined ? { vendorId: s.vendorId } : {}),
             ...(s.jobworkRate !== undefined ? { jobworkRate: s.jobworkRate } : {}),
+            ...(s.labourRate !== undefined ? { labourRate: s.labourRate } : {}),
             ...(s.note !== undefined ? { note: s.note } : {}),
           },
         });
+        // Who does a stage and what it pays are both money decisions worth a record.
+        await logChanges(
+          tx,
+          { type: 'Order', id: line.orderId },
+          { id: req.user!.sub, name: req.user!.name },
+          diffFields(
+            'OrderLineStage',
+            s.id,
+            { jobworkRate: prev.jobworkRate, labourRate: prev.labourRate, vendorId: prev.vendorId },
+            { ...(s.jobworkRate !== undefined ? { jobworkRate: s.jobworkRate } : {}), ...(s.labourRate !== undefined ? { labourRate: s.labourRate } : {}), ...(s.vendorId !== undefined ? { vendorId: s.vendorId } : {}) },
+            [
+              { field: 'jobworkRate', label: 'jobwork rate' },
+              { field: 'labourRate', label: 'in-house piece rate' },
+              { field: 'vendorId', label: 'done by (vendor id)' },
+            ],
+            prev.name
+          )
+        );
       }
     });
 
@@ -311,6 +355,12 @@ const moveSchema = z.object({
   toStageId: z.number().int().nullable().optional(),
   qty: z.number().int().positive(),
   note: z.string().nullable().optional(),
+  /**
+   * Who did the work, with a piece count each. Optional — the board never needed it.
+   * When given, the counts must add up to `qty`, so in-house labour stays exactly
+   * attributable and still reconciles with the stage's cleared figure.
+   */
+  workers: z.array(z.object({ workerId: z.number().int(), pieces: z.number().int().positive() })).optional(),
 });
 
 const movesBodySchema = z.object({
@@ -353,8 +403,12 @@ router.post(
       });
       const lineById = new Map(lines.map((l) => [l.id, l]));
 
+      // Anyone named on a movement must actually be on the books.
+      const namedIds = [...new Set(body.moves.flatMap((m) => m.workers?.map((w) => w.workerId) ?? []))];
+      const namedWorkers = namedIds.length ? await tx.worker.findMany({ where: { id: { in: namedIds } }, select: { id: true, name: true, isActive: true } }) : [];
+
       const simulated = new Map<number, MoveRow[]>();
-      const planned: { orderLineId: number; kind: string; fromStageId: number | null; toStageId: number | null; qty: number; note: string | null }[] = [];
+      const planned: { orderLineId: number; kind: string; fromStageId: number | null; toStageId: number | null; qty: number; note: string | null; workers?: { workerId: number; pieces: number }[] }[] = [];
 
       for (const m of body.moves) {
         const line = lineById.get(m.orderLineId);
@@ -368,11 +422,31 @@ router.post(
 
         // Break a multi-stage clearance into single hops, then check each one in turn.
         const hops = expandHops(boardBefore, { kind: m.kind, fromStageId: m.fromStageId ?? null, toStageId: m.toStageId ?? null, qty: m.qty });
+
+        const workers = m.workers?.length ? m.workers : undefined;
+        if (workers) {
+          // Only a clearance is work done. A release, a rejection or a return moves
+          // pieces without anyone having finished anything.
+          if (m.kind !== 'ADVANCE' && m.kind !== 'COMPLETE') throw new ApiError(400, 'Workers can only be named on a clearance — advancing pieces forward or finishing them.');
+          // Each hop is a different stage's work, so a clearance spanning several
+          // stages cannot say who did which. Clear them one stage at a time.
+          if (hops.length > 1) throw new ApiError(400, `That clearance crosses ${hops.length} stages, so it cannot say who did which. Clear one stage at a time to record the workers.`);
+          const stage = line.stages.find((s) => s.id === (m.fromStageId ?? null));
+          if (!stage) throw new ApiError(400, 'Pick the stage the work was done at before naming who did it.');
+          for (const w of workers) {
+            const found = namedWorkers.find((x) => x.id === w.workerId);
+            if (!found) throw new ApiError(404, `Worker #${w.workerId} not found.`);
+            if (!found.isActive) throw new ApiError(400, `${found.name} is no longer active — reactivate them before recording their work.`);
+          }
+          const workerErr = validateMoveWorkers(m.qty, workers, stage);
+          if (workerErr) throw new ApiError(400, `${line.product.factoryCode} — ${workerErr}`);
+        }
+
         for (const hop of hops) {
           const board = buildBoard(line.qty, line.stages as any, [...(line.moves as any as MoveRow[]), ...extra]);
           const hopErr = validateMove(board, hop);
           if (hopErr) throw new ApiError(400, `${line.product.factoryCode} — ${hopErr}`);
-          planned.push({ orderLineId: m.orderLineId, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty, note: m.note?.trim() || comment });
+          planned.push({ orderLineId: m.orderLineId, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty, note: m.note?.trim() || comment, workers });
           extra.push({ id: -1, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty });
         }
         simulated.set(m.orderLineId, extra);
@@ -381,7 +455,17 @@ router.post(
       const ids: number[] = [];
       for (const p of planned) {
         const created = await tx.stageMove.create({
-          data: { orderLineId: p.orderLineId, kind: p.kind, fromStageId: p.fromStageId, toStageId: p.toStageId, qty: p.qty, date, note: p.note, createdById: req.user!.sub },
+          data: {
+            orderLineId: p.orderLineId,
+            kind: p.kind,
+            fromStageId: p.fromStageId,
+            toStageId: p.toStageId,
+            qty: p.qty,
+            date,
+            note: p.note,
+            createdById: req.user!.sub,
+            ...(p.workers ? { workers: { create: p.workers.map((w) => ({ workerId: w.workerId, pieces: w.pieces })) } } : {}),
+          },
         });
         ids.push(created.id);
       }
@@ -633,6 +717,19 @@ router.put(
       for (let i = 0; i < data.lines.length; i++) {
         const l = data.lines[i];
         await tx.proformaLine.create({ data: { proformaId: id, productId: l.productId ?? null, imageId: l.imageId ?? null, description: l.description, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i } });
+        // Lines are replaced wholesale, so match the old ones by description.
+        const prev = current.lines.find((x) => x.description === l.description);
+        if (prev) {
+          await logChanges(
+            tx,
+            { type: 'Proforma', id },
+            { id: req.user!.sub, name: req.user!.name },
+            diffFields('ProformaLine', prev.id, prev, { unitPrice: l.unitPrice, qty: l.qty }, [
+              { field: 'unitPrice', label: 'unit price' },
+              { field: 'qty', label: 'quantity' },
+            ], l.description)
+          );
+        }
       }
     });
     res.json(serializeProforma(await loadProforma(id)));

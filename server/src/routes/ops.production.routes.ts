@@ -9,6 +9,8 @@ import { loadMethodMap } from '../lib/methods';
 import { round } from '../lib/costing';
 import { buildBoard } from '../lib/production';
 import { allocateFifo, buildStatement, jobworkEventsForOrder, type AllocationResult, type Bucket, type PaymentRow } from '../lib/finance';
+import { buildWorkforceContext, contractorStatement, workerStatement, workforceTotals, type WorkforceContext } from '../lib/manforce';
+import { dayKey } from '../lib/workforce';
 
 const router = Router();
 router.use(authenticate);
@@ -417,11 +419,11 @@ router.get(
       });
     }
 
-    // Material suppliers and workers — from the bills we entered.
-    const billed = entries.filter((e) => (e.partyType === 'SUPPLIER' || e.partyType === 'WORKER') && (e.kind === 'BILL' || e.kind === 'PAYMENT'));
+    // Material suppliers — from the bills we entered.
+    const billed = entries.filter((e) => e.partyType === 'SUPPLIER' && (e.kind === 'BILL' || e.kind === 'PAYMENT'));
     const keys = [...new Set(billed.map((e) => `${e.partyType}:${e.supplierId ?? e.partyName}`))];
     for (const key of keys) {
-      const [partyType, idOrName] = key.split(':') as ['SUPPLIER' | 'WORKER', string];
+      const [partyType, idOrName] = key.split(':') as ['SUPPLIER', string];
       const supplierId = /^\d+$/.test(idOrName) ? Number(idOrName) : null;
       const partyName = supplierId == null ? idOrName : undefined;
       const pos = billedPosition(entries, partyType, supplierId, partyName);
@@ -430,6 +432,7 @@ router.get(
       const label = supplierId != null ? pos.bills[0]?.supplier?.name ?? pos.payments[0]?.partyName ?? `#${supplierId}` : idOrName;
       rows.push({
         partyType,
+        partyId: supplierId,
         supplierId,
         partyName: label,
         accrued,
@@ -451,16 +454,280 @@ router.get(
       });
     }
 
+    // The workforce. Wages are derived, so there is nothing to bill — see
+    // lib/workforce.ts. A gang member is not listed here: their money is inside
+    // their contractor's balance, and listing both would double the payable.
+    for (const row of workforcePayables(await buildWorkforceContext())) rows.push(row);
+
     res.json(rows.sort((a, b) => b.balance - a.balance));
   })
 );
+
+/**
+ * Workers, contractors and statutory dues as payable rows.
+ *
+ * Shaped exactly like the vendor rows above so the Payments page needs no special
+ * case: `jobs` carries the breakdown that explains the balance.
+ */
+function workforcePayables(ctx: WorkforceContext) {
+  const rows: any[] = [];
+
+  for (const account of ctx.directWorkers) {
+    const p = account.position;
+    if (p.earned === 0 && p.paid === 0 && p.advanced === 0) continue;
+    rows.push({
+      partyType: 'WORKER',
+      partyId: account.worker.id,
+      supplierId: null,
+      partyName: account.worker.name,
+      code: account.worker.code,
+      accrued: p.earned,
+      paid: round(p.paid + p.advanced),
+      balance: p.balance,
+      credit: round(Math.max(-p.balance, 0)),
+      pieces: p.earnedPieces,
+      events: account.earnings.length,
+      dueNow: p.dueNow,
+      advanceOutstanding: p.advanceOutstanding,
+      jobs: [
+        { orderId: null, orderNumber: 'Earned', pieces: p.earnedPieces, amount: p.earned, paid: 0, balance: p.earned, stages: [], product: `${p.earnedDays} day(s)${p.overtimeEarned ? ` · OT ₹${p.overtimeEarned}` : ''}` },
+        ...(p.deducted ? [{ orderId: null, orderNumber: 'Deductions', pieces: 0, amount: -p.deducted, paid: 0, balance: -p.deducted, stages: [], product: 'Charged to the worker' }] : []),
+        ...(p.statutoryDeducted ? [{ orderId: null, orderNumber: 'Statutory', pieces: 0, amount: -p.statutoryDeducted, paid: 0, balance: -p.statutoryDeducted, stages: [], product: 'Employee share, posted' }] : []),
+        ...(p.advanced ? [{ orderId: null, orderNumber: 'Advances', pieces: 0, amount: -p.advanced, paid: 0, balance: -p.advanceOutstanding, stages: [], product: `₹${p.advanceRecovered} recovered so far` }] : []),
+      ],
+    });
+  }
+
+  for (const c of ctx.contractors) {
+    if (c.workers.length === 0 && c.paid === 0) continue;
+    rows.push({
+      partyType: 'CONTRACTOR',
+      partyId: c.contractor.id,
+      supplierId: null,
+      partyName: c.contractor.name,
+      code: c.contractor.code,
+      accrued: c.accrued,
+      paid: c.paid,
+      balance: c.balance,
+      credit: round(Math.max(-c.balance, 0)),
+      pieces: c.workers.reduce((a, w) => a + w.position.earnedPieces, 0),
+      events: c.workers.length,
+      jobs: c.workers.map((w) => ({
+        orderId: null,
+        orderNumber: w.worker.name,
+        pieces: w.position.earnedPieces,
+        amount: w.position.earned,
+        paid: 0,
+        balance: round(w.position.earned - w.position.deducted - w.position.statutoryDeducted - w.position.advanced),
+        stages: [],
+        product: `${w.position.earnedDays} day(s)`,
+      })),
+    });
+  }
+
+  for (const s of ctx.statutory) {
+    if (s.accrued === 0 && s.paid === 0) continue;
+    rows.push({
+      partyType: 'STATUTORY',
+      partyId: s.componentId,
+      supplierId: null,
+      partyName: `${s.code}${s.payeeName ? ` — ${s.payeeName}` : ''}`,
+      code: s.code,
+      accrued: s.accrued,
+      paid: s.paid,
+      // A provision is a cost, not yet a debt to anyone, so it never reads as payable.
+      balance: s.isProvision ? 0 : s.balance,
+      credit: 0,
+      pieces: 0,
+      events: s.workers,
+      isProvision: s.isProvision,
+      jobs: [
+        { orderId: null, orderNumber: 'Employee share', pieces: 0, amount: s.employee, paid: 0, balance: s.employee, stages: [], product: 'Deducted from wages' },
+        { orderId: null, orderNumber: 'Employer share', pieces: 0, amount: s.employer, paid: 0, balance: s.employer, stages: [], product: "The factory's own cost" },
+      ],
+    });
+  }
+
+  // Wages typed against a name before Manforce existed. Nothing is lost while they
+  // wait to be migrated onto real worker records.
+  for (const u of ctx.unlinked) {
+    rows.push({
+      partyType: 'WORKER',
+      partyId: null,
+      supplierId: null,
+      partyName: u.partyName,
+      accrued: u.billed,
+      paid: u.paid,
+      balance: u.balance,
+      credit: round(Math.max(-u.balance, 0)),
+      pieces: 0,
+      events: 0,
+      unlinked: true,
+      jobs: [],
+    });
+  }
+
+  return rows;
+}
+
+/**
+ * A workforce party's statement, in the same shape as a vendor's.
+ *
+ * There is no FIFO allocation here and deliberately so: a worker is ONE running
+ * account, not a set of dated debts, so a payment has nothing to be spread across —
+ * it simply reduces the balance. `dueNow` and `advanceOutstanding` are reported
+ * alongside the balance, and the three always reconcile (see lib/workforce.ts).
+ */
+async function workforceStatementResponse(partyType: 'WORKER' | 'CONTRACTOR' | 'STATUTORY', partyId: number, entries: FinanceEntry[]) {
+  const ctx = await buildWorkforceContext();
+  const asPayment = (e: { id: number; date: Date | string; amount: number; ref?: string | null; note?: string | null; partyName?: string }) => ({
+    id: e.id,
+    date: e.date,
+    amount: e.amount,
+    currency: 'INR',
+    ref: e.ref ?? null,
+    note: e.note ?? null,
+    partyName: e.partyName ?? '',
+    aimedAtOrder: null,
+    allocations: [],
+    unallocated: 0,
+  });
+
+  if (partyType === 'WORKER') {
+    const account = ctx.accounts.get(partyId);
+    if (!account) throw new ApiError(404, 'Worker not found.');
+    const w = account.worker;
+    const p = account.position;
+
+    const perOrder = new Map<number, { orderId: number; orderNumber: string; pieces: number; gross: number }>();
+    for (const e of account.earnings) {
+      if (e.kind !== 'PIECE' || e.orderId == null) continue;
+      const row = perOrder.get(e.orderId) ?? { orderId: e.orderId, orderNumber: e.orderNumber ?? `#${e.orderId}`, pieces: 0, gross: 0 };
+      row.pieces += e.pieces;
+      row.gross = round(row.gross + e.amount);
+      perOrder.set(e.orderId, row);
+    }
+
+    return {
+      party: { partyType, partyId, name: w.name, code: w.code, phone: null, gstNo: null, paymentTerms: w.contractor ? `Paid through ${w.contractor.name}` : null },
+      currency: 'INR',
+      summary: { accrued: p.earned, paid: round(p.paid + p.advanced), balance: p.balance, credit: round(Math.max(-p.balance, 0)), pieces: p.earnedPieces, events: account.earnings.length },
+      perOrder: [...perOrder.values()].map((r) => ({ orderId: r.orderId, orderNumber: r.orderNumber, pieces: r.pieces, gross: r.gross, paid: 0, balance: r.gross })),
+      workforce: {
+        payType: w.payType,
+        trade: w.trade?.name ?? null,
+        contractor: w.contractor?.name ?? null,
+        dueNow: p.dueNow,
+        deducted: p.deducted,
+        statutoryDeducted: p.statutoryDeducted,
+        earnedDays: p.earnedDays,
+        overtimeEarned: p.overtimeEarned,
+        advanced: p.advanced,
+        advanceRecovered: p.advanceRecovered,
+        advanceOutstanding: p.advanceOutstanding,
+        advances: account.advances.map((a) => {
+          const state = p.advanceStates.find((s) => s.advanceId === a.id);
+          return { id: a.id, date: a.date, amount: a.amount, recoveryPerMonth: a.recoveryPerMonth, note: a.note ?? null, recovered: state?.recovered ?? 0, outstanding: state?.outstanding ?? a.amount };
+        }),
+      },
+      payments: account.payments.map((x) => asPayment({ ...x, partyName: w.name })),
+      statement: workerStatement(account),
+    };
+  }
+
+  if (partyType === 'CONTRACTOR') {
+    const account = ctx.contractors.find((c) => c.contractor.id === partyId);
+    if (!account) throw new ApiError(404, 'Contractor not found.');
+    const payments = entries.filter((e) => e.partyType === 'CONTRACTOR' && e.kind === 'PAYMENT' && e.contractorId === partyId);
+    return {
+      party: { partyType, partyId, name: account.contractor.name, code: account.contractor.code, phone: account.contractor.phone, gstNo: account.contractor.gstNo, paymentTerms: account.contractor.paymentTerms },
+      currency: 'INR',
+      summary: {
+        accrued: account.accrued,
+        paid: account.paid,
+        balance: account.balance,
+        credit: round(Math.max(-account.balance, 0)),
+        pieces: account.workers.reduce((a, w) => a + w.position.earnedPieces, 0),
+        events: account.workers.length,
+      },
+      perOrder: account.workers.map((w) => ({
+        orderId: null,
+        orderNumber: `${w.worker.code} — ${w.worker.name}`,
+        pieces: w.position.earnedPieces,
+        gross: w.position.earned,
+        paid: 0,
+        balance: round(w.position.earned - w.position.deducted - w.position.statutoryDeducted - w.position.advanced),
+      })),
+      workforce: {
+        gang: account.workers.length,
+        deducted: account.deducted,
+        statutoryDeducted: account.statutoryDeducted,
+        advanced: account.advanced,
+        workers: account.workers.map((w) => ({ id: w.worker.id, code: w.worker.code, name: w.worker.name, payType: w.worker.payType, earned: w.position.earned, days: w.position.earnedDays, pieces: w.position.earnedPieces })),
+      },
+      payments: payments.map(asPayment),
+      statement: contractorStatement(account, payments),
+    };
+  }
+
+  // STATUTORY — one component, everything posted against it.
+  const due = ctx.statutory.find((s) => s.componentId === partyId);
+  const component = ctx.components.find((c) => c.id === partyId);
+  if (!due || !component) throw new ApiError(404, 'Statutory component not found.');
+  const lines = await prisma.statutoryPostingLine.findMany({
+    where: { componentId: partyId },
+    include: { posting: { select: { id: true, number: true, periodFrom: true, periodTo: true, postedOn: true } }, worker: { select: { code: true, name: true } } },
+    orderBy: { id: 'asc' },
+  });
+  const payments = entries.filter((e) => e.partyType === 'STATUTORY' && e.kind === 'PAYMENT' && e.statutoryComponentId === partyId);
+
+  const byPosting = new Map<number, { number: string; postedOn: Date; from: Date; to: Date; employee: number; employer: number; workers: number }>();
+  for (const l of lines) {
+    const row = byPosting.get(l.postingId) ?? { number: l.posting.number, postedOn: l.posting.postedOn, from: l.posting.periodFrom, to: l.posting.periodTo, employee: 0, employer: 0, workers: 0 };
+    row.employee = round(row.employee + l.employeeAmt);
+    row.employer = round(row.employer + l.employerAmt);
+    row.workers += 1;
+    byPosting.set(l.postingId, row);
+  }
+
+  return {
+    party: { partyType, partyId, name: `${due.code} — ${due.name}`, code: due.code, phone: null, gstNo: null, paymentTerms: due.payeeName || null },
+    currency: 'INR',
+    summary: { accrued: due.accrued, paid: due.paid, balance: due.isProvision ? 0 : due.balance, credit: 0, pieces: 0, events: byPosting.size },
+    perOrder: [...byPosting.entries()].map(([id, r]) => ({ orderId: null, orderNumber: r.number, pieces: r.workers, gross: round(r.employee + r.employer), paid: 0, balance: round(r.employee + r.employer), postingId: id })),
+    workforce: {
+      isProvision: due.isProvision,
+      employee: due.employee,
+      employer: due.employer,
+      payeeName: due.payeeName,
+      workersCovered: due.workers,
+      lines: lines.map((l) => ({ id: l.id, posting: l.posting.number, workerCode: l.worker.code, workerName: l.worker.name, wages: l.wages, employeeAmt: l.employeeAmt, employerAmt: l.employerAmt, postedOn: l.posting.postedOn })),
+    },
+    payments: payments.map(asPayment),
+    statement: buildStatement([
+      ...[...byPosting.values()].map((r) => ({
+        date: r.postedOn,
+        type: 'BILL' as const,
+        // dayKey reads the LOCAL date. toISOString() would show the day before for a
+        // period stored at local midnight anywhere east of UTC.
+        description: `${due.code} posted for ${dayKey(r.from)} — ${dayKey(r.to)}`,
+        ref: r.number,
+        orderNumber: null,
+        charge: round(r.employee + r.employer),
+        settle: 0,
+        detail: `${r.workers} worker(s) · employee ₹${r.employee} + employer ₹${r.employer}`,
+      })),
+      ...payments.map((p) => ({ date: p.date, type: 'PAYMENT' as const, description: p.note || 'Paid to the authority', ref: p.ref, orderNumber: null, charge: 0, settle: p.amount, detail: null })),
+    ]),
+  };
+}
 
 // --- summary ----------------------------------------------------------------
 
 /** Headline money totals, shared by the summary endpoint and the dashboard. */
 async function financeTotals() {
   {
-    const { orders, entries, rateOf, symbolOf } = await financeData();
+    const [{ orders, entries, rateOf, symbolOf }, workforce] = await Promise.all([financeData(), buildWorkforceContext()]);
 
     let invoicedInr = 0;
     let receivableInr = 0;
@@ -479,16 +746,30 @@ async function financeTotals() {
     const jobworkPaid = sumOf(entries, 'JOBWORK', 'PAYMENT');
     const materialBilled = sumOf(entries, 'SUPPLIER', 'BILL');
     const materialPaid = sumOf(entries, 'SUPPLIER', 'PAYMENT');
-    const wagesBilled = sumOf(entries, 'WORKER', 'BILL');
-    const wagesPaid = sumOf(entries, 'WORKER', 'PAYMENT');
+
+    // Wages are DERIVED now — attendance and board clearances, not typed bills. The
+    // unlinked figures are the last of the hand-typed rows, still awaiting migration.
+    const wf = workforceTotals(workforce);
+    const unlinkedBilled = round(workforce.unlinked.reduce((a, u) => a + u.billed, 0));
+    const unlinkedPaid = round(workforce.unlinked.reduce((a, u) => a + u.paid, 0));
+    const wagesBilled = round(wf.wagesAccrued + unlinkedBilled);
+    const wagesPaid = round(wf.wagesPaid + unlinkedPaid);
 
     // Overpayment to a party is money on account, not a negative debt.
     const clamp = (v: number) => round(Math.max(v, 0));
     const jobworkDue = clamp(jobworkAccrued - jobworkPaid);
     const materialDue = clamp(materialBilled - materialPaid);
-    const wagesDue = clamp(wagesBilled - wagesPaid);
+    // Clamped per worker inside workforceTotals, so one worker's advance cannot
+    // quietly cancel out what is owed to another.
+    const wagesDue = round(wf.workerDue + clamp(unlinkedBilled - unlinkedPaid));
 
     return {
+      headcount: wf.headcount,
+      contractorCount: wf.contractorCount,
+      contractorDue: wf.contractorDue,
+      statutoryDue: wf.statutoryDue,
+      statutoryProvision: wf.statutoryProvision,
+      advanceOutstanding: wf.advanceOutstanding,
       invoicedInr: round(invoicedInr),
       receivedInr: round(invoicedInr - receivableInr),
       receivableInr: round(receivableInr),
@@ -502,7 +783,7 @@ async function financeTotals() {
       wagesBilled: round(wagesBilled),
       wagesPaid: round(wagesPaid),
       wagesDue,
-      payableInr: round(jobworkDue + materialDue + wagesDue),
+      payableInr: round(jobworkDue + materialDue + wagesDue + wf.contractorDue + wf.statutoryDue),
       jobworkEvents: allEvents.length,
     };
   }
@@ -556,9 +837,9 @@ router.get(
       });
     }
 
-    const billed = entries.filter((e) => e.partyType === 'SUPPLIER' || e.partyType === 'WORKER');
+    const billed = entries.filter((e) => e.partyType === 'SUPPLIER');
     for (const key of [...new Set(billed.map((e) => `${e.partyType}:${e.supplierId ?? e.partyName}`))]) {
-      const [partyType, idOrName] = key.split(':') as ['SUPPLIER' | 'WORKER', string];
+      const [partyType, idOrName] = key.split(':') as ['SUPPLIER', string];
       const supplierId = /^\d+$/.test(idOrName) ? Number(idOrName) : null;
       const pos = billedPosition(entries, partyType, supplierId, supplierId == null ? idOrName : undefined);
       const accrued = round(pos.buckets.reduce((a, b) => a + b.gross, 0));
@@ -572,6 +853,21 @@ router.get(
         weOwe: round(accrued - paid),
         credit: pos.result.credit,
         orders: pos.bills.length,
+      });
+    }
+
+    for (const row of workforcePayables(await buildWorkforceContext())) {
+      out.push({
+        partyType: row.partyType,
+        partyId: row.partyId,
+        name: row.partyName,
+        code: row.code ?? null,
+        // A worker carrying an advance owes the factory, which is the one case where
+        // a payable party can appear on the receivable side.
+        owesUs: round(Math.max(-row.balance, 0)),
+        weOwe: round(Math.max(row.balance, 0)),
+        credit: 0,
+        orders: row.events,
       });
     }
 
@@ -590,12 +886,18 @@ router.get(
   asyncHandler(async (req, res) => {
     const q = z
       .object({
-        partyType: z.enum(['BUYER', 'JOBWORK', 'SUPPLIER', 'WORKER']),
+        partyType: z.enum(['BUYER', 'JOBWORK', 'SUPPLIER', 'WORKER', 'CONTRACTOR', 'STATUTORY']),
         partyId: z.coerce.number().int().optional(),
         partyName: z.string().optional(),
       })
       .parse(req.query);
     const { orders, entries, rateOf, symbolOf } = await financeData();
+
+    // A worker named by id is derived from attendance and the board. One named only
+    // by a typed name is pre-Manforce history and still reads from the ledger below.
+    if ((q.partyType === 'WORKER' && q.partyId) || q.partyType === 'CONTRACTOR' || q.partyType === 'STATUTORY') {
+      return res.json(await workforceStatementResponse(q.partyType, q.partyId!, entries));
+    }
 
     if (q.partyType === 'BUYER') {
       if (!q.partyId) throw new ApiError(400, 'Which buyer?');
@@ -785,11 +1087,20 @@ router.get(
     if (req.query.partyType) where.partyType = req.query.partyType;
     if (req.query.supplierId) where.supplierId = Number(req.query.supplierId);
     if (req.query.buyerId) where.buyerId = Number(req.query.buyerId);
+    if (req.query.workerId) where.workerId = Number(req.query.workerId);
+    if (req.query.contractorId) where.contractorId = Number(req.query.contractorId);
     if (req.query.orderId) where.orderId = Number(req.query.orderId);
     res.json(
       await prisma.ledgerEntry.findMany({
         where,
-        include: { supplier: { select: { name: true } }, buyer: { select: { name: true } }, order: { select: { id: true, number: true } } },
+        include: {
+          supplier: { select: { name: true } },
+          buyer: { select: { name: true } },
+          order: { select: { id: true, number: true } },
+          worker: { select: { id: true, code: true, name: true } },
+          contractor: { select: { id: true, code: true, name: true } },
+          component: { select: { id: true, code: true, name: true } },
+        },
         orderBy: [{ date: 'desc' }, { id: 'desc' }],
         take: 300,
       })
@@ -798,9 +1109,12 @@ router.get(
 );
 
 const ledgerSchema = z.object({
-  partyType: z.enum(['SUPPLIER', 'JOBWORK', 'BUYER', 'WORKER']),
+  partyType: z.enum(['SUPPLIER', 'JOBWORK', 'BUYER', 'WORKER', 'CONTRACTOR', 'STATUTORY']),
   supplierId: z.number().int().nullable().optional(),
   buyerId: z.number().int().nullable().optional(),
+  workerId: z.number().int().nullable().optional(),
+  contractorId: z.number().int().nullable().optional(),
+  statutoryComponentId: z.number().int().nullable().optional(),
   orderId: z.number().int().nullable().optional(),
   stockTxnId: z.number().int().nullable().optional(),
   partyName: z.string().min(1),
@@ -825,6 +1139,15 @@ router.post(
     if (data.partyType === 'JOBWORK' && data.kind === 'BILL') {
       throw new ApiError(400, 'Jobwork owed is calculated from the pieces each vendor cleared — record only the payments here.');
     }
+    if (data.partyType === 'WORKER' && data.kind === 'BILL') {
+      throw new ApiError(400, 'Wages are calculated from attendance and the pieces each worker cleared — record only the payments here.');
+    }
+    if (data.partyType === 'CONTRACTOR' && data.kind === 'BILL') {
+      throw new ApiError(400, "A contractor's earnings are calculated from their gang's work — record only the payments here.");
+    }
+    if (data.partyType === 'STATUTORY' && data.kind === 'BILL') {
+      throw new ApiError(400, 'Statutory liability is created by posting it in Manforce — record only the payments here.');
+    }
     if (data.partyType === 'BUYER' && !data.buyerId) throw new ApiError(400, 'Which buyer is this receipt from?');
 
     // The party must exist and match the row's type, or the entry lands in a ledger
@@ -833,7 +1156,23 @@ router.post(
       if (!(await prisma.buyer.findUnique({ where: { id: data.buyerId! } }))) throw new ApiError(404, 'Buyer not found.');
       if (data.supplierId) throw new ApiError(400, 'A buyer receipt cannot also name a supplier.');
     } else if (data.partyType === 'WORKER') {
-      if (data.supplierId || data.buyerId) throw new ApiError(400, 'Wages are recorded against a worker name, not a supplier or buyer.');
+      if (data.supplierId || data.buyerId) throw new ApiError(400, 'Wages are recorded against a worker, not a supplier or buyer.');
+      if (data.workerId) {
+        const worker = await prisma.worker.findUnique({ where: { id: data.workerId }, include: { contractor: { select: { name: true } } } });
+        if (!worker) throw new ApiError(404, 'Worker not found.');
+        // Paying a gang member directly would leave the contractor's balance saying
+        // the money is still owed, so the two would disagree about the same wages.
+        if (worker.contractorId) throw new ApiError(400, `${worker.name} is in ${worker.contractor?.name ?? 'a contractor'}'s gang — pay the contractor, not the worker.`);
+      }
+    } else if (data.partyType === 'CONTRACTOR') {
+      if (data.supplierId || data.buyerId) throw new ApiError(400, 'A contractor payment cannot also name a supplier or buyer.');
+      if (!data.contractorId) throw new ApiError(400, 'Which contractor is this payment for?');
+      if (!(await prisma.contractor.findUnique({ where: { id: data.contractorId } }))) throw new ApiError(404, 'Contractor not found.');
+    } else if (data.partyType === 'STATUTORY') {
+      if (!data.statutoryComponentId) throw new ApiError(400, 'Which levy does this payment settle?');
+      const component = await prisma.statutoryComponent.findUnique({ where: { id: data.statutoryComponentId } });
+      if (!component) throw new ApiError(404, 'Statutory component not found.');
+      if (component.isProvision) throw new ApiError(400, `${component.code} is a provision, not a payable — it becomes one when it is declared.`);
     } else {
       if (!data.supplierId) throw new ApiError(400, `Which ${data.partyType === 'JOBWORK' ? 'jobwork vendor' : 'supplier'} is this for?`);
       const s = await prisma.supplier.findUnique({ where: { id: data.supplierId } });
@@ -875,6 +1214,9 @@ router.post(
           partyType: data.partyType,
           supplierId: data.supplierId ?? null,
           buyerId: data.buyerId ?? null,
+          workerId: data.workerId ?? null,
+          contractorId: data.contractorId ?? null,
+          statutoryComponentId: data.statutoryComponentId ?? null,
           orderId: data.orderId ?? null,
           stockTxnId: data.stockTxnId ?? null,
           partyName: data.partyName,
@@ -895,7 +1237,13 @@ router.delete(
   '/payments/:id',
   canManage,
   asyncHandler(async (req, res) => {
-    await prisma.ledgerEntry.delete({ where: { id: Number(req.params.id) } });
+    const id = Number(req.params.id);
+    const entry = await prisma.ledgerEntry.findUnique({ where: { id }, include: { advance: { select: { id: true } } } });
+    if (!entry) throw new ApiError(404, 'Entry not found.');
+    // The cash and the recovery terms are two halves of one advance; removing only
+    // the cash would leave an advance being recovered that was never handed over.
+    if (entry.advance) throw new ApiError(409, 'This payment is an advance — delete the advance itself in Manforce and the payment goes with it.');
+    await prisma.ledgerEntry.delete({ where: { id } });
     res.status(204).end();
   })
 );
@@ -962,6 +1310,10 @@ router.get(
       receivable: financials.receivableInr,
       payable: financials.payableInr,
       buyerCredit: financials.buyerCreditInr,
+      headcount: financials.headcount,
+      wagesDue: financials.wagesDue,
+      contractorDue: financials.contractorDue,
+      statutoryDue: financials.statutoryDue,
       vendorLoad: Array.from(vendorLoad.values()).sort((a, b) => b.pieces - a.pieces),
       recentProformas: recentProformas.map((p) => ({ id: p.id, number: p.number, buyer: p.buyer.name, status: p.status, date: p.date })),
       lowStock,

@@ -1,6 +1,9 @@
 import { Button, Card, Col, Divider, Empty, Input, InputNumber, Row, Select, Space, Typography } from 'antd';
 import { DeleteOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { useCurrencies, useMeta } from '../../../api/hooks';
+import { useStageLines } from '../../../api/ops';
+import { useAppSettings, useCostLineSuggestions, type Suggestion } from '../../../api/suggest';
+import HistoryHint from '../../../components/HistoryHint';
 import { groupTotal, lineAmount, lineMeasure, rollup, suggestCostDim } from '../../../util/costing';
 import { money, num, headColor } from '../../../util/format';
 import type { CostGroup, CostLine } from '../../../api/types';
@@ -18,15 +21,37 @@ interface ColSpec {
   key: string;
   label: string;
   width: number;
-  kind: 'text' | 'number' | 'measure' | 'amount' | 'del';
+  kind: 'text' | 'number' | 'measure' | 'amount' | 'del' | 'stage' | 'history';
   step?: number;
 }
 
-export default function StepCosting({ draft, set }: { draft: WizardDraft; set: (patch: Partial<WizardDraft>) => void }) {
+export default function StepCosting({ draft, set, productId }: { draft: WizardDraft; set: (patch: Partial<WizardDraft>) => void; productId?: number }) {
   const { data: meta } = useMeta();
   const { data: currencies } = useCurrencies();
+  const { data: stageLines } = useStageLines();
   const cs = draft.costSheet;
   const groups = cs.groups;
+
+  /**
+   * The stages this product travels through, offered against each LABOUR line.
+   * Mapping is only possible once the product has a stage line, because an order
+   * snapshots the steps of that line and looks the rate up by step.
+   */
+  const stageSteps = (stageLines ?? []).find((l) => l.id === draft.stageLineId)?.steps ?? [];
+
+  // --- what these lines have cost before ----------------------------------
+  //
+  // One request for the whole sheet: forty fields asking individually would be forty
+  // round-trips. Keyed on the line name, so the answer follows a line as it is renamed.
+  const { data: appSettings } = useAppSettings();
+  const askable = groups.flatMap((g) => g.lines.filter((l) => (l.name ?? '').trim()).map((l) => ({ name: l.name, groupName: g.name, head: g.head, stageStepId: l.stageStepId ?? null })));
+  const { data: history, isFetching: historyLoading } = useCostLineSuggestions(productId ?? null, askable);
+  const suggestionFor = (name: string): Suggestion | null => {
+    const key = (name ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    return history?.suggestions.find((s) => s.key === key) ?? null;
+  };
+  const outlierPct = appSettings?.outlierPct ?? history?.outlierPct ?? 25;
+  const windowDays = appSettings?.suggestionWindowDays ?? history?.windowDays ?? 365;
 
   const methodDef = (code: string) => meta?.methods.find((m) => m.code === code);
   const methodMap = Object.fromEntries((meta?.methods ?? []).map((m) => [m.code, m]));
@@ -85,7 +110,7 @@ export default function StepCosting({ draft, set }: { draft: WizardDraft; set: (
   };
 
   // Build the column layout for a method (drives both the header labels and rows).
-  const columnsFor = (method: string): ColSpec[] => {
+  const columnsFor = (method: string, head?: string): ColSpec[] => {
     const def = methodDef(method);
     const showDims = def && !def.usesWeight && def.dims.length > 0;
     const cols: ColSpec[] = [{ key: 'name', label: 'Item name', width: 150, kind: 'text' }];
@@ -96,8 +121,12 @@ export default function StepCosting({ draft, set }: { draft: WizardDraft; set: (
     if (showDims) def!.dims.forEach((d) => cols.push({ key: `cost${d}`, label: `Costing ${d}`, width: 70, kind: 'number', step: 0.1 }));
     if (method === 'QTY') cols.push({ key: 'unit', label: 'Unit', width: 66, kind: 'text' });
     cols.push({ key: 'rate', label: `Rate / ${def?.measureUnit ?? 'unit'}`, width: 90, kind: 'number', step: 0.01 });
+    cols.push({ key: 'history', label: 'Before', width: 40, kind: 'history' });
     cols.push({ key: 'measure', label: `Measure (${def?.measureUnit ?? ''})`, width: 78, kind: 'measure' });
     cols.push({ key: 'amount', label: 'Amount', width: 96, kind: 'amount' });
+    // Labour is the one head whose lines map onto the production line, so an order can
+    // start its in-house piece rates from what the product was costed at.
+    if (head === 'LABOUR') cols.push({ key: 'stageStepId', label: 'Pays for stage', width: 150, kind: 'stage' });
     cols.push({ key: 'del', label: '', width: 34, kind: 'del' });
     return cols;
   };
@@ -123,6 +152,41 @@ export default function StepCosting({ draft, set }: { draft: WizardDraft; set: (
           step={col.step}
           value={(line[col.key as keyof CostLine] as number) ?? undefined}
           onChange={(v) => updateLine(gi, li, { [col.key]: v ?? (col.key === 'qty' ? 0 : null) } as Partial<CostLine>)}
+        />
+      );
+    }
+    if (col.kind === 'history') {
+      return (
+        <div style={{ width: w, textAlign: 'center' }}>
+          <HistoryHint
+            compact
+            loading={historyLoading}
+            suggestion={suggestionFor(line.name)}
+            value={line.rate}
+            outlierPct={outlierPct}
+            windowDays={windowDays}
+            symbol={symbol}
+            /* The line's own unit if it has one — a labour line is priced per LOT,
+               not per the method's generic measure. */
+            unitSuffix={`/${line.unit || methodDef(g.method)?.measureUnit || 'unit'}`}
+            onApply={(v) => updateLine(gi, li, { rate: v })}
+          />
+        </div>
+      );
+    }
+    if (col.kind === 'stage') {
+      return (
+        <Select
+          size="small"
+          style={{ width: w }}
+          allowClear
+          showSearch
+          optionFilterProp="label"
+          placeholder={stageSteps.length ? 'not mapped' : 'no stage line'}
+          disabled={stageSteps.length === 0}
+          value={line.stageStepId ?? undefined}
+          onChange={(v) => updateLine(gi, li, { stageStepId: v ?? null })}
+          options={stageSteps.map((st) => ({ value: st.id, label: `${st.sortOrder + 1}. ${st.name}` }))}
         />
       );
     }
@@ -164,7 +228,7 @@ export default function StepCosting({ draft, set }: { draft: WizardDraft; set: (
 
         {orderedIdx.map(({ g, i }) => {
           const def = methodDef(g.method);
-          const cols = columnsFor(g.method);
+          const cols = columnsFor(g.method, g.head);
           return (
             <Card key={i} size="small" style={{ marginBottom: 12, borderLeft: `4px solid ${headColor(g.head)}` }}
               title={
@@ -197,6 +261,13 @@ export default function StepCosting({ draft, set }: { draft: WizardDraft; set: (
               }
             >
               {def && <Text type="secondary" style={{ fontSize: 12 }}>{def.label} — {def.hint}</Text>}
+              {g.head === 'LABOUR' && (
+                <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+                  {stageSteps.length
+                    ? 'Mapping a line to a stage is optional and changes nothing here — it only pre-fills that stage’s in-house piece rate when an order is created. What the worker is actually paid is set on the order.'
+                    : 'Pick a stage line on the Details step to map these lines to production stages.'}
+                </Text>
+              )}
               <Divider style={{ margin: '8px 0' }} />
               {/* Fixed column labels */}
               <div style={{ display: 'flex', gap: 6, marginBottom: 4, overflowX: 'auto', paddingBottom: 2 }}>

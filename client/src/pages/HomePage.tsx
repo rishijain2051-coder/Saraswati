@@ -11,7 +11,7 @@ import { useAuth } from '../auth/AuthContext';
 const { Title, Text } = Typography;
 
 const MODULES = [
-  { key: 'manforce', title: 'Manforce Management', icon: <TeamOutlined />, path: '/manforce', ready: false, desc: 'Workers, attendance, wages & productivity.' },
+  { key: 'manforce', title: 'Manforce Management', icon: <TeamOutlined />, path: '/manforce', ready: true, desc: 'Workers, muster roll, wages, advances & statutory dues.' },
   { key: 'product', title: 'Product Management', icon: <AppstoreOutlined />, path: '/products', ready: true, desc: 'Catalogue, product details & costing sheets.' },
   { key: 'operations', title: 'Operations Management', icon: <ToolOutlined />, path: '/operations', ready: true, desc: 'Orders, proformas, suppliers, stock, operation sheets, jobs & payments.' },
   { key: 'sales', title: 'Finished Product & Sales', icon: <ShoppingOutlined />, path: '/sales', ready: false, desc: 'Finished goods, dispatch, containers & sales.' },

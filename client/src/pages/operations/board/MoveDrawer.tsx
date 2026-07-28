@@ -6,7 +6,8 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import dayjs from 'dayjs';
 import { api, apiError } from '../../../api/client';
 import { MOVE_COLOR, MOVE_LABEL, OPS_KEYS, uploadMovePhotos, type Order, type OrderLineDto } from '../../../api/ops';
-import { availableAt, describe, deriveKind, hopsBetween, keyOf, labelOf, parseKey, suggestedTarget, targetsFor, validate, type Endpoint } from './moveLogic';
+import { useWorkers } from '../../../api/manforce';
+import { attributionState, availableAt, describe, deriveKind, hopsBetween, keyOf, labelOf, parseKey, suggestedTarget, targetsFor, validate, validateWorkers, type Endpoint } from './moveLogic';
 
 const { Text } = Typography;
 
@@ -30,6 +31,10 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
   const [comment, setComment] = useState('');
   const [date, setDate] = useState<dayjs.Dayjs>(dayjs());
   const [files, setFiles] = useState<UploadFile[]>([]);
+  /** Who did the work. Optional — leave it empty and nothing is attributed. */
+  const [crew, setCrew] = useState<{ workerId?: number; pieces?: number }[]>([]);
+  const { data: workers } = useWorkers({ active: '1' });
+  const namedCrew = useMemo(() => crew.filter((c) => c.workerId != null && (c.pieces ?? 0) > 0) as { workerId: number; pieces: number }[], [crew]);
 
   const board = target?.line.board;
   const from = target?.from ?? null;
@@ -43,7 +48,16 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
     setComment('');
     setDate(dayjs());
     setFiles([]);
+    setCrew([]);
   }, [target?.line.id, fromKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const attribution = useMemo(() => (board ? attributionState(board, from, to) : { allowed: false, stage: null, reason: undefined }), [board, from, to]);
+
+  // Changing the target can make attribution impossible — a clearance across several
+  // stages cannot say who did which — so drop the crew rather than send it anyway.
+  useEffect(() => {
+    if (!attribution.allowed && crew.length) setCrew([]);
+  }, [attribution.allowed]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const invalidate = () => {
     for (const key of OPS_KEYS) qc.invalidateQueries({ queryKey: key });
@@ -59,6 +73,7 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
             fromStageId: from!.kind === 'STAGE' ? from!.stage.id : null,
             toStageId: to!.kind === 'STAGE' ? to!.stage.id : null,
             qty,
+            workers: namedCrew.length ? namedCrew : undefined,
           },
         ],
         date: date.toISOString(),
@@ -82,7 +97,9 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
 
   if (!target || !board) return <Drawer open={false} onClose={onClose} />;
 
-  const error = validate(board, from, to, qty);
+  const crewError = attribution.allowed ? validateWorkers(qty, crew, attribution.stage) : null;
+  const crewPieces = namedCrew.reduce((a, c) => a + c.pieces, 0);
+  const error = validate(board, from, to, qty) ?? crewError;
   const kind = from && to ? deriveKind(from, to) : null;
   const available = availableAt(board, target.from);
   const hops = from && to ? hopsBetween(board, from, to) : [];
@@ -204,6 +221,68 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
             value={comment}
             onChange={(e) => setComment(e.target.value)}
           />
+        </div>
+
+        <div>
+          <Text strong>Who did the work</Text>
+          {attribution.allowed ? (
+            <>
+              <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
+                Optional. Name them and the pieces each did — it must add up to {qty} — and they earn ₹{attribution.stage?.labourRate ?? 0} a piece for {attribution.stage?.name}.
+              </Text>
+              {crew.map((c, i) => (
+                <Space.Compact key={i} style={{ width: '100%', marginBottom: 6 }}>
+                  <Select
+                    style={{ width: '100%' }}
+                    placeholder="Worker"
+                    showSearch
+                    optionFilterProp="label"
+                    value={c.workerId}
+                    onChange={(v) => setCrew((list) => list.map((x, j) => (j === i ? { ...x, workerId: v } : x)))}
+                    options={(workers ?? []).map((w) => ({ value: w.id, label: `${w.code} · ${w.name}${w.contractor ? ` (${w.contractor.name})` : ''}` }))}
+                  />
+                  <InputNumber
+                    min={1}
+                    max={qty}
+                    placeholder="pc"
+                    style={{ width: 110 }}
+                    value={c.pieces}
+                    onChange={(v) => setCrew((list) => list.map((x, j) => (j === i ? { ...x, pieces: v ?? undefined } : x)))}
+                  />
+                  <Button danger onClick={() => setCrew((list) => list.filter((_, j) => j !== i))}>
+                    ✕
+                  </Button>
+                </Space.Compact>
+              ))}
+              <Space>
+                <Button
+                  size="small"
+                  onClick={() => setCrew((list) => [...list, { workerId: undefined, pieces: Math.max(qty - crewPieces, 1) }])}
+                  disabled={!(attribution.stage?.labourRate ?? 0) && crew.length > 0}
+                >
+                  + add a worker
+                </Button>
+                {crew.length > 0 && (
+                  <Text type={crewPieces === qty ? 'success' : 'warning'} style={{ fontSize: 12 }}>
+                    {crewPieces} of {qty} pc accounted for
+                  </Text>
+                )}
+              </Space>
+              {!(attribution.stage?.labourRate ?? 0) && (
+                <Alert
+                  style={{ marginTop: 8 }}
+                  type="info"
+                  showIcon
+                  message="This stage has no piece rate"
+                  description="Workers on it are paid by the day, so there is nothing to attribute. Set a labour rate on the stage first if this is piece work."
+                />
+              )}
+            </>
+          ) : (
+            <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+              {attribution.reason ?? 'Pick where the pieces are going first.'}
+            </Text>
+          )}
         </div>
 
         <div>
