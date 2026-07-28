@@ -56,6 +56,10 @@ export interface OrderLineDto {
   qty: number;
   unitPrice: number;
   product?: { id: number; factoryCode: string; name: string };
+  planned?: number;
+  produced?: number;
+  pending?: number;
+  sheetCount?: number;
 }
 
 export interface Order {
@@ -72,9 +76,12 @@ export interface Order {
   notes?: string | null;
   exchangeRate?: number | null;
   proforma?: { id: number; number: string } | null;
-  sheets?: { id: number; number: string; status: string }[];
+  sheets?: { id: number; number: string; status: string; productId: number; qty: number; producedQty: number; mode: string }[];
   lines: OrderLineDto[];
   total: number;
+  totalOrdered?: number;
+  totalProduced?: number;
+  totalPending?: number;
 }
 
 export interface ProformaLineDto {
@@ -158,10 +165,16 @@ export interface OperationSheet {
   orderId?: number | null;
   order?: { id: number; number: string } | null;
   qty: number;
+  producedQty: number;
+  mode: 'INHOUSE' | 'OUTSOURCED' | string;
+  vendorId?: number | null;
+  vendor?: { id: number; name: string } | null;
+  jobworkCost: number;
   status: string;
   notes?: string | null;
   stages: OpStage[];
   explosion?: OpExplosion | null;
+  existing?: boolean;
 }
 
 export interface LedgerEntry {

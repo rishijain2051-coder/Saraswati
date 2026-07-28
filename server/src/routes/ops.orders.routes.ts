@@ -47,11 +47,25 @@ const orderInclude = {
   currency: true,
   lines: { include: { product: { select: { id: true, factoryCode: true, name: true } } }, orderBy: { sortOrder: 'asc' as const } },
   proforma: { select: { id: true, number: true } },
-  sheets: { select: { id: true, number: true, status: true } },
+  sheets: { select: { id: true, number: true, status: true, productId: true, qty: true, producedQty: true, mode: true } },
 };
 
 function orderTotal(o: any): number {
   return round((o.lines || []).reduce((s: number, l: any) => s + l.qty * l.unitPrice, 0));
+}
+
+// Attach production progress: per-line planned/produced/pending + order totals.
+function serializeOrder(o: any) {
+  const sheets = o.sheets || [];
+  const lines = (o.lines || []).map((l: any) => {
+    const ls = sheets.filter((s: any) => s.productId === l.productId);
+    const planned = ls.reduce((a: number, s: any) => a + (s.qty || 0), 0);
+    const produced = ls.reduce((a: number, s: any) => a + (s.producedQty || 0), 0);
+    return { ...l, planned, produced, pending: Math.max(l.qty - produced, 0), sheetCount: ls.length };
+  });
+  const totalOrdered = lines.reduce((a: number, l: any) => a + l.qty, 0);
+  const totalProduced = lines.reduce((a: number, l: any) => a + l.produced, 0);
+  return { ...o, lines, total: orderTotal(o), totalOrdered, totalProduced, totalPending: Math.max(totalOrdered - totalProduced, 0) };
 }
 
 router.get(
@@ -59,7 +73,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const status = req.query.status as string | undefined;
     const orders = await prisma.order.findMany({ where: status ? { status } : undefined, include: orderInclude, orderBy: { orderDate: 'desc' } });
-    res.json(orders.map((o) => ({ ...o, total: orderTotal(o) })));
+    res.json(orders.map(serializeOrder));
   })
 );
 
@@ -68,7 +82,31 @@ router.get(
   asyncHandler(async (req, res) => {
     const o = await prisma.order.findUnique({ where: { id: Number(req.params.id) }, include: orderInclude });
     if (!o) throw new ApiError(404, 'Order not found.');
-    res.json({ ...o, total: orderTotal(o) });
+    res.json(serializeOrder(o));
+  })
+);
+
+// Bulk-create operation sheets for every order line that has none yet.
+router.post(
+  '/orders/:id/generate-sheets',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const order = await prisma.order.findUnique({ where: { id }, include: { lines: true, sheets: true } });
+    if (!order) throw new ApiError(404, 'Order not found.');
+    let created = 0;
+    for (const line of order.lines) {
+      if (order.sheets.some((s) => s.productId === line.productId)) continue;
+      const product = await prisma.product.findUnique({ where: { id: line.productId } });
+      let templates = await prisma.productionStageTemplate.findMany({ where: { productTypeId: product?.productTypeId ?? undefined, isActive: true }, orderBy: { sortOrder: 'asc' } });
+      if (!product?.productTypeId || templates.length === 0) templates = await prisma.productionStageTemplate.findMany({ where: { productTypeId: null, isActive: true }, orderBy: { sortOrder: 'asc' } });
+      const number = await nextDocNumber('OP');
+      await prisma.operationSheet.create({
+        data: { number, productId: line.productId, orderId: id, qty: line.qty, status: 'InProgress', createdById: req.user!.sub, stages: { create: templates.map((t, i) => ({ name: t.name, sortOrder: i })) } },
+      });
+      created++;
+    }
+    res.json({ created });
   })
 );
 
@@ -106,7 +144,7 @@ router.post(
       },
       include: orderInclude,
     });
-    res.status(201).json({ ...o, total: orderTotal(o) });
+    res.status(201).json(serializeOrder(o));
   })
 );
 
@@ -136,7 +174,7 @@ router.put(
       }
     });
     const o = await prisma.order.findUnique({ where: { id }, include: orderInclude });
-    res.json({ ...o, total: orderTotal(o) });
+    res.json(serializeOrder(o));
   })
 );
 
@@ -301,7 +339,7 @@ router.post(
       await tx.proforma.update({ where: { id }, data: { status: 'Accepted' } });
       return created;
     });
-    res.status(201).json({ ...order, total: orderTotal(order) });
+    res.status(201).json(serializeOrder(order));
   })
 );
 

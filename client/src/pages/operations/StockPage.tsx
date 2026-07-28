@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Breadcrumb, Button, Card, Col, DatePicker, Form, Input, InputNumber, Modal, Row, Select, Space, Table, Tag, Typography, App } from 'antd';
+import { useMemo, useState } from 'react';
+import { Breadcrumb, Button, Card, Col, Collapse, DatePicker, Form, Input, InputNumber, Modal, Row, Select, Space, Table, Tag, Typography, App } from 'antd';
 import { HomeOutlined, PlusOutlined, ImportOutlined, ExportOutlined } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -17,6 +17,16 @@ export default function StockPage() {
   const { data: items, isLoading } = useRawItems();
   const { data: txns } = useStockTxns();
   const { data: suppliers } = useSuppliers('MATERIAL');
+
+  const itemGroups = useMemo(() => {
+    const map = new Map<string, RawItem[]>();
+    for (const it of items ?? []) {
+      const k = it.category || 'Uncategorised';
+      if (!map.has(k)) map.set(k, []);
+      map.get(k)!.push(it);
+    }
+    return Array.from(map.entries()).map(([key, rows]) => ({ key, rows }));
+  }, [items]);
 
   const [itemForm] = Form.useForm();
   const [itemOpen, setItemOpen] = useState(false);
@@ -88,9 +98,11 @@ export default function StockPage() {
         <Button type="primary" icon={<PlusOutlined />} onClick={openItemNew}>Add Item</Button>
       </div>
 
-      <Card size="small" style={{ marginBottom: 16 }}>
-        <Table<RawItem> rowKey="id" size="small" loading={isLoading} columns={itemCols} dataSource={items ?? []} pagination={false} scroll={{ x: 900 }} />
-      </Card>
+      <Collapse defaultActiveKey={itemGroups.map((g) => g.key)} style={{ marginBottom: 16 }} items={itemGroups.map((g) => ({
+        key: g.key,
+        label: <span><b>{g.key}</b> <Tag style={{ marginLeft: 6 }}>{g.rows.length}</Tag>{g.rows.some((r) => r.low) && <Tag color="red">low stock</Tag>}</span>,
+        children: <Table<RawItem> rowKey="id" size="small" loading={isLoading} columns={itemCols} dataSource={g.rows} pagination={false} scroll={{ x: 900 }} />,
+      }))} />
 
       <Card size="small" title="Recent movements">
         <Table<StockTxn> rowKey="id" size="small" columns={txnCols} dataSource={txns ?? []} pagination={{ pageSize: 10 }} scroll={{ x: 800 }} />

@@ -318,7 +318,8 @@ model Supplier {
 
   stockTxns StockTxn[]
   opStages  OpStage[]
-  ledger    LedgerEntry[] @relation("SupplierLedger")
+  jobSheets OperationSheet[] @relation("SheetVendor")
+  ledger    LedgerEntry[]    @relation("SupplierLedger")
 }
 
 model RawItem {
@@ -431,6 +432,10 @@ model OperationSheet {
   productId   Int
   orderId     Int?
   qty         Int      @default(1)
+  producedQty Int      @default(0)
+  mode        String   @default("INHOUSE") // INHOUSE | OUTSOURCED
+  vendorId    Int?
+  jobworkCost Float    @default(0)
   status      String   @default("Draft") // Draft|InProgress|Completed
   notes       String?
   createdById Int?
@@ -439,6 +444,7 @@ model OperationSheet {
 
   product Product   @relation(fields: [productId], references: [id])
   order   Order?    @relation(fields: [orderId], references: [id])
+  vendor  Supplier? @relation("SheetVendor", fields: [vendorId], references: [id])
   stages  OpStage[]
 }
 

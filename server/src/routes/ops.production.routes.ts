@@ -20,6 +20,7 @@ const canManage = requireRole('Manager');
 const sheetInclude = {
   product: { select: { id: true, factoryCode: true, name: true, unit: { select: { code: true } } } },
   order: { select: { id: true, number: true } },
+  vendor: { select: { id: true, name: true } },
   stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' as const } },
 };
 
@@ -92,9 +93,22 @@ const sheetSchema = z.object({
   productId: z.number().int(),
   orderId: z.number().int().nullable().optional(),
   qty: z.number().int().positive().default(1),
+  producedQty: z.number().int().min(0).optional(),
+  mode: z.enum(['INHOUSE', 'OUTSOURCED']).optional(),
+  vendorId: z.number().int().nullable().optional(),
+  jobworkCost: z.number().min(0).optional(),
   notes: z.string().nullable().optional(),
   status: z.string().optional(),
+  split: z.boolean().optional(), // when true, allow a second sheet for same order+product
 });
+
+async function stageTemplatesFor(productTypeId: number | null) {
+  let templates = await prisma.productionStageTemplate.findMany({ where: { productTypeId: productTypeId ?? undefined, isActive: true }, orderBy: { sortOrder: 'asc' } });
+  if (productTypeId == null || templates.length === 0) {
+    templates = await prisma.productionStageTemplate.findMany({ where: { productTypeId: null, isActive: true }, orderBy: { sortOrder: 'asc' } });
+  }
+  return templates;
+}
 
 router.post(
   '/operation-sheets',
@@ -104,12 +118,18 @@ router.post(
     const product = await prisma.product.findUnique({ where: { id: data.productId } });
     if (!product) throw new ApiError(404, 'Product not found.');
 
-    // Choose stage template: product-type-specific, else default (null).
-    let templates = await prisma.productionStageTemplate.findMany({ where: { productTypeId: product.productTypeId ?? undefined, isActive: true }, orderBy: { sortOrder: 'asc' } });
-    if (product.productTypeId == null || templates.length === 0) {
-      templates = await prisma.productionStageTemplate.findMany({ where: { productTypeId: null, isActive: true }, orderBy: { sortOrder: 'asc' } });
+    // Find-or-create: if a sheet already exists for this order+product, return it
+    // (unless the caller explicitly wants to split into another sheet).
+    if (data.orderId && !data.split) {
+      const existing = await prisma.operationSheet.findFirst({ where: { orderId: data.orderId, productId: data.productId } });
+      if (existing) {
+        const full = await prisma.operationSheet.findUnique({ where: { id: existing.id }, include: sheetInclude });
+        const explosion = await explosionFor(full!.productId, full!.qty);
+        return res.status(200).json({ ...full, explosion, existing: true });
+      }
     }
 
+    const templates = await stageTemplatesFor(product.productTypeId ?? null);
     const number = await nextDocNumber('OP');
     const sheet = await prisma.operationSheet.create({
       data: {
@@ -117,6 +137,9 @@ router.post(
         productId: data.productId,
         orderId: data.orderId ?? null,
         qty: data.qty,
+        mode: data.mode ?? 'INHOUSE',
+        vendorId: data.vendorId ?? null,
+        jobworkCost: data.jobworkCost ?? 0,
         status: data.status ?? 'Draft',
         notes: data.notes ?? null,
         createdById: req.user!.sub,
@@ -129,6 +152,20 @@ router.post(
   })
 );
 
+// Bulk-assign sheets to an outsourcing vendor (or back to in-house with vendorId null).
+router.post(
+  '/operation-sheets/bulk-outsource',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const body = z.object({ ids: z.array(z.number().int()).min(1), vendorId: z.number().int().nullable() }).parse(req.body);
+    await prisma.operationSheet.updateMany({
+      where: { id: { in: body.ids } },
+      data: { mode: body.vendorId ? 'OUTSOURCED' : 'INHOUSE', vendorId: body.vendorId },
+    });
+    res.json({ updated: body.ids.length });
+  })
+);
+
 router.put(
   '/operation-sheets/:id',
   canEdit,
@@ -138,6 +175,10 @@ router.put(
       where: { id: Number(req.params.id) },
       data: {
         ...(data.qty != null ? { qty: data.qty } : {}),
+        ...(data.producedQty != null ? { producedQty: data.producedQty } : {}),
+        ...(data.mode ? { mode: data.mode } : {}),
+        ...(data.vendorId !== undefined ? { vendorId: data.vendorId } : {}),
+        ...(data.jobworkCost != null ? { jobworkCost: data.jobworkCost } : {}),
         ...(data.orderId !== undefined ? { orderId: data.orderId } : {}),
         ...(data.notes !== undefined ? { notes: data.notes } : {}),
         ...(data.status ? { status: data.status } : {}),
