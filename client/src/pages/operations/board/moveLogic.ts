@@ -105,12 +105,11 @@ export function targetsFor(board: LineBoard, from: Endpoint | null): { value: st
 /**
  * The stages a forward clearance will actually pass through, in order. Mirrors the
  * server's hop expansion so the drawer can say "recorded as 3 steps" up front.
+ * Only an ADVANCE expands — finishing is taken at its word and skips the rest.
  */
 export function hopsBetween(board: LineBoard, from: Endpoint, to: Endpoint): StageCell[] {
-  const kind = deriveKind(from, to);
-  if ((kind !== 'ADVANCE' && kind !== 'COMPLETE') || from.kind !== 'STAGE') return [];
-  const limit = to.kind === 'STAGE' ? to.stage.sortOrder : Infinity;
-  return board.stages.filter((s) => s.sortOrder > from.stage.sortOrder && s.sortOrder <= limit);
+  if (deriveKind(from, to) !== 'ADVANCE' || from.kind !== 'STAGE' || to.kind !== 'STAGE') return [];
+  return board.stages.filter((s) => s.sortOrder > from.stage.sortOrder && s.sortOrder <= to.stage.sortOrder);
 }
 
 /** Where a straightforward forward clearance should land. */

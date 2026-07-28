@@ -197,11 +197,19 @@ const financeEntryInclude = {
 
 /** Everything needed to compute the money position, in one read. */
 async function financeData() {
-  const [orders, entries] = await Promise.all([
+  const [orders, entries, currencies] = await Promise.all([
     prisma.order.findMany({ where: LIVE_ORDER, include: financeOrderInclude, orderBy: [{ orderDate: 'asc' }, { id: 'asc' }] }),
     prisma.ledgerEntry.findMany({ include: financeEntryInclude, orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
+    prisma.currency.findMany({ select: { code: true, symbol: true, rateToBase: true } }),
   ]);
-  return { orders, entries };
+  /**
+   * Rupee rate for a currency code. Taken from the currency master rather than from
+   * an order, because a receipt can sit in a currency the buyer has no live order in
+   * — and falling back to 1 there would value it as if it were rupees.
+   */
+  const rateOf = (code: string) => currencies.find((c) => c.code === code)?.rateToBase ?? 1;
+  const symbolOf = (code: string) => currencies.find((c) => c.code === code)?.symbol ?? '';
+  return { orders, entries, rateOf, symbolOf };
 }
 
 type FinanceOrder = Awaited<ReturnType<typeof financeData>>['orders'][number];
@@ -247,7 +255,7 @@ function describePayments(entries: FinanceEntry[], result: AllocationResult) {
  * settle them oldest-first. Receipts only ever apply to orders in the same currency,
  * so no hidden conversion can creep into a balance.
  */
-function buyerPositions(orders: FinanceOrder[], entries: FinanceEntry[], buyerId: number) {
+function buyerPositions(orders: FinanceOrder[], entries: FinanceEntry[], buyerId: number, rateOf: (code: string) => number, symbolOf: (code: string) => string) {
   const mine = orders.filter((o) => o.buyerId === buyerId);
   const receipts = entriesFor(entries, 'BUYER', 'PAYMENT', buyerId);
   const currencies = [...new Set([...mine.map((o) => o.currency?.code ?? 'INR'), ...receipts.map((r) => r.currency ?? 'INR')])];
@@ -257,10 +265,10 @@ function buyerPositions(orders: FinanceOrder[], entries: FinanceEntry[], buyerId
     const receiptsInCcy = receipts.filter((r) => (r.currency ?? 'INR') === code);
     const buckets: Bucket[] = ordersInCcy.map((o) => ({ key: `order-${o.id}`, orderId: o.id, label: o.number, date: o.orderDate, gross: orderValue(o) }));
     const result = allocateFifo(buckets, toPaymentRows(receiptsInCcy));
-    const rate = ordersInCcy[0]?.exchangeRate ?? 1;
+    const rate = rateOf(code);
     return {
       currency: code,
-      symbol: ordersInCcy[0]?.currency?.symbol ?? '₹',
+      symbol: symbolOf(code) || '₹',
       exchangeRate: rate,
       invoiced: round(buckets.reduce((a, b) => a + b.gross, 0)),
       received: round(receiptsInCcy.reduce((a, r) => a + r.amount, 0)),
@@ -318,13 +326,13 @@ function billedPosition(entries: FinanceEntry[], partyType: 'SUPPLIER' | 'WORKER
 router.get(
   '/finance/receivables',
   asyncHandler(async (_req, res) => {
-    const { orders, entries } = await financeData();
+    const { orders, entries, rateOf, symbolOf } = await financeData();
     const buyerIds = [...new Set(orders.map((o) => o.buyerId))];
 
     const rows: any[] = [];
     const credits: any[] = [];
     for (const buyerId of buyerIds) {
-      for (const pos of buyerPositions(orders, entries, buyerId)) {
+      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf)) {
         const buyer = pos.orders[0]?.buyer;
         for (const b of pos.buckets) {
           const order = pos.orders.find((o) => o.id === b.orderId)!;
@@ -372,7 +380,7 @@ router.get(
 router.get(
   '/finance/payables',
   asyncHandler(async (_req, res) => {
-    const { orders, entries } = await financeData();
+    const { orders, entries, rateOf, symbolOf } = await financeData();
 
     const rows: any[] = [];
 
@@ -452,13 +460,13 @@ router.get(
 /** Headline money totals, shared by the summary endpoint and the dashboard. */
 async function financeTotals() {
   {
-    const { orders, entries } = await financeData();
+    const { orders, entries, rateOf, symbolOf } = await financeData();
 
     let invoicedInr = 0;
     let receivableInr = 0;
     let buyerCreditInr = 0;
     for (const buyerId of [...new Set(orders.map((o) => o.buyerId))]) {
-      for (const pos of buyerPositions(orders, entries, buyerId)) {
+      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf)) {
         const rate = pos.orders[0]?.exchangeRate ?? 1;
         invoicedInr += pos.invoiced * rate;
         receivableInr += pos.balance * rate;
@@ -512,11 +520,11 @@ router.get(
 router.get(
   '/finance/parties',
   asyncHandler(async (_req, res) => {
-    const { orders, entries } = await financeData();
+    const { orders, entries, rateOf, symbolOf } = await financeData();
     const out: any[] = [];
 
     for (const buyerId of [...new Set(orders.map((o) => o.buyerId))]) {
-      const positions = buyerPositions(orders, entries, buyerId);
+      const positions = buyerPositions(orders, entries, buyerId, rateOf, symbolOf);
       const buyer = positions.find((p) => p.orders.length)?.orders[0].buyer;
       if (!buyer) continue;
       out.push({
@@ -587,11 +595,11 @@ router.get(
         partyName: z.string().optional(),
       })
       .parse(req.query);
-    const { orders, entries } = await financeData();
+    const { orders, entries, rateOf, symbolOf } = await financeData();
 
     if (q.partyType === 'BUYER') {
       if (!q.partyId) throw new ApiError(400, 'Which buyer?');
-      const positions = buyerPositions(orders, entries, q.partyId);
+      const positions = buyerPositions(orders, entries, q.partyId, rateOf, symbolOf);
       const buyer = positions.find((p) => p.orders.length)?.orders[0].buyer ?? (await prisma.buyer.findUnique({ where: { id: q.partyId } }));
       if (!buyer) throw new ApiError(404, 'Buyer not found.');
 
@@ -819,7 +827,25 @@ router.post(
     }
     if (data.partyType === 'BUYER' && !data.buyerId) throw new ApiError(400, 'Which buyer is this receipt from?');
 
-    let currency = data.currency ?? 'INR';
+    // The party must exist and match the row's type, or the entry lands in a ledger
+    // nobody is looking at.
+    if (data.partyType === 'BUYER') {
+      if (!(await prisma.buyer.findUnique({ where: { id: data.buyerId! } }))) throw new ApiError(404, 'Buyer not found.');
+      if (data.supplierId) throw new ApiError(400, 'A buyer receipt cannot also name a supplier.');
+    } else if (data.partyType === 'WORKER') {
+      if (data.supplierId || data.buyerId) throw new ApiError(400, 'Wages are recorded against a worker name, not a supplier or buyer.');
+    } else {
+      if (!data.supplierId) throw new ApiError(400, `Which ${data.partyType === 'JOBWORK' ? 'jobwork vendor' : 'supplier'} is this for?`);
+      const s = await prisma.supplier.findUnique({ where: { id: data.supplierId } });
+      if (!s) throw new ApiError(404, 'Supplier not found.');
+      if (data.partyType === 'JOBWORK' && s.type === 'MATERIAL') throw new ApiError(400, `${s.name} is a material supplier, not a jobwork vendor.`);
+      if (data.partyType === 'SUPPLIER' && s.type === 'JOBWORK') throw new ApiError(400, `${s.name} is a jobwork vendor — record their work under Jobwork.`);
+      if (data.buyerId) throw new ApiError(400, 'A supplier entry cannot also name a buyer.');
+    }
+
+    // Everything except a buyer receipt is settled in rupees. Accepting another
+    // currency here would silently mix units inside the payable totals.
+    let currency = data.partyType === 'BUYER' ? data.currency ?? 'INR' : 'INR';
     if (data.partyType === 'BUYER') {
       // A receipt settles orders in its own currency, so pin it to one. The order
       // named here is a starting point only — a surplus rolls on to older orders.

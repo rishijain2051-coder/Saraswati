@@ -7,6 +7,7 @@ import { prisma } from '../db';
 import { ApiError } from './http';
 import { round } from './costing';
 import { buildBoard, impliedOrderStatus, rollUp, type LineBoard, type MoveRow, type StageRow } from './production';
+import { buildFinanceContext, jobworkEvents, type FinanceContext } from './finance';
 
 type Tx = Prisma.TransactionClient | PrismaClient;
 
@@ -50,7 +51,7 @@ export function boardForLine(line: { qty: number; stages: StageRow[]; moves: Mov
 }
 
 /** Attach boards, totals and the money position to an order payload for the API. */
-export function serializeOrder(o: OrderWithBoard) {
+export function serializeOrder(o: OrderWithBoard, ctx: FinanceContext) {
   const lines = o.lines.map((l) => {
     const board = boardForLine(l as any);
     const vendors = board.stages.filter((s) => s.vendorId).map((s) => ({ id: s.vendorId!, name: s.vendor?.name ?? `Vendor #${s.vendorId}`, stage: s.name, sortOrder: s.sortOrder }));
@@ -103,30 +104,70 @@ export function serializeOrder(o: OrderWithBoard) {
     total,
     summary,
     jobwork: jobworkList,
-    money: orderMoney(o, total, jobworkList),
+    money: orderMoney(o, total, ctx),
   };
 }
 
 /**
- * The money position of one order, all derived:
- *   receivable = order value        - receipts from the buyer
- *   payable    = accrued jobwork    - payments to those vendors  (+ material bills)
+ * Build the shared money context for a set of orders. Loads every order of the
+ * buyers involved plus the whole ledger, because a payment on one order can settle
+ * another — you cannot work out one order's position in isolation.
+ */
+export async function financeContextFor(orders: { buyerId: number }[]): Promise<FinanceContext> {
+  const buyerIds = [...new Set(orders.map((o) => o.buyerId))];
+  const [related, entries] = await Promise.all([
+    prisma.order.findMany({
+      where: { OR: [{ buyerId: { in: buyerIds } }, { ledger: { some: {} } }] },
+      select: {
+        id: true,
+        number: true,
+        buyerId: true,
+        status: true,
+        orderDate: true,
+        exchangeRate: true,
+        currency: { select: { code: true, symbol: true } },
+        lines: { select: { qty: true, unitPrice: true, stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' } }, moves: true, product: { select: { factoryCode: true, name: true } }, id: true } },
+      },
+    }),
+    prisma.ledgerEntry.findMany({ orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
+  ]);
+
+  // Jobwork accrued per vendor per order, straight off each board.
+  const jobwork = new Map<number, Map<number, number>>();
+  for (const o of related) {
+    for (const l of o.lines) {
+      for (const e of jobworkEvents({ id: o.id, number: o.number }, l as never)) {
+        const perOrder = jobwork.get(e.vendorId) ?? new Map<number, number>();
+        perOrder.set(o.id, round((perOrder.get(o.id) ?? 0) + e.amount));
+        jobwork.set(e.vendorId, perOrder);
+      }
+    }
+  }
+  return buildFinanceContext(related as never, entries as never, jobwork);
+}
+
+/**
+ * The money position of one order. Every figure comes from the shared finance
+ * context, which allocates payments FIFO across everything outstanding — so a
+ * receipt that rolled onto another order shows the same number here as it does on
+ * the Payments page. Never recompute this from `order.ledger` alone: rows booked to
+ * an order are only where a payment was *aimed*, not where it landed.
  */
 export function orderMoney(
-  o: { currency?: { code: string; symbol: string } | null; exchangeRate?: number | null; status: string; ledger: { partyType: string; kind: string; amount: number }[] },
+  o: { id: number; currency?: { code: string; symbol: string } | null; exchangeRate?: number | null; status: string },
   total: number,
-  jobwork: { amount: number }[]
+  ctx: FinanceContext
 ) {
-  const sum = (partyType: string, kind: string) => o.ledger.filter((e) => e.partyType === partyType && e.kind === kind).reduce((a, e) => a + e.amount, 0);
+  const at = (m: Map<number, number>) => round(m.get(o.id) ?? 0);
 
   const invoiced = o.status === 'Cancelled' ? 0 : total;
-  const received = sum('BUYER', 'PAYMENT');
-  const jobworkAccrued = round(jobwork.reduce((a, j) => a + j.amount, 0));
-  const jobworkPaid = sum('JOBWORK', 'PAYMENT');
-  const materialBilled = sum('SUPPLIER', 'BILL');
-  const materialPaid = sum('SUPPLIER', 'PAYMENT');
-  const wagesBilled = sum('WORKER', 'BILL');
-  const wagesPaid = sum('WORKER', 'PAYMENT');
+  const received = at(ctx.received);
+  const jobworkAccrued = at(ctx.jobworkAccrued);
+  const jobworkPaid = at(ctx.jobworkPaid);
+  const materialBilled = at(ctx.materialBilled);
+  const materialPaid = at(ctx.materialPaid);
+  const wagesBilled = at(ctx.wagesBilled);
+  const wagesPaid = at(ctx.wagesPaid);
 
   const rate = o.exchangeRate ?? 1;
   return {
@@ -159,7 +200,14 @@ export async function loadOrder(id: number) {
 }
 
 export async function loadSerializedOrder(id: number) {
-  return serializeOrder(await loadOrder(id));
+  const o = await loadOrder(id);
+  return serializeOrder(o, await financeContextFor([o]));
+}
+
+/** Serialize many orders sharing one money context, so the list stays consistent. */
+export async function serializeOrders(orders: OrderWithBoard[]) {
+  const ctx = await financeContextFor(orders);
+  return orders.map((o) => serializeOrder(o, ctx));
 }
 
 /**

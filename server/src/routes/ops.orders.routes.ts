@@ -12,7 +12,7 @@ import { computeCostSheet } from '../lib/productCosting';
 import { loadMethodMap } from '../lib/methods';
 import { round } from '../lib/costing';
 import { buildBoard, expandHops, MOVE_KINDS, validateMove, type MoveRow } from '../lib/production';
-import { loadOrder, loadSerializedOrder, materializeStages, orderInclude, resolveStageLineId, serializeOrder, syncOrderStatus } from '../lib/orderBoard';
+import { loadOrder, loadSerializedOrder, materializeStages, orderInclude, resolveStageLineId, serializeOrders, syncOrderStatus } from '../lib/orderBoard';
 import { proformaPdf } from '../lib/docPdf';
 import { buildEml, mailtoUrl, proformaMail } from '../lib/mailDraft';
 
@@ -72,7 +72,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const status = req.query.status as string | undefined;
     const orders = await prisma.order.findMany({ where: status ? { status } : undefined, include: orderInclude, orderBy: { orderDate: 'desc' } });
-    res.json(orders.map(serializeOrder));
+    res.json(await serializeOrders(orders));
   })
 );
 
@@ -265,7 +265,22 @@ router.patch(
     const line = await prisma.orderLine.findUnique({ where: { id: lineId }, include: { stages: true } });
     if (!line) throw new ApiError(404, 'Order line not found.');
 
-    // A stage handed to a vendor needs a rate, or the jobwork bill silently reads zero.
+    if (data.stageLineId != null) {
+      const sl = await prisma.stageLine.findUnique({ where: { id: data.stageLineId }, include: { _count: { select: { steps: true } } } });
+      if (!sl) throw new ApiError(404, 'Stage line not found.');
+      if (sl._count.steps === 0) throw new ApiError(400, `Stage line ${sl.code} has no stages yet.`);
+    }
+
+    // A stage handed to a vendor needs a real jobwork supplier and a rate, or the
+    // bill for it silently reads zero.
+    const vendorIds = [...new Set((data.stages ?? []).map((s) => s.vendorId).filter((v): v is number => v != null))];
+    const vendors = vendorIds.length ? await prisma.supplier.findMany({ where: { id: { in: vendorIds } } }) : [];
+    for (const id of vendorIds) {
+      const v = vendors.find((x) => x.id === id);
+      if (!v) throw new ApiError(404, 'Jobwork vendor not found.');
+      if (v.type === 'MATERIAL') throw new ApiError(400, `${v.name} is a material supplier, not a jobwork vendor.`);
+      if (!v.isActive) throw new ApiError(400, `${v.name} is marked inactive.`);
+    }
     for (const s of data.stages ?? []) {
       const current = line.stages.find((x) => x.id === s.id);
       if (!current) throw new ApiError(400, 'A stage in the payload does not belong to this order line.');
@@ -331,39 +346,49 @@ router.post(
   asyncHandler(async (req, res) => {
     const orderId = Number(req.params.id);
     const body = movesBodySchema.parse(req.body);
-    const order = await loadOrder(orderId);
-    if (order.status === 'Cancelled') throw new ApiError(409, 'This order is cancelled — reopen it before moving pieces.');
-
-    const lineById = new Map(order.lines.map((l) => [l.id, l]));
     const date = body.date ? new Date(body.date) : new Date();
     const comment = body.comment?.trim() || null;
 
-    const simulated = new Map<number, MoveRow[]>();
-    const planned: { orderLineId: number; kind: string; fromStageId: number | null; toStageId: number | null; qty: number; note: string | null }[] = [];
-
-    for (const m of body.moves) {
-      const line = lineById.get(m.orderLineId);
-      if (!line) throw new ApiError(400, 'A movement refers to a line that is not on this order.');
-      if (line.stages.length === 0) throw new ApiError(400, `${line.product.factoryCode} has no stage line yet — assign one before moving pieces.`);
-
-      const extra = simulated.get(m.orderLineId) ?? [];
-      const boardBefore = buildBoard(line.qty, line.stages as any, [...(line.moves as any as MoveRow[]), ...extra]);
-      const err = validateMove(boardBefore, { kind: m.kind, fromStageId: m.fromStageId ?? null, toStageId: m.toStageId ?? null, qty: m.qty });
-      if (err) throw new ApiError(400, `${line.product.factoryCode} — ${err}`);
-
-      // Break a multi-stage clearance into single hops, then check each one in turn.
-      const hops = expandHops(boardBefore, { kind: m.kind, fromStageId: m.fromStageId ?? null, toStageId: m.toStageId ?? null, qty: m.qty });
-      for (const hop of hops) {
-        const board = buildBoard(line.qty, line.stages as any, [...(line.moves as any as MoveRow[]), ...extra]);
-        const hopErr = validateMove(board, hop);
-        if (hopErr) throw new ApiError(400, `${line.product.factoryCode} — ${hopErr}`);
-        planned.push({ orderLineId: m.orderLineId, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty, note: m.note?.trim() || comment });
-        extra.push({ id: -1, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty });
-      }
-      simulated.set(m.orderLineId, extra);
-    }
-
+    // The board is read, validated and written inside ONE transaction. Doing the
+    // check outside left a window where two simultaneous clearances of the same
+    // pieces both passed validation and both wrote, driving a stage negative.
+    // SQLite serialises write transactions, so re-reading in here closes it.
     const result = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({ where: { id: orderId }, select: { status: true } });
+      if (!order) throw new ApiError(404, 'Order not found.');
+      if (order.status === 'Cancelled') throw new ApiError(409, 'This order is cancelled — reopen it before moving pieces.');
+
+      const lines = await tx.orderLine.findMany({
+        where: { orderId },
+        include: { stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' } }, moves: true, product: { select: { factoryCode: true } } },
+      });
+      const lineById = new Map(lines.map((l) => [l.id, l]));
+
+      const simulated = new Map<number, MoveRow[]>();
+      const planned: { orderLineId: number; kind: string; fromStageId: number | null; toStageId: number | null; qty: number; note: string | null }[] = [];
+
+      for (const m of body.moves) {
+        const line = lineById.get(m.orderLineId);
+        if (!line) throw new ApiError(400, 'A movement refers to a line that is not on this order.');
+        if (line.stages.length === 0) throw new ApiError(400, `${line.product.factoryCode} has no stage line yet — assign one before moving pieces.`);
+
+        const extra = simulated.get(m.orderLineId) ?? [];
+        const boardBefore = buildBoard(line.qty, line.stages as any, [...(line.moves as any as MoveRow[]), ...extra]);
+        const err = validateMove(boardBefore, { kind: m.kind, fromStageId: m.fromStageId ?? null, toStageId: m.toStageId ?? null, qty: m.qty });
+        if (err) throw new ApiError(400, `${line.product.factoryCode} — ${err}`);
+
+        // Break a multi-stage clearance into single hops, then check each one in turn.
+        const hops = expandHops(boardBefore, { kind: m.kind, fromStageId: m.fromStageId ?? null, toStageId: m.toStageId ?? null, qty: m.qty });
+        for (const hop of hops) {
+          const board = buildBoard(line.qty, line.stages as any, [...(line.moves as any as MoveRow[]), ...extra]);
+          const hopErr = validateMove(board, hop);
+          if (hopErr) throw new ApiError(400, `${line.product.factoryCode} — ${hopErr}`);
+          planned.push({ orderLineId: m.orderLineId, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty, note: m.note?.trim() || comment });
+          extra.push({ id: -1, kind: hop.kind, fromStageId: hop.fromStageId, toStageId: hop.toStageId, qty: hop.qty });
+        }
+        simulated.set(m.orderLineId, extra);
+      }
+
       const ids: number[] = [];
       for (const p of planned) {
         const created = await tx.stageMove.create({
@@ -413,8 +438,10 @@ router.delete(
   '/moves/:moveId/photos/:photoId',
   canEdit,
   asyncHandler(async (req, res) => {
-    const photo = await prisma.stageMovePhoto.findUnique({ where: { id: Number(req.params.photoId) } });
-    if (!photo) throw new ApiError(404, 'Photo not found.');
+    // Scoped to the move in the path, so one movement's id cannot be used to delete
+    // another's photo.
+    const photo = await prisma.stageMovePhoto.findFirst({ where: { id: Number(req.params.photoId), moveId: Number(req.params.moveId) } });
+    if (!photo) throw new ApiError(404, 'Photo not found on that movement.');
     await prisma.stageMovePhoto.delete({ where: { id: photo.id } });
     fs.promises.unlink(path.join(uploadDir, photo.filename)).catch(() => undefined);
     res.status(204).end();
@@ -443,11 +470,13 @@ router.delete(
     const move = await prisma.stageMove.findUnique({ where: { id }, include: { orderLine: { select: { id: true, orderId: true } } } });
     if (!move) throw new ApiError(404, 'Movement not found.');
 
-    const latest = await prisma.stageMove.findFirst({ where: { orderLineId: move.orderLineId }, orderBy: { id: 'desc' } });
-    if (latest && latest.id !== id) throw new ApiError(409, 'Only the most recent movement on a line can be undone. Undo the later ones first.');
-
     const photos = await prisma.stageMovePhoto.findMany({ where: { moveId: id } });
+    // Re-checked inside the transaction so two simultaneous undos cannot both win.
     await prisma.$transaction(async (tx) => {
+      const still = await tx.stageMove.findUnique({ where: { id }, select: { id: true } });
+      if (!still) throw new ApiError(409, 'That movement has already been undone.');
+      const latest = await tx.stageMove.findFirst({ where: { orderLineId: move.orderLineId }, orderBy: { id: 'desc' } });
+      if (latest && latest.id !== id) throw new ApiError(409, 'Only the most recent movement on a line can be undone. Undo the later ones first.');
       await tx.stageMove.delete({ where: { id } }); // photos cascade with it
       await syncOrderStatus(tx, move.orderLine.orderId);
     });

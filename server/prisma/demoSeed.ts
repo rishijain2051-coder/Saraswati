@@ -443,13 +443,23 @@ async function wipeOperational() {
 }
 
 async function ensureConfig() {
-  const hash = await bcrypt.hash('admin123', 10);
-  const admin = await prisma.user.upsert({ where: { email: 'admin@saraswati.local' }, update: {}, create: { name: 'Administrator', email: 'admin@saraswati.local', role: 'Admin', passwordHash: hash } });
-  await prisma.user.upsert({
-    where: { email: 'manager@saraswati.local' },
-    update: {},
-    create: { name: 'Production Manager', email: 'manager@saraswati.local', role: 'Manager', passwordHash: await bcrypt.hash('manager123', 10) },
-  });
+  // The demo advertises these two logins, so it ENFORCES them rather than upserting
+  // with an empty update — a drifted role or password would otherwise leave the demo
+  // unopenable at exactly the wrong moment.
+  const logins = [
+    { email: 'admin@saraswati.local', name: 'Administrator', role: 'Admin', password: 'admin123' },
+    { email: 'manager@saraswati.local', name: 'Production Manager', role: 'Manager', password: 'manager123' },
+  ];
+  let admin!: { id: number };
+  for (const l of logins) {
+    const passwordHash = await bcrypt.hash(l.password, 10);
+    const rec = await prisma.user.upsert({
+      where: { email: l.email },
+      update: { name: l.name, role: l.role, passwordHash, isActive: true },
+      create: { name: l.name, email: l.email, role: l.role, passwordHash },
+    });
+    if (l.role === 'Admin') admin = rec;
+  }
 
   for (const c of [
     { code: 'INR', name: 'Indian Rupee', symbol: '₹', rateToBase: 1, isBase: true },

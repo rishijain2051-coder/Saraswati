@@ -74,8 +74,10 @@ each hand-over carries a note and photos → jobwork feeds Payments.**
   cannot be expressed.
 - **Multi-step clearance:** a forward move spanning several stages is expanded by
   `expandHops()` into one `ADVANCE` per stage crossed, so each stage's `cleared`
-  count — and therefore the jobwork owed for it — stays exact. Rework and releases
-  stay single hops: a rejection is one event, not a walk back down the line.
+  count — and therefore the jobwork owed for it — stays exact. **Only ADVANCE
+  expands.** A rejection is one event, and a COMPLETE is taken at its word: finishing
+  from stage 3 must not mark 4-6 as passed, or a vendor owning one of them would be
+  paid for work nobody did. The drawer warns which stages a completion skips.
   `hopsBetween()` mirrors this client-side so the drawer can say "recorded as 3
   steps" before you commit. One submission may carry moves for several order lines
   (that is what the "Clear a stage" bulk drawer posts).
@@ -128,6 +130,13 @@ account** rather than a negative balance. Because it is a pure function of (buck
 payments) recomputed on every read, a later order automatically soaks up an existing
 credit and nothing can go stale — there is deliberately no allocation table. Buyer
 buckets are partitioned by currency so a receipt never crosses currencies.
+
+**One shared context.** `buildFinanceContext()` allocates every payment once and
+indexes the result by order; `orderMoney()` reads from it. Never recompute an order's
+position from `order.ledger` alone — a row's `orderId` is only where a payment was
+*aimed*, not where FIFO landed it, so doing so makes the order page and the Payments
+page disagree. `financeContextFor()` loads what is needed; `serializeOrders()` shares
+one context across a list.
 
 Statements: `/finance/statement?partyType=…&partyId=…` returns a running balance plus
 the detail behind every charge and how each payment was split. **A statement row
@@ -186,8 +195,15 @@ npm run build        # type-check + build both (run before declaring done)
 ```
 
 ```bash
+npm run verify       # DB-free self-checks — run these before declaring done
 npm run db:demo      # rebuild the investor demo (wipes operational data first)
 ```
+
+`prisma/verify.ts` holds the invariants as pure-function assertions with fixed inputs:
+the example.xlsx FOB (₹19,180.60), board conservation, the move rules, hop expansion,
+jobwork reconciliation and FIFO allocation. It needs no database, so it survives any
+wipe — **this is now the authority for the costing formulas**, not a seeded product.
+Add a case here whenever you touch `costing.ts`, `production.ts` or `finance.ts`.
 
 `prisma/demoSeed.ts` builds a whole factory mid-season — 10 photographed products
 with real costing, three buyers in GBP/USD/EUR, proformas at every stage of the sales

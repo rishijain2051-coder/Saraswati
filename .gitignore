@@ -27,3 +27,6 @@ coverage/
 
 # db backups
 *.bak
+
+# TypeScript incremental build info
+*.tsbuildinfo

@@ -115,6 +115,126 @@ export function allocateFifo(buckets: Bucket[], payments: PaymentRow[]): Allocat
 }
 
 // ---------------------------------------------------------------------------
+// One shared money picture
+//
+// Both the Payments screens and an individual order read their figures from here,
+// so a receipt that FIFO moved onto another order can never show one number in one
+// place and a different number in another.
+// ---------------------------------------------------------------------------
+
+export interface FinanceOrderLike {
+  id: number;
+  number: string;
+  buyerId: number;
+  status: string;
+  orderDate: Date | string;
+  exchangeRate: number | null;
+  currency?: { code: string; symbol: string } | null;
+  lines: { qty: number; unitPrice: number }[];
+}
+
+export interface FinanceEntryLike {
+  id: number;
+  partyType: string;
+  kind: string;
+  amount: number;
+  currency?: string | null;
+  date: Date | string;
+  orderId?: number | null;
+  supplierId?: number | null;
+  buyerId?: number | null;
+  partyName: string;
+}
+
+export interface FinanceContext {
+  /** Allocated receipts per order, in that order's own currency. */
+  received: Map<number, number>;
+  /** Buyer money that had no outstanding order left to settle, keyed `buyerId:CCY`. */
+  buyerCredit: Map<string, { buyerId: number; currency: string; amount: number }>;
+  /** Jobwork accrued per order, from the board. */
+  jobworkAccrued: Map<number, number>;
+  /** Jobwork payments allocated back to the orders that earned them. */
+  jobworkPaid: Map<number, number>;
+  /** Manually billed material / wages per order, and payments allocated to them. */
+  materialBilled: Map<number, number>;
+  materialPaid: Map<number, number>;
+  wagesBilled: Map<number, number>;
+  wagesPaid: Map<number, number>;
+}
+
+const bump = (m: Map<number, number>, k: number, v: number) => m.set(k, round((m.get(k) ?? 0) + v));
+
+/**
+ * Allocate every payment across everything outstanding, once, and index the result
+ * by order. `jobworkPerOrder` comes from the board (pieces cleared × rate).
+ */
+export function buildFinanceContext(orders: FinanceOrderLike[], entries: FinanceEntryLike[], jobworkPerOrder: Map<number, Map<number, number>>): FinanceContext {
+  const ctx: FinanceContext = {
+    received: new Map(),
+    buyerCredit: new Map(),
+    jobworkAccrued: new Map(),
+    jobworkPaid: new Map(),
+    materialBilled: new Map(),
+    materialPaid: new Map(),
+    wagesBilled: new Map(),
+    wagesPaid: new Map(),
+  };
+  const live = orders.filter((o) => o.status !== 'Cancelled');
+
+  // --- buyers: their orders are the debts, per currency ---------------------
+  for (const buyerId of [...new Set(live.map((o) => o.buyerId))]) {
+    const mine = live.filter((o) => o.buyerId === buyerId);
+    const receipts = entries.filter((e) => e.partyType === 'BUYER' && e.kind === 'PAYMENT' && e.buyerId === buyerId);
+    const codes = [...new Set([...mine.map((o) => o.currency?.code ?? 'INR'), ...receipts.map((r) => r.currency ?? 'INR')])];
+    for (const code of codes) {
+      const ordersInCcy = mine.filter((o) => (o.currency?.code ?? 'INR') === code);
+      const inCcy = receipts.filter((r) => (r.currency ?? 'INR') === code);
+      const buckets: Bucket[] = ordersInCcy.map((o) => ({
+        key: `order-${o.id}`,
+        orderId: o.id,
+        label: o.number,
+        date: o.orderDate,
+        gross: round(o.lines.reduce((a, l) => a + l.qty * l.unitPrice, 0)),
+      }));
+      const result = allocateFifo(buckets, inCcy.map((e) => ({ id: e.id, date: e.date, amount: e.amount, orderId: e.orderId })));
+      for (const b of result.buckets) if (b.orderId != null) ctx.received.set(b.orderId, b.paid);
+      if (result.credit > 0) ctx.buyerCredit.set(`${buyerId}:${code}`, { buyerId, currency: code, amount: result.credit });
+    }
+  }
+
+  // --- jobwork: accrual from the board, payments allocated oldest job first --
+  for (const [vendorId, perOrder] of jobworkPerOrder) {
+    for (const [orderId, amount] of perOrder) bump(ctx.jobworkAccrued, orderId, amount);
+    const buckets: Bucket[] = [...perOrder.entries()]
+      .map(([orderId, gross]) => {
+        const o = live.find((x) => x.id === orderId);
+        return { key: `order-${orderId}`, orderId, label: o?.number ?? `#${orderId}`, date: o?.orderDate ?? new Date(0), gross };
+      })
+      .filter((b) => b.gross > 0);
+    const payments = entries.filter((e) => e.partyType === 'JOBWORK' && e.kind === 'PAYMENT' && e.supplierId === vendorId);
+    const result = allocateFifo(buckets, payments.map((e) => ({ id: e.id, date: e.date, amount: e.amount, orderId: e.orderId })));
+    for (const b of result.buckets) if (b.orderId != null) bump(ctx.jobworkPaid, b.orderId, b.paid);
+  }
+
+  // --- material and wages: the bills are the debts --------------------------
+  for (const type of ['SUPPLIER', 'WORKER'] as const) {
+    const billed = type === 'SUPPLIER' ? ctx.materialBilled : ctx.wagesBilled;
+    const paid = type === 'SUPPLIER' ? ctx.materialPaid : ctx.wagesPaid;
+    const rows = entries.filter((e) => e.partyType === type);
+    for (const key of [...new Set(rows.map((e) => `${e.supplierId ?? e.partyName}`))]) {
+      const mine = rows.filter((e) => `${e.supplierId ?? e.partyName}` === key);
+      const bills = mine.filter((e) => e.kind === 'BILL');
+      for (const b of bills) if (b.orderId != null) bump(billed, b.orderId, b.amount);
+      const buckets: Bucket[] = bills.map((b) => ({ key: `bill-${b.id}`, orderId: b.orderId ?? null, label: `Bill #${b.id}`, date: b.date, gross: b.amount }));
+      const result = allocateFifo(buckets, mine.filter((e) => e.kind === 'PAYMENT').map((e) => ({ id: e.id, date: e.date, amount: e.amount, orderId: e.orderId })));
+      for (const b of result.buckets) if (b.orderId != null) bump(paid, b.orderId, b.paid);
+    }
+  }
+
+  return ctx;
+}
+
+// ---------------------------------------------------------------------------
 // Jobwork earned, movement by movement
 // ---------------------------------------------------------------------------
 
@@ -160,22 +280,24 @@ interface LineForEvents {
 export function jobworkEvents(order: { id: number; number: string }, line: LineForEvents): JobworkEvent[] {
   const stageById = new Map(line.stages.map((s) => [s.id, s]));
   const events: JobworkEvent[] = [];
-  const clearedSoFar = new Map<number, number>();
-  const rejectedFrom = new Map<number, number>();
+  /** Pieces sent back INTO a stage that have not yet been cleared out again. */
+  const awaitingRedo = new Map<number, number>();
 
-  // Walk oldest-first so "was this a re-do?" can be answered as we go.
+  // Walk oldest-first so "was this a re-do?" can be answered as we go: a clearance
+  // counts as rework only while pieces are known to have come back to that stage.
   const chronological = [...line.moves].sort((a, b) => byDate({ date: a.date!, id: a.id }, { date: b.date!, id: b.id }));
   for (const m of chronological) {
-    if (m.kind === 'REJECT' && m.fromStageId != null) {
-      rejectedFrom.set(m.fromStageId, (rejectedFrom.get(m.fromStageId) ?? 0) + m.qty);
+    if (m.kind === 'REJECT' && m.toStageId != null) {
+      awaitingRedo.set(m.toStageId, (awaitingRedo.get(m.toStageId) ?? 0) + m.qty);
     }
     if (m.kind !== 'ADVANCE' && m.kind !== 'COMPLETE') continue;
     if (m.fromStageId == null) continue;
     const stage = stageById.get(m.fromStageId);
     if (!stage?.vendorId) continue;
 
-    const already = clearedSoFar.get(stage.id) ?? 0;
-    clearedSoFar.set(stage.id, already + m.qty);
+    const pending = awaitingRedo.get(stage.id) ?? 0;
+    const isRedo = pending > 0;
+    if (isRedo) awaitingRedo.set(stage.id, Math.max(pending - m.qty, 0));
 
     events.push({
       moveId: m.id,
@@ -193,7 +315,7 @@ export function jobworkEvents(order: { id: number; number: string }, line: LineF
       rate: stage.jobworkRate ?? 0,
       amount: round(m.qty * (stage.jobworkRate ?? 0)),
       note: m.note ?? null,
-      rework: already + m.qty > line.qty,
+      rework: isRedo,
     });
   }
   return events;

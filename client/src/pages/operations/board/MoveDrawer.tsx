@@ -87,6 +87,9 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
   const available = availableAt(board, target.from);
   const hops = from && to ? hopsBetween(board, from, to) : [];
   const crossing = hops.filter((s) => s.vendorId);
+  /** Finishing from anywhere but the last stage jumps over the rest of the line. */
+  const skipped =
+    kind === 'COMPLETE' && from?.kind === 'STAGE' ? board.stages.filter((s) => s.sortOrder > from.stage.sortOrder) : [];
 
   return (
     <Drawer
@@ -174,6 +177,12 @@ export default function MoveDrawer({ order, target, onClose }: { order: Order; t
                 <span>
                   Recorded as {hops.length} steps: {hops.map((s) => s.name).join(' → ')}.
                   {crossing.length > 0 && ` Jobwork counts for ${crossing.map((s) => s.vendor?.name ?? 'vendor').join(', ')}.`}
+                </span>
+              ) : skipped.length > 0 ? (
+                <span>
+                  Skips {skipped.map((s) => s.name).join(', ')} — nobody is credited for those stages
+                  {skipped.some((s) => s.vendorId) ? `, including ${[...new Set(skipped.filter((s) => s.vendorId).map((s) => s.vendor?.name ?? 'a vendor'))].join(' and ')}` : ''}. Advance
+                  through them first if that work was really done.
                 </span>
               ) : undefined
             }

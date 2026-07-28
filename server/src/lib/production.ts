@@ -229,25 +229,27 @@ export function nextStageAfter(board: LineBoard, stageId: number): StageCell | n
  *
  * Clearing 1 -> 4 in a single action records 1->2, 2->3, 3->4 rather than one jump,
  * so every stage's "cleared" count — and therefore the jobwork owed for it — stays
- * exact. Backward moves (rework) and releases stay single hops: a rejection is one
- * event, not a walk back through the line.
+ * exact.
+ *
+ * Only ADVANCE expands. A REJECT is one event, not a walk back down the line; and a
+ * COMPLETE is taken at its word — saying "these are finished" from stage 3 must NOT
+ * quietly mark stages 4, 5 and 6 as passed, because any vendor owning those stages
+ * would then be credited for work nobody did. To pay those stages, advance through
+ * them first and complete from the last one.
  */
 export function expandHops(
   board: LineBoard,
   req: { kind: MoveKind; fromStageId?: number | null; toStageId?: number | null; qty: number }
 ): { kind: MoveKind; fromStageId: number | null; toStageId: number | null; qty: number }[] {
   const single = [{ kind: req.kind, fromStageId: req.fromStageId ?? null, toStageId: req.toStageId ?? null, qty: req.qty }];
-  if (req.kind !== 'ADVANCE' && req.kind !== 'COMPLETE') return single;
+  if (req.kind !== 'ADVANCE') return single;
 
   const from = req.fromStageId != null ? board.stages.find((s) => s.id === req.fromStageId) : undefined;
-  if (!from) return single;
-
-  // Every stage strictly after the origin, up to the destination (or the end of the
-  // line when completing).
   const to = req.toStageId != null ? board.stages.find((s) => s.id === req.toStageId) : undefined;
-  const limit = to ? to.sortOrder : Infinity;
-  const between = board.stages.filter((s) => s.sortOrder > from.sortOrder && s.sortOrder <= limit);
-  if (between.length <= 1 && req.kind === 'ADVANCE') return single;
+  if (!from || !to) return single;
+
+  const between = board.stages.filter((s) => s.sortOrder > from.sortOrder && s.sortOrder <= to.sortOrder);
+  if (between.length <= 1) return single;
 
   const hops: { kind: MoveKind; fromStageId: number | null; toStageId: number | null; qty: number }[] = [];
   let cursor = from.id;
@@ -255,8 +257,7 @@ export function expandHops(
     hops.push({ kind: 'ADVANCE', fromStageId: cursor, toStageId: stage.id, qty: req.qty });
     cursor = stage.id;
   }
-  if (req.kind === 'COMPLETE') hops.push({ kind: 'COMPLETE', fromStageId: cursor, toStageId: null, qty: req.qty });
-  return hops.length ? hops : single;
+  return hops;
 }
 
 /** Human label for a move endpoint, used in movement history. */
