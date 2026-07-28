@@ -109,7 +109,7 @@ export default function StockPage() {
       </Card>
 
       {/* Item modal */}
-      <Modal title={editItem ? 'Edit item' : 'Add raw item'} open={itemOpen} onCancel={() => setItemOpen(false)} onOk={() => itemForm.submit()} confirmLoading={saveItem.isPending} destroyOnClose>
+      <Modal title={editItem ? 'Edit item' : 'Add raw item'} open={itemOpen} onCancel={() => setItemOpen(false)} onOk={() => itemForm.submit()} confirmLoading={saveItem.isPending} destroyOnHidden>
         <Form form={itemForm} layout="vertical" onFinish={(v) => saveItem.mutate(v)} style={{ marginTop: 12 }}>
           <Row gutter={12}>
             <Col span={10}><Form.Item name="code" label="Code" rules={[{ required: true }]}><Input disabled={!!editItem} /></Form.Item></Col>
@@ -123,7 +123,7 @@ export default function StockPage() {
       </Modal>
 
       {/* Movement modal */}
-      <Modal title={`Record ${moveType === 'IN' ? 'Inward' : 'Outward'}`} open={moveOpen} onCancel={() => setMoveOpen(false)} onOk={() => moveForm.submit()} confirmLoading={saveMove.isPending} destroyOnClose>
+      <Modal title={`Record ${moveType === 'IN' ? 'Inward' : 'Outward'}`} open={moveOpen} onCancel={() => setMoveOpen(false)} onOk={() => moveForm.submit()} confirmLoading={saveMove.isPending} destroyOnHidden>
         <Form form={moveForm} layout="vertical" onFinish={(v) => saveMove.mutate(v)} style={{ marginTop: 12 }}>
           <Form.Item name="rawItemId" label="Item" rules={[{ required: true }]}>
             <Select showSearch optionFilterProp="label" options={(items ?? []).map((i) => ({ label: `${i.code} — ${i.name} (bal ${num(i.balance, 2)} ${i.unit})`, value: i.id }))} />

@@ -134,7 +134,7 @@ export default function FormulasTab() {
         okButtonProps={{ disabled: !!exprError || !draft.code.trim() || !draft.label.trim() }}
         onOk={() => save.mutate(draft)}
         confirmLoading={save.isPending}
-        destroyOnClose
+        destroyOnHidden
       >
         <Row gutter={12}>
           <Col span={6}>

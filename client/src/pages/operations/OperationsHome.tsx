@@ -1,27 +1,19 @@
-import { Breadcrumb, Card, Col, List, Row, Statistic, Tag, Typography } from 'antd';
-import {
-  HomeOutlined,
-  FileDoneOutlined,
-  FileTextOutlined,
-  ShopOutlined,
-  InboxOutlined,
-  ProfileOutlined,
-  WalletOutlined,
-} from '@ant-design/icons';
+import { Badge, Breadcrumb, Card, Col, List, Row, Statistic, Tag, Typography } from 'antd';
+import { HomeOutlined, FileDoneOutlined, FileTextOutlined, ShopOutlined, InboxOutlined, ProfileOutlined, WalletOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
-import { useOpsDashboard } from '../../api/ops';
+import { useOpsDashboard, PROFORMA_STATUS_COLOR } from '../../api/ops';
 import { num } from '../../util/format';
 
 const { Title, Text } = Typography;
 
 const SECTIONS = [
-  { key: 'orders', title: 'Orders', icon: <FileDoneOutlined />, path: '/operations/orders', desc: 'Buyer orders from proforma to shipment.' },
-  { key: 'proformas', title: 'Proformas', icon: <FileTextOutlined />, path: '/operations/proformas', desc: 'Proforma invoices & their status.' },
-  { key: 'suppliers', title: 'Suppliers', icon: <ShopOutlined />, path: '/operations/suppliers', desc: 'Material & jobwork vendors.' },
-  { key: 'stock', title: 'Stock', icon: <InboxOutlined />, path: '/operations/stock', desc: 'Raw-material inward, outward & balances.' },
-  { key: 'sheets', title: 'Operation Sheets', icon: <ProfileOutlined />, path: '/operations/sheets', desc: 'Material & labour sheets, stages & jobwork.' },
-  { key: 'payments', title: 'Payments', icon: <WalletOutlined />, path: '/operations/payments', desc: 'Ledgers & dues for suppliers, buyers, workers.' },
+  { key: 'proformas', title: 'Proformas', icon: <FileTextOutlined />, path: '/operations/proformas', desc: 'Make a PI, mail it to the buyer, record accept or reject.' },
+  { key: 'orders', title: 'Orders', icon: <FileDoneOutlined />, path: '/operations/orders', desc: 'The production board — every piece, every stage, in-house or vendor.' },
+  { key: 'sheets', title: 'Material Sheets', icon: <ProfileOutlined />, path: '/operations/sheets', desc: 'What each job needs, printable per section.' },
+  { key: 'payments', title: 'Payments', icon: <WalletOutlined />, path: '/operations/payments', desc: 'What buyers owe us and what we owe out — worked out from the orders.' },
+  { key: 'suppliers', title: 'Suppliers', icon: <ShopOutlined />, path: '/operations/suppliers', desc: 'Material and jobwork vendors.' },
+  { key: 'stock', title: 'Stock', icon: <InboxOutlined />, path: '/operations/stock', desc: 'Raw-material inward, outward and balances.' },
 ];
 
 export default function OperationsHome() {
@@ -31,18 +23,56 @@ export default function OperationsHome() {
   return (
     <div>
       <Breadcrumb style={{ marginBottom: 16 }} items={[{ title: <Link to="/"><HomeOutlined /></Link> }, { title: 'Operations' }]} />
-      <Title level={2} style={{ marginBottom: 2 }}>Operations</Title>
-      <Text type="secondary">Your work hub — orders, proformas, suppliers, stock, operation sheets, jobs & payments.</Text>
+      <Title level={2} style={{ marginBottom: 2 }}>
+        Operations
+      </Title>
+      <Text type="secondary">Proforma → order → production board → payments.</Text>
 
       <Row gutter={[16, 16]} style={{ margin: '16px 0' }}>
-        <Col xs={12} md={6}><Card size="small" hoverable onClick={() => navigate('/operations/orders')}><Statistic title="Pending Orders" value={d?.pendingOrders ?? 0} /></Card></Col>
-        <Col xs={12} md={6}><Card size="small" hoverable onClick={() => navigate('/operations/sheets')}><Statistic title="Jobs In Production" value={d?.inProduction ?? 0} /></Card></Col>
-        <Col xs={12} md={6}><Card size="small" hoverable onClick={() => navigate('/operations/payments')}><Statistic title="Receivable (₹)" value={num(d?.receivable ?? 0, 0)} valueStyle={{ color: '#389e0d' }} /></Card></Col>
-        <Col xs={12} md={6}><Card size="small" hoverable onClick={() => navigate('/operations/payments')}><Statistic title="Payable (₹)" value={num(d?.payable ?? 0, 0)} valueStyle={{ color: '#cf1322' }} /></Card></Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/proformas')}>
+            <Statistic title="PIs awaiting a reply" value={d?.awaitingDecision ?? 0} valueStyle={{ color: '#1677ff' }} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/orders')}>
+            <Statistic title="Live orders" value={d?.pendingOrders ?? 0} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/orders')}>
+            <Statistic title="Pieces in production" value={d?.inProduction ?? 0} valueStyle={{ color: '#d48806' }} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/orders')}>
+            <Statistic title="Pieces at vendors" value={d?.atVendors ?? 0} valueStyle={{ color: '#d4380d' }} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/orders')}>
+            <Statistic title="Not started" value={d?.pendingPieces ?? 0} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/orders')}>
+            <Statistic title="Finished pieces" value={d?.finishedPieces ?? 0} valueStyle={{ color: '#389e0d' }} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/payments')}>
+            <Statistic title="To collect (₹)" value={num(d?.receivable ?? 0, 0)} valueStyle={{ color: '#389e0d' }} />
+          </Card>
+        </Col>
+        <Col xs={12} md={6}>
+          <Card size="small" hoverable onClick={() => navigate('/operations/payments')}>
+            <Statistic title="Owed out (₹)" value={num(d?.payable ?? 0, 0)} valueStyle={{ color: '#cf1322' }} />
+          </Card>
+        </Col>
       </Row>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        <Col xs={24} md={12}>
+        <Col xs={24} md={8}>
           <Card size="small" title="Recent proformas">
             <List
               size="small"
@@ -50,14 +80,34 @@ export default function OperationsHome() {
               locale={{ emptyText: 'No proformas yet' }}
               renderItem={(p) => (
                 <List.Item onClick={() => navigate(`/operations/proformas/${p.id}`)} style={{ cursor: 'pointer' }}>
-                  <span><b>{p.number}</b> · {p.buyer}</span>
-                  <span><Tag>{p.status}</Tag><Text type="secondary">{dayjs(p.date).format('DD MMM')}</Text></span>
+                  <span>
+                    <b>{p.number}</b> · {p.buyer}
+                  </span>
+                  <span>
+                    <Tag color={PROFORMA_STATUS_COLOR[p.status] ?? 'default'}>{p.status}</Tag>
+                    <Text type="secondary">{dayjs(p.date).format('DD MMM')}</Text>
+                  </span>
                 </List.Item>
               )}
             />
           </Card>
         </Col>
-        <Col xs={24} md={12}>
+        <Col xs={24} md={8}>
+          <Card size="small" title="Pieces sitting with vendors" extra={<Text type="secondary" style={{ fontSize: 12 }}>jobwork {num(d?.jobworkAccrued ?? 0, 0)} ₹</Text>}>
+            <List
+              size="small"
+              dataSource={d?.vendorLoad ?? []}
+              locale={{ emptyText: 'Nothing out for jobwork' }}
+              renderItem={(v) => (
+                <List.Item onClick={() => navigate('/operations/payments')} style={{ cursor: 'pointer' }}>
+                  <span>{v.vendorName}</span>
+                  <Tag color="volcano">{v.pieces} pcs</Tag>
+                </List.Item>
+              )}
+            />
+          </Card>
+        </Col>
+        <Col xs={24} md={8}>
           <Card size="small" title="Low stock alerts">
             <List
               size="small"
@@ -66,7 +116,12 @@ export default function OperationsHome() {
               renderItem={(it) => (
                 <List.Item onClick={() => navigate('/operations/stock')} style={{ cursor: 'pointer' }}>
                   <span>{it.name}</span>
-                  <span><Tag color="red">{num(it.balance, 2)} {it.unit}</Tag><Text type="secondary">reorder ≤ {num(it.reorderLevel, 0)}</Text></span>
+                  <span>
+                    <Tag color="red">
+                      {num(it.balance, 2)} {it.unit}
+                    </Tag>
+                    <Text type="secondary">reorder ≤ {num(it.reorderLevel, 0)}</Text>
+                  </span>
                 </List.Item>
               )}
             />
@@ -80,7 +135,18 @@ export default function OperationsHome() {
             <Card className="module-card" onClick={() => navigate(s.path)} style={{ height: '100%', borderTop: '4px solid #6d4c41' }}>
               <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
                 <div style={{ fontSize: 30, color: '#6d4c41' }}>{s.icon}</div>
-                <div><Title level={4} style={{ margin: 0 }}>{s.title}</Title><Text type="secondary">{s.desc}</Text></div>
+                <div>
+                  <Title level={4} style={{ margin: 0 }}>
+                    {s.key === 'proformas' && (d?.awaitingDecision ?? 0) > 0 ? (
+                      <Badge count={d!.awaitingDecision} offset={[10, -2]} color="#1677ff">
+                        {s.title}
+                      </Badge>
+                    ) : (
+                      s.title
+                    )}
+                  </Title>
+                  <Text type="secondary">{s.desc}</Text>
+                </div>
               </div>
             </Card>
           </Col>

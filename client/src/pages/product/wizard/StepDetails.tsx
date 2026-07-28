@@ -1,6 +1,7 @@
 import { Button, Card, Col, Divider, Input, InputNumber, Row, Select, Space, Tag, Typography } from 'antd';
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import { useAttributes, useBuyers, useMeta, useUnits } from '../../../api/hooks';
+import { useStageLines } from '../../../api/ops';
 import type { WizardDraft } from './draft';
 
 const { Text } = Typography;
@@ -52,6 +53,7 @@ export default function StepDetails({
   const { data: colours } = useAttributes('COLOUR');
   const { data: materials } = useAttributes('MATERIAL');
   const { data: finishes } = useAttributes('FINISH');
+  const { data: stageLines } = useStageLines();
 
   const attrOpts = (arr?: { id: number; value: string }[]) => (arr ?? []).map((a) => ({ label: a.value, value: a.id }));
 
@@ -139,6 +141,22 @@ export default function StepDetails({
           <Col xs={12} md={8}>
             <Text type="secondary">Finish</Text>
             <Select allowClear style={{ width: '100%' }} value={draft.finishId ?? undefined} options={attrOpts(finishes)} onChange={(v) => set({ finishId: v ?? null })} />
+          </Col>
+          <Col xs={24} md={16}>
+            <Text type="secondary">Production stage line</Text>
+            <Select
+              allowClear
+              style={{ width: '100%' }}
+              placeholder={stageLines?.some((l) => l.isDefault) ? 'Uses the default line if left blank' : 'Select the route this product travels'}
+              value={draft.stageLineId ?? undefined}
+              options={(stageLines ?? [])
+                .filter((l) => l.isActive || l.id === draft.stageLineId)
+                .map((l) => ({ label: `${l.code} — ${l.name}  (${l.steps.map((s) => s.name).join(' → ')})`, value: l.id }))}
+              onChange={(v) => set({ stageLineId: v ?? null })}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              The stages every order of this product moves through. Manage the lines in Master Data → Stage Lines.
+            </Text>
           </Col>
         </Row>
         <Divider style={{ margin: '12px 0 8px' }} />

@@ -85,14 +85,17 @@ async function main() {
   }
 
   // --- Example product: CRAZY ALMIRAH (matches example.xlsx) ---------------
-  await prisma.product.deleteMany({ where: { factoryCode: 'AB-00123' } });
+  // Left alone once it exists, so re-running the seed never wipes work that
+  // orders, proformas or material sheets already point at.
+  const demoExists = await prisma.product.findUnique({ where: { factoryCode: 'AB-00123' }, select: { id: true } });
 
   const L = (
     name: string,
     opts: Partial<{ qty: number; wastagePct: number; actualL: number; actualW: number; actualH: number; costL: number; costW: number; costH: number; actualWeight: number; unit: string; rate: number }>
   ) => ({ name, qty: 1, wastagePct: 0, ...opts });
 
-  await prisma.product.create({
+  if (demoExists) console.log('  AB-00123 already present — left untouched.');
+  else await prisma.product.create({
     data: {
       factoryCode: 'AB-00123',
       name: 'Crazy Almirah',
@@ -237,7 +240,6 @@ async function main() {
     { key: 'PI', prefix: 'PI', useYear: true },
     { key: 'ORD', prefix: 'ORD', useYear: true },
     { key: 'OP', prefix: 'OP', useYear: false },
-    { key: 'PO', prefix: 'PO', useYear: false },
   ];
   for (const s of sequences) {
     await prisma.docSequence.upsert({ where: { key: s.key }, update: { prefix: s.prefix, useYear: s.useYear }, create: s });
@@ -248,17 +250,33 @@ async function main() {
     { code: 'SUP-METAL', name: 'Metal Craft Works', type: 'MATERIAL', contactName: 'Iqbal Khan', phone: '+91 98290 22222', gstNo: '08MNOPQ5678R1Z2', address: 'Jodhpur, Rajasthan', paymentTerms: '15 days' },
     { code: 'JOB-POLISH', name: 'Glaze Polishing Co.', type: 'JOBWORK', contactName: 'Suresh', phone: '+91 98290 33333', address: 'Jodhpur, Rajasthan', paymentTerms: 'On delivery' },
     { code: 'JOB-CARVE', name: 'Precision Carving', type: 'JOBWORK', contactName: 'Mohan Lal', phone: '+91 98290 44444', address: 'Jodhpur, Rajasthan', paymentTerms: 'On delivery' },
+    { code: 'JOB-POWDER', name: 'Shakti Powder Coating', type: 'JOBWORK', contactName: 'Vikram Singh', phone: '+91 98290 55555', address: 'Boranada, Jodhpur', paymentTerms: '15 days' },
   ];
   for (const s of suppliers) {
     await prisma.supplier.upsert({ where: { code: s.code }, update: s, create: s });
   }
 
-  if ((await prisma.productionStageTemplate.count({ where: { productTypeId: null } })) === 0) {
-    const stages = ['Cutting', 'Assembly', 'Polishing', 'Packing'];
-    for (let i = 0; i < stages.length; i++) {
-      await prisma.productionStageTemplate.create({ data: { productTypeId: null, name: stages[i], sortOrder: i } });
+  // --- Stage lines (production routes) ------------------------------------
+  // A product is assigned one stage line; each order line snapshots its steps.
+  const stageLines = [
+    { code: 'X', name: 'Wood line', isDefault: true, steps: ['Raw joining', 'Raw sanding', 'Polishing', 'Accessory fitting', 'QC', 'Packaging'] },
+    { code: 'Y', name: 'Metal line', isDefault: false, steps: ['Raw joining', 'Powder coating', 'Fitting', 'QC', 'Packing'] },
+  ];
+  const stageLineId: Record<string, number> = {};
+  for (const sl of stageLines) {
+    const existing = await prisma.stageLine.findUnique({ where: { code: sl.code } });
+    const rec = existing
+      ? await prisma.stageLine.update({ where: { code: sl.code }, data: { name: sl.name, isDefault: sl.isDefault, isActive: true } })
+      : await prisma.stageLine.create({ data: { code: sl.code, name: sl.name, isDefault: sl.isDefault } });
+    // Keep the step list in step with the seed definition.
+    await prisma.stageLineStep.deleteMany({ where: { stageLineId: rec.id } });
+    for (let i = 0; i < sl.steps.length; i++) {
+      await prisma.stageLineStep.create({ data: { stageLineId: rec.id, name: sl.steps[i], sortOrder: i } });
     }
+    stageLineId[sl.code] = rec.id;
   }
+  // The demo almirah travels the wood line.
+  await prisma.product.updateMany({ where: { factoryCode: 'AB-00123' }, data: { stageLineId: stageLineId['X'] } });
 
   const rawItems = [
     { code: 'RM-MANGO', name: 'Mango Wood', category: 'Wood', unit: 'CFT', reorderLevel: 50, openingQty: 200 },

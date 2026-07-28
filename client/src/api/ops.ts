@@ -1,11 +1,39 @@
 import { useQuery } from '@tanstack/react-query';
-import { api } from './client';
+import { api, apiError } from './client';
 import type { Buyer, Currency } from './types';
 
-export const ORDER_STATUSES = ['Confirmed', 'Production', 'Ready', 'Shipped', 'Closed', 'Cancelled'];
-export const PROFORMA_STATUSES = ['Draft', 'Sent', 'Accepted', 'Rejected'];
-export const STAGE_STATUSES = ['NOT_STARTED', 'IN_PROGRESS', 'DONE'];
-export const PARTY_TYPES = ['SUPPLIER', 'JOBWORK', 'BUYER', 'WORKER'];
+export const ORDER_STATUSES = ['Confirmed', 'Production', 'Ready', 'Shipped', 'Closed', 'Cancelled'] as const;
+export const PROFORMA_STATUSES = ['Draft', 'Sent', 'Accepted', 'Rejected'] as const;
+export const PARTY_TYPES = ['SUPPLIER', 'JOBWORK', 'BUYER', 'WORKER'] as const;
+
+export const ORDER_STATUS_COLOR: Record<string, string> = {
+  Confirmed: 'blue',
+  Production: 'gold',
+  Ready: 'cyan',
+  Shipped: 'green',
+  Closed: 'default',
+  Cancelled: 'red',
+};
+
+export const PROFORMA_STATUS_COLOR: Record<string, string> = { Draft: 'default', Sent: 'blue', Accepted: 'green', Rejected: 'red' };
+
+export type MoveKind = 'RELEASE' | 'ADVANCE' | 'REJECT' | 'COMPLETE' | 'RETURN';
+
+export const MOVE_LABEL: Record<MoveKind, string> = {
+  RELEASE: 'Started',
+  ADVANCE: 'Cleared',
+  REJECT: 'Sent back',
+  COMPLETE: 'Finished',
+  RETURN: 'Reopened',
+};
+
+export const MOVE_COLOR: Record<MoveKind, string> = {
+  RELEASE: 'blue',
+  ADVANCE: 'green',
+  REJECT: 'red',
+  COMPLETE: 'purple',
+  RETURN: 'orange',
+};
 
 export interface Supplier {
   id: number;
@@ -19,6 +47,23 @@ export interface Supplier {
   address?: string | null;
   paymentTerms?: string | null;
   isActive: boolean;
+}
+
+export interface StageLineStep {
+  id: number;
+  name: string;
+  sortOrder: number;
+}
+
+export interface StageLine {
+  id: number;
+  code: string;
+  name: string;
+  isDefault: boolean;
+  isActive: boolean;
+  notes?: string | null;
+  steps: StageLineStep[];
+  _count?: { products: number; orderLines: number };
 }
 
 export interface RawItem {
@@ -50,16 +95,96 @@ export interface StockTxn {
   supplier?: { name: string } | null;
 }
 
+// --- the production board ---------------------------------------------------
+
+export interface StageCell {
+  id: number;
+  name: string;
+  sortOrder: number;
+  vendorId: number | null;
+  vendor?: { id: number; name: string } | null;
+  jobworkRate: number;
+  note?: string | null;
+  /** Pieces sitting here right now. */
+  at: number;
+  /** Pieces that moved forward out of here. */
+  cleared: number;
+  rejectedOut: number;
+  rejectedIn: number;
+  reached: number;
+  jobworkValue: number;
+}
+
+export interface LineBoard {
+  qty: number;
+  pending: number;
+  done: number;
+  wip: number;
+  progressPct: number;
+  stages: StageCell[];
+  jobwork: { vendorId: number; vendorName: string; stages: string[]; pieces: number; amount: number }[];
+}
+
+export interface StageMovePhoto {
+  id: number;
+  url: string;
+  caption?: string | null;
+}
+
+export interface StageMoveHistory {
+  id: number;
+  kind: MoveKind;
+  fromStageId: number | null;
+  toStageId: number | null;
+  fromStage: string | null;
+  toStage: string | null;
+  qty: number;
+  date: string;
+  /** The hand-over comment written when the pieces were passed on. */
+  note?: string | null;
+  photos: StageMovePhoto[];
+}
+
 export interface OrderLineDto {
-  id?: number;
+  id: number;
   productId: number;
   qty: number;
   unitPrice: number;
-  product?: { id: number; factoryCode: string; name: string };
-  planned?: number;
-  produced?: number;
-  pending?: number;
-  sheetCount?: number;
+  sortOrder: number;
+  amount: number;
+  product: { id: number; factoryCode: string; name: string; primaryImage?: string | null; stageLineId?: number | null; unit?: { code: string } | null };
+  stageLineId?: number | null;
+  stageLine?: { id: number; code: string; name: string } | null;
+  /** Derived from who owns each stage: all ours, all a vendor's, or a mix. */
+  mode: 'INHOUSE' | 'OUTSOURCED' | 'MIXED' | string;
+  vendors: { id: number; name: string }[];
+  outsourcedStages: { id: number; name: string; stage: string; sortOrder: number }[];
+  needsStageLine: boolean;
+  board: LineBoard;
+  history: StageMoveHistory[];
+  sheet?: { id: number; number: string } | null;
+}
+
+/** The money position of one order — every figure derived, never typed in. */
+export interface OrderMoney {
+  currency: string;
+  symbol: string;
+  exchangeRate: number;
+  invoiced: number;
+  received: number;
+  receivable: number;
+  invoicedInr: number;
+  receivableInr: number;
+  jobworkAccrued: number;
+  jobworkPaid: number;
+  jobworkDue: number;
+  materialBilled: number;
+  materialPaid: number;
+  materialDue: number;
+  wagesBilled: number;
+  wagesPaid: number;
+  wagesDue: number;
+  payableInr: number;
 }
 
 export interface Order {
@@ -75,22 +200,49 @@ export interface Order {
   incoterms?: string | null;
   notes?: string | null;
   exchangeRate?: number | null;
-  proforma?: { id: number; number: string } | null;
-  sheets?: { id: number; number: string; status: string; productId: number; qty: number; producedQty: number; mode: string }[];
+  proforma?: { id: number; number: string; status: string } | null;
   lines: OrderLineDto[];
   total: number;
-  totalOrdered?: number;
-  totalProduced?: number;
-  totalPending?: number;
+  summary: { ordered: number; done: number; wip: number; pending: number; progressPct: number };
+  jobwork: { vendorId: number; vendorName: string; pieces: number; amount: number; stages: string[] }[];
+  money: OrderMoney;
+  ledger: LedgerEntry[];
+  /** Present on the response to a move submission. */
+  createdMoves?: number;
+  moveIds?: number[];
+  /** The hop the pieces landed on — hand-over photos attach here. */
+  photoMoveId?: number | null;
+  statusChangedTo?: string | null;
 }
+
+/** Payload for `POST /orders/:id/moves`. */
+export interface MoveInput {
+  orderLineId: number;
+  kind: MoveKind;
+  fromStageId?: number | null;
+  toStageId?: number | null;
+  qty: number;
+  note?: string | null;
+}
+
+// --- proformas -------------------------------------------------------------
 
 export interface ProformaLineDto {
   id?: number;
   productId?: number | null;
+  imageId?: number | null;
   description: string;
   qty: number;
   unitPrice: number;
-  product?: { id: number; factoryCode: string; name: string } | null;
+  amount?: number;
+  specs?: string | null;
+  image?: { id: number; url: string; filename: string } | null;
+  product?: {
+    id: number;
+    factoryCode: string;
+    name: string;
+    images?: { id: number; url: string; filename: string; isPrimary: boolean; caption?: string | null }[];
+  } | null;
 }
 
 export interface Proforma {
@@ -109,24 +261,30 @@ export interface Proforma {
   bankDetails?: string | null;
   notes?: string | null;
   exchangeRate?: number | null;
+  showImages: boolean;
+  sentAt?: string | null;
+  decidedAt?: string | null;
+  rejectReason?: string | null;
   order?: { id: number; number: string } | null;
   lines: ProformaLineDto[];
   total: number;
+  canEdit: boolean;
 }
 
-export interface OpStage {
-  id: number;
-  name: string;
-  sortOrder: number;
-  mode: 'INHOUSE' | 'OUTSOURCED' | string;
-  vendorId?: number | null;
-  vendor?: { id: number; name: string } | null;
-  jobworkCost: number;
-  status: string;
-  qtyDone: number;
-  assignee?: string | null;
-  note?: string | null;
+export interface MailDraftInfo {
+  to: string[];
+  hasEmail: boolean;
+  buyerName: string;
+  contactName: string | null;
+  subject: string;
+  text: string;
+  html: string;
+  mailto: string | null;
+  filename: string;
+  attachmentSupported: false;
 }
+
+// --- material sheets -------------------------------------------------------
 
 export interface OpExplosion {
   currency?: { code: string; symbol: string } | null;
@@ -139,14 +297,7 @@ export interface OpExplosion {
     factoryExpensePct: number;
     marginPct: number;
   };
-  order: {
-    qty: number;
-    headTotals: Record<string, number>;
-    exFactory: number;
-    forwarding: number;
-    fob: number;
-    nonFob: number;
-  };
+  order: { qty: number; headTotals: Record<string, number>; exFactory: number; forwarding: number; fob: number; nonFob: number };
   groups: {
     head: string;
     name: string;
@@ -157,31 +308,30 @@ export interface OpExplosion {
   }[];
 }
 
-export interface OperationSheet {
+export interface MaterialSheet {
   id: number;
   number: string;
   productId: number;
   product: { id: number; factoryCode: string; name: string; unit?: { code: string } | null };
   orderId?: number | null;
-  order?: { id: number; number: string } | null;
+  order?: { id: number; number: string; buyer?: { name: string } } | null;
+  orderLineId?: number | null;
+  /** Stage owners come from the line, so "made by" is derived rather than stored. */
+  orderLine?: { id: number; qty: number; stages: { name: string; vendor?: { id: number; name: string } | null }[] } | null;
   qty: number;
-  producedQty: number;
-  mode: 'INHOUSE' | 'OUTSOURCED' | string;
-  vendorId?: number | null;
-  vendor?: { id: number; name: string } | null;
-  jobworkCost: number;
-  status: string;
   notes?: string | null;
-  stages: OpStage[];
   explosion?: OpExplosion | null;
   existing?: boolean;
 }
+
+// --- payments --------------------------------------------------------------
 
 export interface LedgerEntry {
   id: number;
   partyType: string;
   supplierId?: number | null;
   buyerId?: number | null;
+  orderId?: number | null;
   partyName: string;
   kind: 'BILL' | 'PAYMENT';
   amount: number;
@@ -191,23 +341,165 @@ export interface LedgerEntry {
   note?: string | null;
   supplier?: { name: string } | null;
   buyer?: { name: string } | null;
+  order?: { id: number; number: string } | null;
 }
 
-export interface PartyDue {
-  partyType: string;
+/** How one payment was spread across what was outstanding. */
+export interface AllocatedPayment {
+  id: number;
+  date: string;
+  amount: number;
+  currency: string;
+  ref?: string | null;
+  note?: string | null;
   partyName: string;
+  aimedAtOrder?: string | null;
+  allocations: { key: string; orderId: number | null; label: string; amount: number }[];
+  /** Money that had nothing left to settle — credit on account. */
+  unallocated: number;
+}
+
+/** One live order's receivable position, with the receipts that touched it. */
+export interface Receivable {
+  orderId: number;
+  orderNumber: string;
+  buyerId: number;
+  buyerName: string;
+  status: string;
+  orderDate: string;
+  deliveryDate?: string | null;
+  currency: string;
+  symbol: string;
+  exchangeRate: number;
+  invoiced: number;
+  received: number;
+  balance: number;
+  balanceInr: number;
+  receiptCount: number;
+  receipts: { id: number; date: string; ref?: string | null; amount: number; fullAmount: number; spreadAcross: number; aimedAtOrder?: string | null }[];
+}
+
+export interface ReceivablesResponse {
+  rows: Receivable[];
+  /** Money received beyond every outstanding order, held against the buyer. */
+  credits: { buyerId: number; buyerName: string; currency: string; symbol: string; amount: number }[];
+}
+
+/** One party's payable position; jobwork accrual comes off the board. */
+export interface Payable {
+  partyType: string;
   supplierId: number | null;
-  buyerId: number | null;
-  billed: number;
+  partyName: string;
+  accrued: number;
   paid: number;
   balance: number;
+  credit: number;
+  pieces: number;
+  events: number;
+  jobs: { orderId: number | null; orderNumber: string; product: string; stages: string[]; pieces: number; amount: number; paid: number; balance: number }[];
+}
+
+export interface FinanceSummary {
+  invoicedInr: number;
+  receivedInr: number;
+  receivableInr: number;
+  buyerCreditInr: number;
+  jobworkAccrued: number;
+  jobworkPaid: number;
+  jobworkDue: number;
+  materialBilled: number;
+  materialPaid: number;
+  materialDue: number;
+  wagesBilled: number;
+  wagesPaid: number;
+  wagesDue: number;
+  payableInr: number;
+  jobworkEvents: number;
+}
+
+export type PartyType = 'BUYER' | 'JOBWORK' | 'SUPPLIER' | 'WORKER';
+
+export interface PartyRow {
+  partyType: PartyType;
+  partyId: number | null;
+  name: string;
+  code?: string | null;
+  owesUs: number;
+  weOwe: number;
+  credit: number;
+  orders: number;
+}
+
+export interface StatementRow {
+  date: string;
+  type: 'ACCRUAL' | 'BILL' | 'INVOICE' | 'PAYMENT' | 'RECEIPT';
+  description: string;
+  ref?: string | null;
+  orderNumber?: string | null;
+  charge: number;
+  settle: number;
+  balance: number;
+  detail?: string | null;
+}
+
+/** One dated jobwork earning: pieces cleared out of a vendor stage × its rate. */
+export interface JobworkEvent {
+  moveId: number;
+  date: string;
+  orderId: number;
+  orderNumber: string;
+  orderLineId: number;
+  productCode: string;
+  productName: string;
+  stage: string;
+  stageSortOrder: number;
+  vendorId: number;
+  vendorName: string;
+  pieces: number;
+  rate: number;
+  amount: number;
+  note?: string | null;
+  rework: boolean;
+}
+
+export interface PartyStatement {
+  party: { partyType: PartyType; partyId: number | null; name: string; code?: string | null; email?: string | null; phone?: string | null; gstNo?: string | null; paymentTerms?: string | null };
+  /** Buyers can trade in more than one currency, so their statement is per currency. */
+  currencies?: {
+    currency: string;
+    symbol: string;
+    invoiced: number;
+    received: number;
+    balance: number;
+    credit: number;
+    orders: { orderId: number; orderNumber: string; date: string; status: string; gross: number; paid: number; balance: number }[];
+    receipts: AllocatedPayment[];
+    statement: StatementRow[];
+  }[];
+  currency?: string;
+  summary?: { accrued: number; paid: number; balance: number; credit: number; pieces: number; events: number };
+  perOrder?: { orderId: number | null; orderNumber: string; pieces: number; gross: number; paid: number; balance: number }[];
+  events?: JobworkEvent[];
+  bills?: { id: number; date: string; amount: number; ref?: string | null; note?: string | null; orderNumber?: string | null; stockTxn?: { id: number; item: string; qty: number; unit: string; rate: number } | null }[];
+  payments?: AllocatedPayment[];
+  /** Material deliveries recorded in stock, and whether each has been billed. */
+  supplied?: { id: number; date: string; item: string; qty: number; unit: string; rate: number; value: number; note?: string | null; billed: boolean; billId: number | null }[];
+  unbilledValue?: number;
+  statement?: StatementRow[];
 }
 
 export interface OpsDashboard {
   pendingOrders: number;
+  awaitingDecision: number;
   inProduction: number;
+  atVendors: number;
+  pendingPieces: number;
+  finishedPieces: number;
+  jobworkAccrued: number;
   receivable: number;
   payable: number;
+  buyerCredit: number;
+  vendorLoad: { vendorId: number; vendorName: string; pieces: number }[];
   recentProformas: { id: number; number: string; buyer: string; status: string; date: string }[];
   lowStock: { id: number; name: string; unit: string; balance: number; reorderLevel: number }[];
 }
@@ -215,18 +507,85 @@ export interface OpsDashboard {
 const get = async <T>(url: string, params?: Record<string, unknown>) => (await api.get<T>(url, { params })).data;
 
 export const useSuppliers = (type?: string) => useQuery({ queryKey: ['suppliers', type ?? 'all'], queryFn: () => get<Supplier[]>('/suppliers', type ? { type } : {}) });
+export const useStageLines = () => useQuery({ queryKey: ['stage-lines'], queryFn: () => get<StageLine[]>('/stage-lines') });
 export const useRawItems = () => useQuery({ queryKey: ['raw-items'], queryFn: () => get<RawItem[]>('/raw-items') });
 export const useStockTxns = (rawItemId?: number) => useQuery({ queryKey: ['stock-txns', rawItemId ?? 'all'], queryFn: () => get<StockTxn[]>('/stock/txns', rawItemId ? { rawItemId } : {}) });
 export const useOrders = (status?: string) => useQuery({ queryKey: ['orders', status ?? 'all'], queryFn: () => get<Order[]>('/orders', status ? { status } : {}) });
 export const useOrder = (id?: number | string) => useQuery({ enabled: id != null && id !== 'new', queryKey: ['order', id], queryFn: () => get<Order>(`/orders/${id}`) });
 export const useProformas = (status?: string) => useQuery({ queryKey: ['proformas', status ?? 'all'], queryFn: () => get<Proforma[]>('/proformas', status ? { status } : {}) });
 export const useProforma = (id?: number | string) => useQuery({ enabled: id != null && id !== 'new', queryKey: ['proforma', id], queryFn: () => get<Proforma>(`/proformas/${id}`) });
-export const useSheets = (status?: string) => useQuery({ queryKey: ['op-sheets', status ?? 'all'], queryFn: () => get<OperationSheet[]>('/operation-sheets', status ? { status } : {}) });
-export const useSheet = (id?: number | string) => useQuery({ enabled: id != null, queryKey: ['op-sheet', id], queryFn: () => get<OperationSheet>(`/operation-sheets/${id}`) });
+export const useSheets = (orderId?: number) => useQuery({ queryKey: ['op-sheets', orderId ?? 'all'], queryFn: () => get<MaterialSheet[]>('/operation-sheets', orderId ? { orderId } : {}) });
+export const useSheet = (id?: number | string) => useQuery({ enabled: id != null, queryKey: ['op-sheet', id], queryFn: () => get<MaterialSheet>(`/operation-sheets/${id}`) });
 export const usePayments = (params: Record<string, unknown> = {}) => useQuery({ queryKey: ['payments', params], queryFn: () => get<LedgerEntry[]>('/payments', params) });
-export const useParties = () => useQuery({ queryKey: ['parties'], queryFn: () => get<PartyDue[]>('/payments/parties') });
+export const useReceivables = () => useQuery({ queryKey: ['receivables'], queryFn: () => get<ReceivablesResponse>('/finance/receivables') });
+export const usePayables = () => useQuery({ queryKey: ['payables'], queryFn: () => get<Payable[]>('/finance/payables') });
+export const useFinanceSummary = () => useQuery({ queryKey: ['finance-summary'], queryFn: () => get<FinanceSummary>('/finance/summary') });
+export const useFinanceParties = () => useQuery({ queryKey: ['finance-parties'], queryFn: () => get<PartyRow[]>('/finance/parties') });
+export const usePartyStatement = (partyType?: PartyType, partyId?: number | string, partyName?: string) =>
+  useQuery({
+    enabled: !!partyType && (partyId != null || !!partyName),
+    queryKey: ['statement', partyType, partyId ?? partyName],
+    queryFn: () => get<PartyStatement>('/finance/statement', { partyType, partyId, partyName }),
+  });
 export const useOpsDashboard = () => useQuery({ queryKey: ['ops-dashboard'], queryFn: () => get<OpsDashboard>('/ops/dashboard') });
+
+/** Every query key that a movement or a money entry can invalidate. */
+export const OPS_KEYS = [['orders'], ['order'], ['ops-dashboard'], ['receivables'], ['payables'], ['finance-summary'], ['finance-parties'], ['statement'], ['payments'], ['stock-txns']];
+
+/** Upload hand-over photos onto a movement. */
+export async function uploadMovePhotos(moveId: number, files: File[]): Promise<Order> {
+  const form = new FormData();
+  for (const f of files) form.append('photos', f);
+  return (await api.post<Order>(`/moves/${moveId}/photos`, form)).data;
+}
+export const useMailDraft = (proformaId?: number | string, enabled = true) =>
+  useQuery({ enabled: enabled && proformaId != null, queryKey: ['pi-mail', proformaId], queryFn: () => get<MailDraftInfo>(`/proformas/${proformaId}/mail`) });
 
 export async function suggestPrice(productId: number, currencyId?: number) {
   return get<{ fobInr: number; rate: number; currencyCode: string; suggested: number }>('/ops/price', { productId, currencyId });
+}
+
+/**
+ * Fetch a binary document through axios (so the bearer token is sent) and hand it
+ * to the browser. `open: true` shows a PDF in a new tab; otherwise it downloads.
+ */
+export async function fetchDocument(url: string, filename: string, open = false): Promise<void> {
+  try {
+    const res = await api.get(url, { responseType: 'blob' });
+    const contentType = res.headers['content-type'];
+    const blob = new Blob([res.data], { type: typeof contentType === 'string' ? contentType : 'application/octet-stream' });
+    const href = URL.createObjectURL(blob);
+    if (open) {
+      const w = window.open(href, '_blank');
+      if (!w) triggerDownload(href, filename); // popup blocked — fall back to saving it
+    } else {
+      triggerDownload(href, filename);
+    }
+    setTimeout(() => URL.revokeObjectURL(href), 60_000);
+  } catch (err) {
+    throw new Error(await blobErrorMessage(err));
+  }
+}
+
+function triggerDownload(href: string, filename: string) {
+  const a = document.createElement('a');
+  a.href = href;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/** Server errors arrive as a Blob when responseType is 'blob' — unwrap them. */
+async function blobErrorMessage(err: unknown): Promise<string> {
+  const data = (err as any)?.response?.data;
+  if (data instanceof Blob) {
+    try {
+      const parsed = JSON.parse(await data.text());
+      if (parsed?.error) return parsed.error;
+    } catch {
+      /* not JSON — fall through */
+    }
+  }
+  return apiError(err);
 }

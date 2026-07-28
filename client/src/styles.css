@@ -36,6 +36,172 @@ body {
   letter-spacing: 0.4px;
 }
 
+/* ---------------------------------------------------------------------------
+   Production board — one row per order line: not-started, each stage, finished.
+   --------------------------------------------------------------------------- */
+/* Let a line's header wrap instead of clipping its stage-line and vendor tags. */
+.board-line-card .ant-card-head-wrapper {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.board-line-card .ant-card-head-title,
+.board-line-card .ant-card-extra {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+.board-line-card .ant-card-head-title {
+  flex: 1 1 auto;
+  min-width: 260px;
+}
+
+.board-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.board-cell {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 108px;
+  border: 1px solid #e6ded9;
+  border-radius: 8px;
+  background: #fcfaf9;
+  padding: 7px 9px 8px;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.board-cell.is-filled {
+  background: #fff;
+  border-color: #d7c4bb;
+  box-shadow: 0 1px 3px rgba(62, 39, 35, 0.08);
+}
+.board-cell.is-clickable {
+  cursor: pointer;
+}
+.board-cell.is-clickable:hover {
+  border-color: #6d4c41;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(62, 39, 35, 0.16);
+}
+.board-cell-pending.is-filled {
+  border-left: 3px solid #bfbfbf;
+}
+.board-cell-stage.is-filled {
+  border-left: 3px solid #d48806;
+}
+.board-cell-done.is-filled {
+  border-left: 3px solid #389e0d;
+}
+.board-cell-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 17px;
+  /* leaves room for the quick-clear tick pinned to the top-right */
+  padding-right: 20px;
+}
+.board-cell-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #efebe9;
+  color: #6d4c41;
+  font-size: 10px;
+  font-weight: 700;
+  flex: none;
+}
+.board-cell-name {
+  font-size: 11.5px;
+  color: #6b5b54;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.board-cell-qty {
+  font-size: 23px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: #cfc4bf;
+  margin: 2px 0 3px;
+}
+.board-cell.is-filled .board-cell-qty {
+  color: #4e342e;
+}
+.board-cell-done.is-filled .board-cell-qty {
+  color: #389e0d;
+}
+.board-cell-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  min-height: 20px;
+  align-items: center;
+}
+.board-cell-actions {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+}
+.board-arrow {
+  align-self: center;
+  color: #c9bab3;
+  font-size: 17px;
+  flex: none;
+  padding: 0 1px;
+}
+.board-thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid #eee;
+  display: block;
+}
+
+/* Stage-line master: the route shown as a flow of chips. */
+.stage-flow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.stage-flow-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #efebe9;
+  color: #4e342e;
+  border-radius: 14px;
+  padding: 3px 11px 3px 5px;
+  font-size: 12.5px;
+}
+.stage-flow-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #6d4c41;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* Proforma document: product photo column. */
+.doc-thumb {
+  width: 62px;
+  height: 62px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid #e8e0dc;
+  display: block;
+}
+
 /* Print / Save-as-PDF: show only the .print-area */
 @media print {
   body * {

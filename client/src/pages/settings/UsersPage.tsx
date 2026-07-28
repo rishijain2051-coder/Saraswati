@@ -81,7 +81,7 @@ export default function UsersPage() {
         onCancel={() => { setOpen(false); setEditing(null); }}
         onOk={() => form.submit()}
         confirmLoading={save.isPending}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" onFinish={(v) => save.mutate(v)} style={{ marginTop: 12 }}>
           <Form.Item name="name" label="Name" rules={[{ required: true }]}>

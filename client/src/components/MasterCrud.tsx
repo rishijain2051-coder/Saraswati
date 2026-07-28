@@ -125,7 +125,7 @@ export default function MasterCrud({
         onCancel={() => { setOpen(false); setEditingId(null); }}
         onOk={() => form.submit()}
         confirmLoading={upsert.isPending}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" onFinish={(v) => upsert.mutate(v)} style={{ marginTop: 12 }}>
           {fields.map((f) => (

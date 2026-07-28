@@ -24,6 +24,7 @@ import StockPage from './pages/operations/StockPage';
 import SheetsPage from './pages/operations/SheetsPage';
 import SheetDetailPage from './pages/operations/SheetDetailPage';
 import PaymentsPage from './pages/operations/PaymentsPage';
+import PartyStatementPage from './pages/operations/PartyStatementPage';
 import {
   TeamOutlined,
   ShoppingOutlined,
@@ -83,6 +84,7 @@ export default function AppRoutes() {
         <Route path="operations/sheets" element={<SheetsPage />} />
         <Route path="operations/sheets/:id" element={<SheetDetailPage />} />
         <Route path="operations/payments" element={<PaymentsPage />} />
+        <Route path="operations/payments/:partyType/:partyId" element={<PartyStatementPage />} />
 
         {/* Placeholder modules (future phases) */}
         <Route path="manforce" element={<PlaceholderModule title="Manforce Management" icon={<TeamOutlined />} />} />

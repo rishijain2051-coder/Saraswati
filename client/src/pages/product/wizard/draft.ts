@@ -14,6 +14,8 @@ export interface WizardDraft {
   materialId?: number | null;
   finishId?: number | null;
   unitId?: number | null;
+  /** Which production route this product travels (Operations uses it). */
+  stageLineId?: number | null;
   prodLengthIn?: number | null;
   prodWidthIn?: number | null;
   prodHeightIn?: number | null;
@@ -62,6 +64,7 @@ export function fromProduct(p: ProductDetail): WizardDraft {
     materialId: p.materialId,
     finishId: p.finishId,
     unitId: p.unitId,
+    stageLineId: p.stageLineId,
     prodLengthIn: p.prodLengthIn,
     prodWidthIn: p.prodWidthIn,
     prodHeightIn: p.prodHeightIn,

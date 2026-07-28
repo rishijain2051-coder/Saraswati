@@ -76,7 +76,6 @@ model AttributeValue {
   productsColour   Product[] @relation("ProductColour")
   productsMaterial Product[] @relation("ProductMaterial")
   productsFinish   Product[] @relation("ProductFinish")
-  stageTemplates   ProductionStageTemplate[] @relation("StageTemplateProductType")
 
   @@unique([type, value])
 }
@@ -122,6 +121,9 @@ model Product {
   finishId      Int?
   unitId        Int?
 
+  // production routing — which stage line this product travels through
+  stageLineId Int?
+
   // physical — assembled product (inches)
   prodLengthIn  Float?
   prodWidthIn   Float?
@@ -150,6 +152,7 @@ model Product {
   material    AttributeValue? @relation("ProductMaterial", fields: [materialId], references: [id])
   finish      AttributeValue? @relation("ProductFinish", fields: [finishId], references: [id])
   unit        Unit?           @relation(fields: [unitId], references: [id])
+  stageLine   StageLine?      @relation(fields: [stageLineId], references: [id])
   createdBy   User?           @relation("ProductCreatedBy", fields: [createdById], references: [id])
 
   buyers      ProductBuyer[]
@@ -202,7 +205,8 @@ model ProductImage {
   sortOrder    Int      @default(0)
   createdAt    DateTime @default(now())
 
-  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product       Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  proformaLines ProformaLine[] @relation("ProformaLineImage")
 }
 
 // ---------------------------------------------------------------------------
@@ -297,8 +301,8 @@ model CostLine {
 }
 
 // ---------------------------------------------------------------------------
-// Operations module (Phase 2) — orders, proformas, suppliers, stock,
-// operation sheets, jobs/stages, payments. Raw Material folded in here.
+// Operations module (Phase 2) — proformas, orders, the production board,
+// challans, suppliers, stock, material sheets, payments.
 // ---------------------------------------------------------------------------
 
 model Supplier {
@@ -316,10 +320,9 @@ model Supplier {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  stockTxns StockTxn[]
-  opStages  OpStage[]
-  jobSheets OperationSheet[] @relation("SheetVendor")
-  ledger    LedgerEntry[]    @relation("SupplierLedger")
+  stockTxns  StockTxn[]
+  lineStages OrderLineStage[] @relation("StageVendor")
+  ledger     LedgerEntry[]    @relation("SupplierLedger")
 }
 
 model RawItem {
@@ -350,9 +353,49 @@ model StockTxn {
   createdById Int?
   createdAt   DateTime @default(now())
 
-  rawItem  RawItem   @relation(fields: [rawItemId], references: [id], onDelete: Cascade)
-  supplier Supplier? @relation(fields: [supplierId], references: [id])
+  rawItem  RawItem      @relation(fields: [rawItemId], references: [id], onDelete: Cascade)
+  supplier Supplier?    @relation(fields: [supplierId], references: [id])
+  /// The bill raised for this receipt, if one has been. Lets a supplier statement
+  /// show which deliveries are still un-billed without ever double-counting them.
+  bill     LedgerEntry?
 }
+
+// ---------------------------------------------------------------------------
+// Production routing
+// ---------------------------------------------------------------------------
+
+/// A named production route ("stage line"), e.g.
+///   X — raw joining → raw sanding → polishing → accessory fitting → QC → packaging
+///   Y — raw joining → powder coating → fitting → QC → packing
+/// A product is assigned one stage line. Each order line SNAPSHOTS the steps into
+/// OrderLineStage rows, so editing the master later never rewrites live orders.
+model StageLine {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique
+  name      String
+  isDefault Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  steps      StageLineStep[]
+  products   Product[]
+  orderLines OrderLine[]
+}
+
+model StageLineStep {
+  id          Int    @id @default(autoincrement())
+  stageLineId Int
+  name        String
+  sortOrder   Int    @default(0)
+
+  stageLine StageLine @relation(fields: [stageLineId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Orders + the production board
+// ---------------------------------------------------------------------------
 
 model Order {
   id           Int       @id @default(autoincrement())
@@ -375,6 +418,7 @@ model Order {
   proforma Proforma?        @relation("ProformaOrder", fields: [proformaId], references: [id])
   lines    OrderLine[]
   sheets   OperationSheet[]
+  ledger   LedgerEntry[]
 }
 
 model OrderLine {
@@ -385,8 +429,81 @@ model OrderLine {
   unitPrice Float @default(0) // in order currency
   sortOrder Int   @default(0)
 
-  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  product Product @relation(fields: [productId], references: [id])
+  /// Which route this line follows. WHO does each stage lives on the stage rows,
+  /// so any mix is possible — e.g. 1-3 in-house, 4 outsourced, 5-6 in-house.
+  stageLineId Int?
+
+  order     Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product    @relation(fields: [productId], references: [id])
+  stageLine StageLine? @relation(fields: [stageLineId], references: [id])
+
+  stages OrderLineStage[]
+  moves  StageMove[]
+  sheet  OperationSheet?
+}
+
+/// One stage of one order line — the snapshot of a StageLineStep.
+model OrderLineStage {
+  id          Int     @id @default(autoincrement())
+  orderLineId Int
+  name        String
+  sortOrder   Int     @default(0)
+  vendorId    Int? // null = in-house
+  jobworkRate Float   @default(0) // ₹ per piece payable to the vendor for this stage
+  note        String?
+
+  orderLine OrderLine   @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
+  vendor    Supplier?   @relation("StageVendor", fields: [vendorId], references: [id])
+  movesFrom StageMove[] @relation("MoveFrom")
+  movesTo   StageMove[] @relation("MoveTo")
+
+  @@unique([orderLineId, sortOrder])
+}
+
+/// Append-only ledger of piece movements. How many pieces sit where is always
+/// DERIVED from these rows (see lib/production.ts) and never stored, so the board
+/// can never drift out of sync with its own history.
+///
+///   RELEASE  : PENDING   -> toStage
+///   ADVANCE  : fromStage -> toStage           (forward)
+///   REJECT   : fromStage -> toStage / PENDING (backward — rework)
+///   COMPLETE : fromStage -> DONE
+///   RETURN   : DONE      -> toStage           (undo a completion)
+model StageMove {
+  id          Int      @id @default(autoincrement())
+  orderLineId Int
+  kind        String
+  fromStageId Int?
+  toStageId   Int?
+  qty         Int
+  date        DateTime @default(now())
+  /// Free-text hand-over comment written when the pieces were passed on.
+  note        String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  orderLine OrderLine        @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
+  fromStage OrderLineStage?  @relation("MoveFrom", fields: [fromStageId], references: [id])
+  toStage   OrderLineStage?  @relation("MoveTo", fields: [toStageId], references: [id])
+  photos    StageMovePhoto[]
+
+  @@index([orderLineId])
+}
+
+/// Photos attached to a hand-over — proof of condition when pieces change hands.
+model StageMovePhoto {
+  id           Int      @id @default(autoincrement())
+  moveId       Int
+  filename     String
+  originalName String?
+  url          String
+  caption      String?
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  move StageMove @relation(fields: [moveId], references: [id], onDelete: Cascade)
+
+  @@index([moveId])
 }
 
 model Proforma {
@@ -403,6 +520,10 @@ model Proforma {
   bankDetails   String?
   notes         String?
   exchangeRate  Float?
+  showImages    Boolean   @default(true) // print product photos on the PI
+  sentAt        DateTime?
+  decidedAt     DateTime? // when it was accepted or rejected
+  rejectReason  String?
   createdById   Int?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -417,69 +538,55 @@ model ProformaLine {
   id          Int    @id @default(autoincrement())
   proformaId  Int
   productId   Int?
+  imageId     Int? // which product photo to print (null = the product's primary)
   description String
   qty         Int    @default(1)
   unitPrice   Float  @default(0)
   sortOrder   Int    @default(0)
 
-  proforma Proforma @relation(fields: [proformaId], references: [id], onDelete: Cascade)
-  product  Product? @relation(fields: [productId], references: [id])
+  proforma Proforma      @relation(fields: [proformaId], references: [id], onDelete: Cascade)
+  product  Product?      @relation(fields: [productId], references: [id])
+  image    ProductImage? @relation("ProformaLineImage", fields: [imageId], references: [id])
 }
 
+/// "Material sheet" — a numbered printout of the live costing explosion for a
+/// product × qty (what to buy / issue to the floor). Production PROGRESS lives on
+/// the order board (OrderLineStage + StageMove), never here.
 model OperationSheet {
   id          Int      @id @default(autoincrement())
   number      String   @unique
   productId   Int
   orderId     Int?
+  orderLineId Int?     @unique
   qty         Int      @default(1)
-  producedQty Int      @default(0)
-  mode        String   @default("INHOUSE") // INHOUSE | OUTSOURCED
-  vendorId    Int?
-  jobworkCost Float    @default(0)
-  status      String   @default("Draft") // Draft|InProgress|Completed
   notes       String?
   createdById Int?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  product Product   @relation(fields: [productId], references: [id])
-  order   Order?    @relation(fields: [orderId], references: [id])
-  vendor  Supplier? @relation("SheetVendor", fields: [vendorId], references: [id])
-  stages  OpStage[]
+  product   Product    @relation(fields: [productId], references: [id])
+  order     Order?     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderLine OrderLine? @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
 }
 
-model OpStage {
-  id               Int     @id @default(autoincrement())
-  operationSheetId Int
-  name             String
-  sortOrder        Int     @default(0)
-  mode             String  @default("INHOUSE") // INHOUSE | OUTSOURCED
-  vendorId         Int?
-  jobworkCost      Float   @default(0)
-  status           String  @default("NOT_STARTED") // NOT_STARTED|IN_PROGRESS|DONE
-  qtyDone          Int     @default(0)
-  assignee         String? // worker name (Manforce master later)
-  note             String?
-
-  sheet  OperationSheet @relation(fields: [operationSheetId], references: [id], onDelete: Cascade)
-  vendor Supplier?      @relation(fields: [vendorId], references: [id])
-}
-
-model ProductionStageTemplate {
-  id            Int     @id @default(autoincrement())
-  productTypeId Int? // null = default template
-  name          String
-  sortOrder     Int     @default(0)
-  isActive      Boolean @default(true)
-
-  productType AttributeValue? @relation("StageTemplateProductType", fields: [productTypeId], references: [id])
-}
-
+/// Money that actually moved, plus manually-entered bills.
+///
+/// What is OWED is never entered by hand where the system already knows it:
+///   - buyer receivable  = order value            - BUYER receipts
+///   - jobwork payable   = board-accrued jobwork  - JOBWORK payments
+/// So BUYER and JOBWORK rows are PAYMENT rows only; SUPPLIER (material) and WORKER
+/// rows may be BILL or PAYMENT because nothing else knows those amounts.
 model LedgerEntry {
   id          Int      @id @default(autoincrement())
   partyType   String // SUPPLIER | JOBWORK | BUYER | WORKER
   supplierId  Int?
   buyerId     Int?
+  /// The order this money is aimed at. Optional: a payment with no order — or one
+  /// larger than that order's balance — is spread oldest-first across whatever the
+  /// party still owes or is owed (see lib/finance.ts). Allocation is computed on
+  /// read, never stored, so it cannot go stale when values change.
+  orderId     Int?
+  stockTxnId  Int?     @unique // set when this bill covers a specific stock receipt
   partyName   String // snapshot / for WORKER
   kind        String // BILL | PAYMENT
   amount      Float
@@ -492,11 +599,17 @@ model LedgerEntry {
 
   supplier Supplier? @relation("SupplierLedger", fields: [supplierId], references: [id])
   buyer    Buyer?    @relation("BuyerLedger", fields: [buyerId], references: [id])
+  order    Order?    @relation(fields: [orderId], references: [id])
+  stockTxn StockTxn? @relation(fields: [stockTxnId], references: [id])
+
+  @@index([orderId])
+  @@index([partyType, supplierId])
+  @@index([partyType, buyerId])
 }
 
 model DocSequence {
   id      Int     @id @default(autoincrement())
-  key     String  @unique // PI | ORD | OP | PO
+  key     String  @unique // PI | ORD | OP
   prefix  String
   useYear Boolean @default(false)
   lastNo  Int     @default(0)

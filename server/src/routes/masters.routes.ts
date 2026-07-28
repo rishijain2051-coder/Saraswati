@@ -265,6 +265,100 @@ router.delete(
 );
 
 // ---------------------------------------------------------------------------
+// Stage lines — named production routes (products are assigned one)
+// ---------------------------------------------------------------------------
+
+const stageLineInclude = { steps: { orderBy: { sortOrder: 'asc' as const } }, _count: { select: { products: true, orderLines: true } } };
+
+router.get(
+  '/stage-lines',
+  asyncHandler(async (_req, res) => {
+    res.json(await prisma.stageLine.findMany({ include: stageLineInclude, orderBy: [{ isDefault: 'desc' }, { code: 'asc' }] }));
+  })
+);
+
+const stageLineSchema = z.object({
+  code: z.string().min(1).max(16),
+  name: z.string().min(1),
+  isDefault: z.boolean().optional().default(false),
+  isActive: z.boolean().optional().default(true),
+  notes: z.string().nullable().optional(),
+  steps: z.array(z.string().min(1)).min(1, 'A stage line needs at least one stage.'),
+});
+
+router.post(
+  '/stage-lines',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const data = stageLineSchema.parse(req.body);
+    const created = await prisma.$transaction(async (tx) => {
+      if (data.isDefault) await tx.stageLine.updateMany({ data: { isDefault: false }, where: {} });
+      return tx.stageLine.create({
+        data: {
+          code: data.code.toUpperCase(),
+          name: data.name,
+          isDefault: data.isDefault,
+          isActive: data.isActive,
+          notes: data.notes ?? null,
+          steps: { create: data.steps.map((name, i) => ({ name, sortOrder: i })) },
+        },
+        include: stageLineInclude,
+      });
+    });
+    res.status(201).json(created);
+  })
+);
+
+/**
+ * Editing a stage line never disturbs live orders: each order line keeps its own
+ * snapshot of the steps (OrderLineStage), so masters stay freely editable.
+ */
+router.patch(
+  '/stage-lines/:id',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const data = stageLineSchema.partial().parse(req.body);
+    if (data.steps && data.steps.length === 0) throw new ApiError(400, 'A stage line needs at least one stage.');
+    const updated = await prisma.$transaction(async (tx) => {
+      if (data.isDefault) await tx.stageLine.updateMany({ data: { isDefault: false }, where: { id: { not: id } } });
+      await tx.stageLine.update({
+        where: { id },
+        data: {
+          ...(data.code ? { code: data.code.toUpperCase() } : {}),
+          ...(data.name ? { name: data.name } : {}),
+          ...(data.isDefault !== undefined ? { isDefault: data.isDefault } : {}),
+          ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
+          ...(data.notes !== undefined ? { notes: data.notes } : {}),
+        },
+      });
+      if (data.steps) {
+        await tx.stageLineStep.deleteMany({ where: { stageLineId: id } });
+        for (let i = 0; i < data.steps.length; i++) await tx.stageLineStep.create({ data: { stageLineId: id, name: data.steps[i], sortOrder: i } });
+      }
+      return tx.stageLine.findUnique({ where: { id }, include: stageLineInclude });
+    });
+    res.json(updated);
+  })
+);
+
+router.delete(
+  '/stage-lines/:id',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const line = await prisma.stageLine.findUnique({ where: { id }, include: { _count: { select: { products: true, orderLines: true } } } });
+    if (!line) throw new ApiError(404, 'Stage line not found.');
+    const { products, orderLines } = line._count;
+    if (products + orderLines > 0) {
+      throw new ApiError(409, `${line.code} is used by ${products} product(s) and ${orderLines} order line(s). Deactivate it instead of deleting.`);
+    }
+    await prisma.stageLine.delete({ where: { id } });
+    res.status(204).end();
+  })
+);
+
+// ---------------------------------------------------------------------------
 // Cost methods (user-editable costing formulas)
 // ---------------------------------------------------------------------------
 

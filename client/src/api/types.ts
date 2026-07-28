@@ -182,6 +182,7 @@ export interface ProductDetail {
   materialId?: number | null;
   finishId?: number | null;
   unitId?: number | null;
+  stageLineId?: number | null;
   prodLengthIn?: number | null;
   prodWidthIn?: number | null;
   prodHeightIn?: number | null;
@@ -200,6 +201,7 @@ export interface ProductDetail {
   material?: AttributeValue | null;
   finish?: AttributeValue | null;
   unit?: Unit | null;
+  stageLine?: { id: number; code: string; name: string; steps: { id: number; name: string; sortOrder: number }[] } | null;
   createdBy?: { id: number; name: string } | null;
   buyers: ProductBuyerLink[];
   images: ProductImage[];

@@ -113,7 +113,7 @@ export default function CurrencyRatesImport({ currencies }: { currencies: Curren
         onOk={() => apply.mutate()}
         confirmLoading={apply.isPending}
         onCancel={() => setOpen(false)}
-        destroyOnClose
+        destroyOnHidden
       >
         <Alert
           type="info"

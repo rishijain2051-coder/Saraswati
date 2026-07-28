@@ -4,6 +4,7 @@ import { HomeOutlined } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
 import MasterCrud, { type FieldDef } from '../../components/MasterCrud';
 import FormulasTab from './FormulasTab';
+import StageLinesTab from './StageLinesTab';
 import CurrencyRatesImport from './CurrencyRatesImport';
 import { useCurrencies, useMeta } from '../../api/hooks';
 import { useAuth } from '../../auth/AuthContext';
@@ -84,7 +85,7 @@ export default function MastersPage() {
     <div>
       <Breadcrumb style={{ marginBottom: 16 }} items={[{ title: <Link to="/"><HomeOutlined /></Link> }, { title: 'Master Data' }]} />
       <Title level={3}>Master Data</Title>
-      <Text type="secondary">These lists power the dropdowns, filters and costing across Product Management.</Text>
+      <Text type="secondary">These lists power the dropdowns, filters, costing and production routing across the whole ERP.</Text>
       <Card style={{ marginTop: 16 }}>
         <Tabs
           items={[
@@ -92,6 +93,7 @@ export default function MastersPage() {
             { key: 'units', label: 'Units', children: <MasterCrud endpoint="/units" queryKey={['units']} fields={unitFields} /> },
             { key: 'buyers', label: 'Buyers', children: <MasterCrud endpoint="/buyers" queryKey={['buyers']} fields={buyerFields} /> },
             { key: 'attributes', label: 'Attributes', children: <AttributesTab /> },
+            { key: 'stage-lines', label: 'Stage Lines', children: <StageLinesTab /> },
             { key: 'formulas', label: 'Cost Formulas', children: <FormulasTab /> },
           ]}
         />

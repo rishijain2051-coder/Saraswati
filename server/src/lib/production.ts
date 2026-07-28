@@ -1,0 +1,288 @@
+/**
+ * Production board engine.
+ *
+ * Where every piece of an order line currently sits is DERIVED from the
+ * append-only StageMove ledger — never stored. That means the board can never
+ * drift out of sync with its own history, and any move can be undone by deleting
+ * its ledger row.
+ *
+ * Buckets:  PENDING  ->  stage 1 .. stage n  ->  DONE
+ *
+ * Move kinds and their endpoints (see schema.prisma):
+ *   RELEASE  PENDING   -> toStage
+ *   ADVANCE  fromStage -> toStage           (forward)
+ *   REJECT   fromStage -> toStage | PENDING  (backward — rework)
+ *   COMPLETE fromStage -> DONE
+ *   RETURN   DONE      -> toStage            (undo a completion)
+ *
+ * `kind` is what disambiguates a null endpoint: a null `toStageId` means DONE for
+ * COMPLETE but PENDING for REJECT; a null `fromStageId` means PENDING for RELEASE
+ * but DONE for RETURN.
+ */
+
+export const MOVE_KINDS = ['RELEASE', 'ADVANCE', 'REJECT', 'COMPLETE', 'RETURN'] as const;
+export type MoveKind = (typeof MOVE_KINDS)[number];
+
+export interface StageRow {
+  id: number;
+  name: string;
+  sortOrder: number;
+  vendorId: number | null;
+  jobworkRate: number;
+  note?: string | null;
+  vendor?: { id: number; name: string } | null;
+}
+
+export interface MoveRow {
+  id: number;
+  kind: string;
+  fromStageId: number | null;
+  toStageId: number | null;
+  qty: number;
+  date?: Date | string;
+  note?: string | null;
+}
+
+export interface StageCell {
+  id: number;
+  name: string;
+  sortOrder: number;
+  vendorId: number | null;
+  vendor?: { id: number; name: string } | null;
+  jobworkRate: number;
+  note?: string | null;
+  /** Pieces sitting at this stage right now. */
+  at: number;
+  /** Pieces that have moved forward out of this stage (advanced or completed). */
+  cleared: number;
+  /** Pieces sent backwards out of this stage (rejected for rework). */
+  rejectedOut: number;
+  /** Pieces that came back INTO this stage after a rejection downstream. */
+  rejectedIn: number;
+  /** Pieces that have ever entered this stage. */
+  reached: number;
+  /** Jobwork payable so far for this stage = cleared × rate (0 when in-house). */
+  jobworkValue: number;
+}
+
+export interface LineBoard {
+  qty: number;
+  pending: number;
+  done: number;
+  /** Pieces somewhere inside the stage line (neither pending nor done). */
+  wip: number;
+  progressPct: number;
+  stages: StageCell[];
+  /** Jobwork payable so far, grouped by vendor. */
+  jobwork: { vendorId: number; vendorName: string; stages: string[]; pieces: number; amount: number }[];
+}
+
+const r2 = (n: number) => Math.round(n * 100) / 100;
+
+/** Build the live board for one order line from its stage snapshot + move ledger. */
+export function buildBoard(qty: number, stages: StageRow[], moves: MoveRow[]): LineBoard {
+  const ordered = [...stages].sort((a, b) => a.sortOrder - b.sortOrder);
+  const cells = new Map<number, StageCell>();
+  for (const s of ordered) {
+    cells.set(s.id, {
+      id: s.id,
+      name: s.name,
+      sortOrder: s.sortOrder,
+      vendorId: s.vendorId ?? null,
+      vendor: s.vendor ?? null,
+      jobworkRate: s.jobworkRate ?? 0,
+      note: s.note ?? null,
+      at: 0,
+      cleared: 0,
+      rejectedOut: 0,
+      rejectedIn: 0,
+      reached: 0,
+      jobworkValue: 0,
+    });
+  }
+
+  let pending = qty;
+  let done = 0;
+
+  for (const m of moves) {
+    const q = m.qty;
+    const from = m.fromStageId != null ? cells.get(m.fromStageId) : undefined;
+    const to = m.toStageId != null ? cells.get(m.toStageId) : undefined;
+
+    if (from) from.at -= q;
+    if (to) {
+      to.at += q;
+      to.reached += q;
+    }
+
+    switch (m.kind) {
+      case 'RELEASE':
+        pending -= q;
+        break;
+      case 'ADVANCE':
+        if (from) from.cleared += q;
+        break;
+      case 'REJECT':
+        if (from) from.rejectedOut += q;
+        if (to) to.rejectedIn += q;
+        else pending += q; // rejected all the way back to unstarted
+        break;
+      case 'COMPLETE':
+        if (from) from.cleared += q;
+        done += q;
+        break;
+      case 'RETURN':
+        done -= q;
+        break;
+    }
+  }
+
+  const cellList = ordered.map((s) => cells.get(s.id)!);
+  for (const c of cellList) c.jobworkValue = r2(c.vendorId ? c.cleared * (c.jobworkRate || 0) : 0);
+
+  const jobworkMap = new Map<number, { vendorId: number; vendorName: string; stages: string[]; pieces: number; amount: number }>();
+  for (const c of cellList) {
+    if (!c.vendorId || c.jobworkValue <= 0) continue;
+    const row =
+      jobworkMap.get(c.vendorId) ??
+      jobworkMap.set(c.vendorId, { vendorId: c.vendorId, vendorName: c.vendor?.name ?? `Vendor #${c.vendorId}`, stages: [], pieces: 0, amount: 0 }).get(c.vendorId)!;
+    row.stages.push(c.name);
+    row.pieces += c.cleared;
+    row.amount = r2(row.amount + c.jobworkValue);
+  }
+
+  const wip = cellList.reduce((a, c) => a + c.at, 0);
+  return {
+    qty,
+    pending,
+    done,
+    wip,
+    progressPct: qty > 0 ? Math.round((done / qty) * 100) : 0,
+    stages: cellList,
+    jobwork: Array.from(jobworkMap.values()),
+  };
+}
+
+export interface MoveRequest {
+  kind: MoveKind;
+  fromStageId?: number | null;
+  toStageId?: number | null;
+  qty: number;
+}
+
+/**
+ * Validate a move against the current board. Returns an error message, or null
+ * when the move is legal. Every rule lives here so the API and the UI agree.
+ */
+export function validateMove(board: LineBoard, req: MoveRequest): string | null {
+  const { kind, qty } = req;
+  if (!MOVE_KINDS.includes(kind)) return `Unknown move type "${kind}".`;
+  if (!Number.isInteger(qty) || qty <= 0) return 'Quantity must be a whole number of 1 or more.';
+
+  const byId = new Map(board.stages.map((s) => [s.id, s]));
+  const from = req.fromStageId != null ? byId.get(req.fromStageId) : undefined;
+  const to = req.toStageId != null ? byId.get(req.toStageId) : undefined;
+  if (req.fromStageId != null && !from) return 'The stage you are moving from does not belong to this order line.';
+  if (req.toStageId != null && !to) return 'The stage you are moving to does not belong to this order line.';
+
+  const need = (label: string, available: number) => (qty > available ? `Only ${available} pc(s) available at ${label}.` : null);
+
+  switch (kind) {
+    case 'RELEASE':
+      if (from) return 'A release always starts from the not-started pool.';
+      if (!to) return 'Pick the stage to release pieces into.';
+      return need('not started', board.pending);
+
+    case 'ADVANCE':
+      if (!from) return 'Pick the stage to clear pieces from.';
+      if (!to) return 'Pick the stage to move pieces into.';
+      if (to.sortOrder <= from.sortOrder) return 'Advancing must move forward — use "send back" to return pieces to an earlier stage.';
+      return need(from.name, from.at);
+
+    case 'REJECT':
+      if (!from) return 'Pick the stage the pieces are being rejected from.';
+      if (to && to.sortOrder >= from.sortOrder) return 'Sending back must move to an earlier stage.';
+      return need(from.name, from.at);
+
+    case 'COMPLETE':
+      if (!from) return 'Pick the stage to complete pieces from.';
+      if (to) return 'Completing moves pieces out of the line — leave the target stage empty.';
+      return need(from.name, from.at);
+
+    case 'RETURN':
+      if (from) return 'A return always starts from the finished pool.';
+      if (!to) return 'Pick the stage to return finished pieces into.';
+      return need('finished', board.done);
+  }
+  return null;
+}
+
+/** The stage a forward clearance should land on, or null when it finishes the line. */
+export function nextStageAfter(board: LineBoard, stageId: number): StageCell | null {
+  const cur = board.stages.find((s) => s.id === stageId);
+  if (!cur) return null;
+  return board.stages.find((s) => s.sortOrder > cur.sortOrder) ?? null;
+}
+
+/**
+ * Expand a forward clearance that spans several stages into one hop per stage.
+ *
+ * Clearing 1 -> 4 in a single action records 1->2, 2->3, 3->4 rather than one jump,
+ * so every stage's "cleared" count — and therefore the jobwork owed for it — stays
+ * exact. Backward moves (rework) and releases stay single hops: a rejection is one
+ * event, not a walk back through the line.
+ */
+export function expandHops(
+  board: LineBoard,
+  req: { kind: MoveKind; fromStageId?: number | null; toStageId?: number | null; qty: number }
+): { kind: MoveKind; fromStageId: number | null; toStageId: number | null; qty: number }[] {
+  const single = [{ kind: req.kind, fromStageId: req.fromStageId ?? null, toStageId: req.toStageId ?? null, qty: req.qty }];
+  if (req.kind !== 'ADVANCE' && req.kind !== 'COMPLETE') return single;
+
+  const from = req.fromStageId != null ? board.stages.find((s) => s.id === req.fromStageId) : undefined;
+  if (!from) return single;
+
+  // Every stage strictly after the origin, up to the destination (or the end of the
+  // line when completing).
+  const to = req.toStageId != null ? board.stages.find((s) => s.id === req.toStageId) : undefined;
+  const limit = to ? to.sortOrder : Infinity;
+  const between = board.stages.filter((s) => s.sortOrder > from.sortOrder && s.sortOrder <= limit);
+  if (between.length <= 1 && req.kind === 'ADVANCE') return single;
+
+  const hops: { kind: MoveKind; fromStageId: number | null; toStageId: number | null; qty: number }[] = [];
+  let cursor = from.id;
+  for (const stage of between) {
+    hops.push({ kind: 'ADVANCE', fromStageId: cursor, toStageId: stage.id, qty: req.qty });
+    cursor = stage.id;
+  }
+  if (req.kind === 'COMPLETE') hops.push({ kind: 'COMPLETE', fromStageId: cursor, toStageId: null, qty: req.qty });
+  return hops.length ? hops : single;
+}
+
+/** Human label for a move endpoint, used in movement history. */
+export function endpointLabel(board: LineBoard, kind: string, stageId: number | null, side: 'from' | 'to'): string {
+  if (stageId != null) return board.stages.find((s) => s.id === stageId)?.name ?? `Stage #${stageId}`;
+  if (side === 'from') return kind === 'RETURN' ? 'Finished' : 'Not started';
+  return kind === 'REJECT' ? 'Not started' : 'Finished';
+}
+
+/** Roll a set of line boards up to an order-level summary. */
+export function rollUp(boards: LineBoard[]) {
+  const ordered = boards.reduce((a, b) => a + b.qty, 0);
+  const done = boards.reduce((a, b) => a + b.done, 0);
+  const wip = boards.reduce((a, b) => a + b.wip, 0);
+  const pending = boards.reduce((a, b) => a + b.pending, 0);
+  return { ordered, done, wip, pending, progressPct: ordered > 0 ? Math.round((done / ordered) * 100) : 0 };
+}
+
+/**
+ * Order status that the board implies. Returns null when the current status is
+ * one the board must not touch (shipped / closed / cancelled are human decisions).
+ */
+export function impliedOrderStatus(current: string, summary: { ordered: number; done: number; wip: number; pending: number }): string | null {
+  if (['Shipped', 'Closed', 'Cancelled'].includes(current)) return null;
+  if (summary.ordered === 0) return null;
+  if (summary.done >= summary.ordered) return current === 'Ready' ? null : 'Ready';
+  if (summary.wip > 0 || summary.done > 0) return current === 'Production' ? null : 'Production';
+  return null;
+}

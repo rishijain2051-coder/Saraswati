@@ -1,4 +1,4 @@
-import { Breadcrumb, Button, Card, Col, Descriptions, Empty, Result, Row, Skeleton, Space, Tabs, Tag, Typography } from 'antd';
+import { Breadcrumb, Button, Card, Col, Descriptions, Empty, Result, Row, Skeleton, Space, Tabs, Tag, Tooltip, Typography } from 'antd';
 import { HomeOutlined, EditOutlined, ArrowLeftOutlined } from '@ant-design/icons';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useProduct } from '../../api/hooks';
@@ -44,6 +44,16 @@ export default function ProductDetailPage({ catalogueMode = false }: { catalogue
             <Descriptions.Item label="Material">{p.material?.value || '—'}</Descriptions.Item>
             <Descriptions.Item label="Finish">{p.finish?.value || '—'}</Descriptions.Item>
             <Descriptions.Item label="Unit">{p.unit?.code || '—'}</Descriptions.Item>
+            <Descriptions.Item label="Stage Line">
+              {p.stageLine ? (
+                <Tooltip title={p.stageLine.steps.map((s) => s.name).join(' → ')}>
+                  <Tag color="#6d4c41">{p.stageLine.code}</Tag>
+                  {p.stageLine.name}
+                </Tooltip>
+              ) : (
+                '—'
+              )}
+            </Descriptions.Item>
             <Descriptions.Item label="Description" span={2}>{p.description || '—'}</Descriptions.Item>
           </Descriptions>
         </Card>
