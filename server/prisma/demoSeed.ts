@@ -1,0 +1,927 @@
+/**
+ * Investor demo data — a furniture export house caught mid-season.
+ *
+ * Rebuilds a coherent factory: a photographed catalogue with real costing, three
+ * buyers in three currencies, proformas at every stage of the sales cycle, four
+ * orders at different points of production (including outsourced stages and a QC
+ * rejection), and a money position that ties back to all of it.
+ *
+ *   npm run db:demo
+ *
+ * Safe to re-run: it clears operational data first, then rebuilds from scratch.
+ * Configuration (logins, currencies, units, attributes, cost formulas, stage lines)
+ * is created if missing and otherwise left alone.
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import bcrypt from 'bcryptjs';
+import { PrismaClient } from '@prisma/client';
+import { BUILTIN_METHODS, round } from '../src/lib/costing';
+import { computeCostSheet } from '../src/lib/productCosting';
+import { loadMethodMap } from '../src/lib/methods';
+
+const prisma = new PrismaClient();
+
+const ASSETS = path.join(__dirname, 'demo', 'assets');
+const UPLOADS = path.join(__dirname, '..', 'uploads');
+
+const YEAR = new Date().getFullYear();
+/** Days before today, so the demo always looks current. */
+const ago = (days: number, hour = 10) => {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  d.setHours(hour, 0, 0, 0);
+  return d;
+};
+
+// ---------------------------------------------------------------------------
+// Costing helpers — parts are derived from the piece's own dimensions, so the
+// numbers move sensibly from one product to the next instead of being invented.
+// ---------------------------------------------------------------------------
+
+type Line = Record<string, unknown>;
+const L = (name: string, opts: Partial<{ qty: number; wastagePct: number; actualL: number; actualW: number; actualH: number; costL: number; costW: number; costH: number; actualWeight: number; unit: string; rate: number }>): Line => ({
+  name,
+  qty: 1,
+  wastagePct: 0,
+  ...opts,
+});
+
+/** A solid-wood carcass cut from the product's own L/W/H, in CFT. */
+function carcass(material: string, rate: number, dims: { l: number; w: number; h: number }, shelves = 2): Line {
+  const { l, w, h } = dims;
+  const pad = (v: number, f = 1.08) => round(v * f, 1);
+  return {
+    head: 'MAIN_COMPONENT',
+    name: material,
+    method: 'CFT',
+    dimUnit: 'IN',
+    sortOrder: 0,
+    lines: {
+      create: [
+        L('TOP', { actualL: l, actualW: w, actualH: 1.2, costL: pad(l), costW: pad(w, 1.2), costH: 1.2, qty: 1, wastagePct: 20, rate, unit: 'CFT' }),
+        L('SIDE PANEL', { actualL: h, actualW: w, actualH: 1, costL: pad(h), costW: pad(w, 1.2), costH: 1, qty: 2, wastagePct: 20, rate, unit: 'CFT' }),
+        L('BOTTOM', { actualL: l - 2, actualW: w - 1, actualH: 1, costL: pad(l - 2), costW: pad(w - 1, 1.2), costH: 1, qty: 1, wastagePct: 20, rate, unit: 'CFT' }),
+        L('SHELF', { actualL: l - 3, actualW: w - 2, actualH: 0.8, costL: pad(l - 3), costW: pad(w - 2, 1.2), costH: 0.8, qty: shelves, wastagePct: 20, rate, unit: 'CFT' }),
+        L('DOOR FRAME', { actualL: h - 6, actualW: 3.5, actualH: 1.2, costL: pad(h - 6), costW: 4.2, costH: 1.2, qty: 4, wastagePct: 18, rate, unit: 'CFT' }),
+        L('BACK RAIL', { actualL: l - 2, actualW: 3, actualH: 1, costL: pad(l - 2), costW: 3.6, costH: 1, qty: 2, wastagePct: 15, rate, unit: 'CFT' }),
+      ],
+    },
+  };
+}
+
+const plyBack = (l: number, h: number, rate = 32): Line => ({
+  head: 'SUB_COMPONENT',
+  name: 'Ply 6mm',
+  method: 'SQFT',
+  dimUnit: 'IN',
+  sortOrder: 0,
+  lines: { create: [L('BACK PANEL', { actualL: l, actualW: h, costL: l, costW: h, qty: 1, rate, unit: 'SQFT' }), L('DRAWER BASE', { actualL: 18, actualW: 14, costL: 18, costW: 14, qty: 3, rate, unit: 'SQFT' })] },
+});
+
+const ironFrame = (kg: number, rate = 195): Line => ({
+  head: 'SUB_COMPONENT',
+  name: 'Iron — powder-coated frame',
+  method: 'WEIGHT',
+  sortOrder: 1,
+  lines: { create: [L('BASE FRAME / LEGS', { actualWeight: kg, wastagePct: 4, qty: 1, rate, unit: 'KGS' })] },
+});
+
+const glassPanel = (n: number, l: number, w: number, rate = 140): Line => ({
+  head: 'SUB_COMPONENT',
+  name: 'Glass 4mm',
+  method: 'SQFT',
+  dimUnit: 'IN',
+  sortOrder: 2,
+  lines: { create: [L('DOOR GLASS', { actualL: l, actualW: w, costL: l, costW: w, qty: n, rate, unit: 'SQFT' })] },
+});
+
+const tileInlay = (n: number, rate = 34): Line => ({
+  head: 'SUB_COMPONENT',
+  name: 'Hand-painted ceramic tiles',
+  method: 'QTY',
+  sortOrder: 3,
+  lines: { create: [L('4x4 PAINTED TILE', { qty: n, rate, unit: 'PCS' })] },
+});
+
+const hardware = (scale = 1): Line => ({
+  head: 'HARDWARE',
+  name: 'Hardware',
+  method: 'QTY',
+  sortOrder: 0,
+  lines: {
+    create: [
+      L('BRASS CUP HANDLE', { qty: Math.round(4 * scale), rate: 78, unit: 'PCS' }),
+      L('CONCEALED HINGE', { qty: Math.round(6 * scale), rate: 46, unit: 'PCS' }),
+      L('DRAWER SLIDE PAIR', { qty: Math.round(3 * scale), rate: 165, unit: 'SET' }),
+      L("1.5' SCREW", { qty: Math.round(48 * scale), rate: 0.85, unit: 'PCS' }),
+      L('FELT PAD', { qty: 4, rate: 6, unit: 'PCS' }),
+      L('SANDING PAPER 120N', { qty: Math.round(4 * scale), rate: 39, unit: 'PCS' }),
+    ],
+  },
+});
+
+const polishing = (scale = 1): Line => ({
+  head: 'POLISHING',
+  name: 'Polishing',
+  method: 'QTY',
+  sortOrder: 0,
+  lines: {
+    create: [
+      L('WOOD STAIN', { qty: round(1.4 * scale, 2), rate: 240, unit: 'LTR' }),
+      L('SEALER', { qty: round(1.2 * scale, 2), rate: 210, unit: 'LTR' }),
+      L('MATT LACQUER', { qty: round(1.6 * scale, 2), rate: 265, unit: 'LTR' }),
+      L('THINNER', { qty: round(2.0 * scale, 2), rate: 92, unit: 'LTR' }),
+      L('RUBBING CLOTH', { qty: 3, rate: 9, unit: 'PCS' }),
+    ],
+  },
+});
+
+const packaging = (cbm: number): Line => ({
+  head: 'PACKAGING',
+  name: 'Packaging',
+  method: 'QTY',
+  sortOrder: 0,
+  lines: {
+    create: [
+      L('BUBBLE WRAP', { qty: round(cbm * 9, 2), rate: 34, unit: 'MTR' }),
+      L('EPE FOAM', { qty: round(cbm * 7, 2), rate: 41, unit: 'MTR' }),
+      L('7-PLY EXPORT CARTON', { qty: 1, rate: round(430 + cbm * 320), unit: 'PCS' }),
+      L('EDGE PROTECTOR', { qty: 8, rate: 3.2, unit: 'PCS' }),
+      L('STRAPPING + STICKERS', { qty: 1, rate: 46, unit: 'LOT' }),
+    ],
+  },
+});
+
+const labour = (scale = 1, extra?: [string, number]): Line => ({
+  head: 'LABOUR',
+  name: 'Labour',
+  method: 'QTY',
+  sortOrder: 0,
+  lines: {
+    create: [
+      L('CNC / CUTTING', { qty: 1, rate: round(120 * scale), unit: 'LOT' }),
+      L('CARCASS ASSEMBLY', { qty: 1, rate: round(430 * scale), unit: 'LOT' }),
+      L('SANDING', { qty: 1, rate: round(210 * scale), unit: 'LOT' }),
+      L('POLISHING LABOUR', { qty: 1, rate: round(390 * scale), unit: 'LOT' }),
+      L('FITTING & QC', { qty: 1, rate: round(180 * scale), unit: 'LOT' }),
+      L('PACKING LABOUR', { qty: 1, rate: round(165 * scale), unit: 'LOT' }),
+      ...(extra ? [L(extra[0], { qty: 1, rate: extra[1], unit: 'LOT' })] : []),
+    ],
+  },
+});
+
+const forwarding = (cbm: number): Line => ({
+  head: 'FORWARDING',
+  name: 'Forwarding',
+  method: 'QTY',
+  sortOrder: 0,
+  lines: {
+    create: [
+      L('CHA CHARGES', { qty: 1, rate: round(90 + cbm * 60), unit: 'LOT' }),
+      L('INLAND FREIGHT (ICD)', { qty: 1, rate: round(140 + cbm * 210), unit: 'LOT' }),
+      L('FORWARDER / BL', { qty: 1, rate: round(320 + cbm * 480), unit: 'LOT' }),
+    ],
+  },
+});
+
+// ---------------------------------------------------------------------------
+
+interface ProductDef {
+  code: string;
+  name: string;
+  alias: string;
+  image: string;
+  description: string;
+  type: string;
+  size: string;
+  colour: string;
+  material: string;
+  finish: string;
+  itemType: string;
+  stageLine: 'X' | 'Y';
+  dims: { l: number; w: number; h: number };
+  pack: { l: number; w: number; h: number };
+  weight: [number, number];
+  buyer: 'AB' | 'HG' | 'MW';
+  buyerCode: string;
+  groups: (methodDims: { l: number; w: number; h: number }, cbm: number) => Line[];
+}
+
+const PRODUCTS: ProductDef[] = [
+  {
+    code: 'AB-2101',
+    name: 'Aurora Two-Tone Sideboard',
+    alias: 'Aurora 2-Door Sideboard',
+    image: 'aurora-two-tone-sideboard.jpg',
+    description: 'Two-door mango wood sideboard with a marble-effect two-tone front, brass cup handles and a black powder-coated iron splay base.',
+    type: 'Cabinet',
+    size: 'Medium',
+    colour: 'Natural',
+    material: 'Mango Wood',
+    finish: 'Matt',
+    itemType: 'Knock-Down (KD)',
+    stageLine: 'Y',
+    dims: { l: 47, w: 16, h: 30 },
+    pack: { l: 51, w: 20, h: 34 },
+    weight: [38, 46],
+    buyer: 'AB',
+    buyerCode: 'AUR-SB-47',
+    groups: (d, cbm) => [carcass('Mango Wood', 620, d, 1), plyBack(30, 45), ironFrame(9.5), hardware(0.9), polishing(0.9), packaging(cbm), labour(0.95), forwarding(cbm)],
+  },
+  {
+    code: 'AB-2102',
+    name: 'Aurora Striped Console',
+    alias: 'Aurora Striped 2-Door',
+    image: 'aurora-striped-console.jpg',
+    description: 'Companion piece to the Aurora sideboard — banded light and dark mango fronts on a slim powder-coated base, sized for a hallway.',
+    type: 'Side Table',
+    size: 'Small',
+    colour: 'Natural',
+    material: 'Mango Wood',
+    finish: 'Matt',
+    itemType: 'Knock-Down (KD)',
+    stageLine: 'Y',
+    dims: { l: 36, w: 15, h: 30 },
+    pack: { l: 40, w: 19, h: 34 },
+    weight: [29, 35],
+    buyer: 'AB',
+    buyerCode: 'AUR-CN-36',
+    groups: (d, cbm) => [carcass('Mango Wood', 620, d, 1), plyBack(30, 34), ironFrame(7.5), hardware(0.7), polishing(0.75), packaging(cbm), labour(0.8), forwarding(cbm)],
+  },
+  {
+    code: 'HG-2201',
+    name: 'Jaipur Tiled Sideboard',
+    alias: 'Jaipur 3-Door Tiled',
+    image: 'jaipur-tiled-sideboard.jpg',
+    description: 'Distressed-white three-door sideboard inset with 27 hand-painted Jaipur ceramic tiles. Three top drawers, solid mango carcass.',
+    type: 'Cabinet',
+    size: 'Large',
+    colour: 'Distressed White',
+    material: 'Mango Wood',
+    finish: 'Distressed',
+    itemType: 'Finished Furniture',
+    stageLine: 'X',
+    dims: { l: 59, w: 16, h: 34 },
+    pack: { l: 63, w: 20, h: 38 },
+    weight: [52, 61],
+    buyer: 'HG',
+    buyerCode: 'JAI-SB-60',
+    groups: (d, cbm) => [carcass('Mango Wood', 585, d, 2), plyBack(34, 57), tileInlay(27), hardware(1.15), polishing(1.2), packaging(cbm), labour(1.2, ['TILE SETTING', 340]), forwarding(cbm)],
+  },
+  {
+    code: 'HG-2202',
+    name: 'Jaipur Tiled Tall Cabinet',
+    alias: 'Jaipur Tall Tiled',
+    image: 'jaipur-tiled-tall-cabinet.jpg',
+    description: 'Tall two-door version of the Jaipur range with 40 hand-painted tiles across full-height doors and four internal shelves.',
+    type: 'Almirah',
+    size: 'Large',
+    colour: 'Distressed White',
+    material: 'Mango Wood',
+    finish: 'Distressed',
+    itemType: 'Finished Furniture',
+    stageLine: 'X',
+    dims: { l: 32, w: 15, h: 66 },
+    pack: { l: 36, w: 19, h: 70 },
+    weight: [58, 68],
+    buyer: 'HG',
+    buyerCode: 'JAI-TC-66',
+    groups: (d, cbm) => [carcass('Mango Wood', 585, d, 4), plyBack(66, 30), tileInlay(40), hardware(1.1), polishing(1.3), packaging(cbm), labour(1.3, ['TILE SETTING', 480]), forwarding(cbm)],
+  },
+  {
+    code: 'MW-2301',
+    name: 'Heritage Display Hutch',
+    alias: 'Heritage Glazed Hutch',
+    image: 'heritage-display-hutch.jpg',
+    description: 'Two-piece glazed display hutch in solid acacia: sliding-glass upper deck over a four-door base with a woven rattan basket bay.',
+    type: 'Bookshelf',
+    size: 'XL',
+    colour: 'Honey',
+    material: 'Oak Wood',
+    finish: 'Natural Wax',
+    itemType: 'Knock-Down (KD)',
+    stageLine: 'X',
+    dims: { l: 63, w: 18, h: 78 },
+    pack: { l: 67, w: 22, h: 44 },
+    weight: [86, 99],
+    buyer: 'MW',
+    buyerCode: 'HER-HU-63',
+    groups: (d, cbm) => [carcass('Oak Wood', 740, d, 4), plyBack(78, 61), glassPanel(4, 26, 22), hardware(1.5), polishing(1.5), packaging(cbm), labour(1.6, ['GLAZING', 420]), forwarding(cbm)],
+  },
+  {
+    code: 'AB-2401',
+    name: 'Sunburst Marquetry Sideboard',
+    alias: 'Sunburst 3-Door',
+    image: 'sunburst-marquetry-sideboard.jpg',
+    description: 'Three-door sideboard with hand-laid radial marquetry in reclaimed sheesham across every front, on a slim black iron plinth.',
+    type: 'Cabinet',
+    size: 'Large',
+    colour: 'Walnut',
+    material: 'Sheesham',
+    finish: 'Glossy',
+    itemType: 'Finished Furniture',
+    stageLine: 'Y',
+    dims: { l: 67, w: 17, h: 31 },
+    pack: { l: 71, w: 21, h: 35 },
+    weight: [61, 71],
+    buyer: 'AB',
+    buyerCode: 'SUN-SB-67',
+    groups: (d, cbm) => [carcass('Sheesham', 890, d, 2), plyBack(31, 65), ironFrame(11.5), hardware(1.2), polishing(1.45), packaging(cbm), labour(1.5, ['MARQUETRY INLAY', 1150]), forwarding(cbm)],
+  },
+  {
+    code: 'MW-2501',
+    name: 'Mandala Carved Almirah',
+    alias: 'Mandala 2-Door Almirah',
+    image: 'mandala-carved-almirah.jpg',
+    description: 'Two-door almirah with a deep hand-carved mandala spanning both doors, brass ring pulls and a single internal hanging rail.',
+    type: 'Almirah',
+    size: 'Large',
+    colour: 'Honey',
+    material: 'Mango Wood',
+    finish: 'Natural Wax',
+    itemType: 'Finished Furniture',
+    stageLine: 'X',
+    dims: { l: 36, w: 18, h: 72 },
+    pack: { l: 40, w: 22, h: 76 },
+    weight: [64, 74],
+    buyer: 'MW',
+    buyerCode: 'MAN-AL-72',
+    groups: (d, cbm) => [carcass('Mango Wood', 640, d, 3), plyBack(72, 34), hardware(1.05), polishing(1.35), packaging(cbm), labour(1.35, ['HAND CARVING', 1450]), forwarding(cbm)],
+  },
+  {
+    code: 'HG-2601',
+    name: 'Nordic Mango Sideboard',
+    alias: 'Nordic 4-Door Low',
+    image: 'nordic-mango-sideboard.jpg',
+    description: 'Low four-door sideboard in pale mango with book-matched grain fronts on tapered black steel legs. Flat-packs for container efficiency.',
+    type: 'Cabinet',
+    size: 'Large',
+    colour: 'Natural',
+    material: 'Mango Wood',
+    finish: 'Matt',
+    itemType: 'Knock-Down (KD)',
+    stageLine: 'Y',
+    dims: { l: 71, w: 15, h: 28 },
+    pack: { l: 75, w: 19, h: 20 },
+    weight: [49, 58],
+    buyer: 'HG',
+    buyerCode: 'NOR-SB-71',
+    groups: (d, cbm) => [carcass('Mango Wood', 605, d, 1), plyBack(28, 69), ironFrame(8.5), hardware(1.1), polishing(1.1), packaging(cbm), labour(1.05), forwarding(cbm)],
+  },
+  {
+    code: 'MW-2701',
+    name: 'Rustic Dining Hutch',
+    alias: 'Rustic Glazed Dining Set Hutch',
+    image: 'rustic-dining-hutch.jpg',
+    description: 'Wide glazed dining hutch in reclaimed pine with six drawers, twin display decks and antique-iron drop handles.',
+    type: 'Bookshelf',
+    size: 'XL',
+    colour: 'Honey',
+    material: 'Oak Wood',
+    finish: 'Distressed',
+    itemType: 'Knock-Down (KD)',
+    stageLine: 'X',
+    dims: { l: 67, w: 19, h: 82 },
+    pack: { l: 71, w: 23, h: 46 },
+    weight: [94, 108],
+    buyer: 'MW',
+    buyerCode: 'RUS-HU-67',
+    groups: (d, cbm) => [carcass('Oak Wood', 705, d, 5), plyBack(82, 65), glassPanel(6, 22, 20), hardware(1.7), polishing(1.6), packaging(cbm), labour(1.75, ['GLAZING', 520]), forwarding(cbm)],
+  },
+  {
+    code: 'AB-2801',
+    name: 'Herringbone Reclaimed Console',
+    alias: 'Herringbone 2-Door',
+    image: 'herringbone-reclaimed-console.jpg',
+    description: 'Two-door console with a herringbone front laid from reclaimed railway sheesham, each panel a different tone, on a black iron plinth.',
+    type: 'Side Table',
+    size: 'Medium',
+    colour: 'Walnut',
+    material: 'Sheesham',
+    finish: 'Matt',
+    itemType: 'Finished Furniture',
+    stageLine: 'Y',
+    dims: { l: 55, w: 16, h: 30 },
+    pack: { l: 59, w: 20, h: 34 },
+    weight: [47, 55],
+    buyer: 'AB',
+    buyerCode: 'HER-CN-55',
+    groups: (d, cbm) => [carcass('Sheesham', 860, d, 1), plyBack(30, 53), ironFrame(10), hardware(1), polishing(1.2), packaging(cbm), labour(1.3, ['HERRINGBONE LAY-UP', 890]), forwarding(cbm)],
+  },
+];
+
+const CBM_PER_CUBIC_INCH = 0.0000163871;
+const cbmOf = (d: { l: number; w: number; h: number }) => round(d.l * d.w * d.h * CBM_PER_CUBIC_INCH, 4);
+
+// ---------------------------------------------------------------------------
+
+async function wipeOperational() {
+  await prisma.stageMovePhoto.deleteMany();
+  await prisma.stageMove.deleteMany();
+  await prisma.orderLineStage.deleteMany();
+  await prisma.operationSheet.deleteMany();
+  await prisma.ledgerEntry.deleteMany();
+  await prisma.orderLine.deleteMany();
+  await prisma.order.deleteMany();
+  await prisma.proformaLine.deleteMany();
+  await prisma.proforma.deleteMany();
+  await prisma.stockTxn.deleteMany();
+  await prisma.rawItem.deleteMany();
+  await prisma.productImage.deleteMany();
+  await prisma.costLine.deleteMany();
+  await prisma.costGroup.deleteMany();
+  await prisma.costSheet.deleteMany();
+  await prisma.productBuyer.deleteMany();
+  await prisma.relatedProduct.deleteMany();
+  await prisma.product.deleteMany();
+  await prisma.buyer.deleteMany();
+  await prisma.supplier.deleteMany();
+  for (const f of fs.existsSync(UPLOADS) ? fs.readdirSync(UPLOADS) : []) {
+    if (f !== '.gitkeep') fs.unlinkSync(path.join(UPLOADS, f));
+  }
+}
+
+async function ensureConfig() {
+  const hash = await bcrypt.hash('admin123', 10);
+  const admin = await prisma.user.upsert({ where: { email: 'admin@saraswati.local' }, update: {}, create: { name: 'Administrator', email: 'admin@saraswati.local', role: 'Admin', passwordHash: hash } });
+  await prisma.user.upsert({
+    where: { email: 'manager@saraswati.local' },
+    update: {},
+    create: { name: 'Production Manager', email: 'manager@saraswati.local', role: 'Manager', passwordHash: await bcrypt.hash('manager123', 10) },
+  });
+
+  for (const c of [
+    { code: 'INR', name: 'Indian Rupee', symbol: '₹', rateToBase: 1, isBase: true },
+    { code: 'USD', name: 'US Dollar', symbol: '$', rateToBase: 83.4, isBase: false },
+    { code: 'EUR', name: 'Euro', symbol: '€', rateToBase: 90.2, isBase: false },
+    { code: 'GBP', name: 'Pound Sterling', symbol: '£', rateToBase: 105.6, isBase: false },
+  ]) {
+    await prisma.currency.upsert({ where: { code: c.code }, update: { rateToBase: c.rateToBase, symbol: c.symbol, name: c.name, isBase: c.isBase }, create: c });
+  }
+  for (const m of BUILTIN_METHODS) await prisma.costMethod.upsert({ where: { code: m.code }, update: { ...m, isBuiltIn: true }, create: { ...m, isBuiltIn: true } });
+
+  const units = [['PCS', 'Pieces'], ['SET', 'Set'], ['KGS', 'Kilograms'], ['CFT', 'Cubic Feet'], ['SQFT', 'Square Feet'], ['SQM', 'Square Metre'], ['MTR', 'Metre'], ['LTR', 'Litre'], ['LOT', 'Lot']];
+  for (let i = 0; i < units.length; i++) await prisma.unit.upsert({ where: { code: units[i][0] }, update: { name: units[i][1], sortOrder: i }, create: { code: units[i][0], name: units[i][1], sortOrder: i } });
+
+  const attributes: Record<string, string[]> = {
+    PRODUCT_TYPE: ['Almirah', 'Cabinet', 'Side Table', 'Dining Table', 'Chair', 'Bar Stool', 'Bench', 'Bookshelf'],
+    ITEM_TYPE: ['Finished Furniture', 'Knock-Down (KD)', 'Hardware Fitting'],
+    SIZE: ['Small', 'Medium', 'Large', 'XL'],
+    COLOUR: ['Natural', 'Walnut', 'Distressed White', 'Black', 'Honey'],
+    MATERIAL: ['Mango Wood', 'Oak Wood', 'Sheesham', 'Iron', 'Ply', 'Glass'],
+    FINISH: ['Matt', 'Glossy', 'Distressed', 'Powder Coated', 'Natural Wax'],
+  };
+  const attrId: Record<string, Record<string, number>> = {};
+  for (const [type, values] of Object.entries(attributes)) {
+    attrId[type] = {};
+    for (let i = 0; i < values.length; i++) {
+      const rec = await prisma.attributeValue.upsert({ where: { type_value: { type, value: values[i] } }, update: { sortOrder: i }, create: { type, value: values[i], sortOrder: i } });
+      attrId[type][values[i]] = rec.id;
+    }
+  }
+
+  const stageLines = [
+    { code: 'X', name: 'Wood line', isDefault: true, steps: ['Raw joining', 'Raw sanding', 'Polishing', 'Accessory fitting', 'QC', 'Packaging'] },
+    { code: 'Y', name: 'Metal line', isDefault: false, steps: ['Raw joining', 'Powder coating', 'Fitting', 'QC', 'Packing'] },
+  ];
+  const lineId: Record<string, number> = {};
+  for (const sl of stageLines) {
+    const existing = await prisma.stageLine.findUnique({ where: { code: sl.code } });
+    const rec = existing
+      ? await prisma.stageLine.update({ where: { code: sl.code }, data: { name: sl.name, isDefault: sl.isDefault, isActive: true } })
+      : await prisma.stageLine.create({ data: { code: sl.code, name: sl.name, isDefault: sl.isDefault } });
+    await prisma.stageLineStep.deleteMany({ where: { stageLineId: rec.id } });
+    for (let i = 0; i < sl.steps.length; i++) await prisma.stageLineStep.create({ data: { stageLineId: rec.id, name: sl.steps[i], sortOrder: i } });
+    lineId[sl.code] = rec.id;
+  }
+
+  for (const s of [
+    { key: 'PI', prefix: 'PI', useYear: true },
+    { key: 'ORD', prefix: 'ORD', useYear: true },
+    { key: 'OP', prefix: 'OP', useYear: false },
+  ]) {
+    await prisma.docSequence.upsert({ where: { key: s.key }, update: { prefix: s.prefix, useYear: s.useYear }, create: s });
+  }
+
+  return { admin, attrId, lineId };
+}
+
+async function main() {
+  console.log('Building investor demo…\n');
+  await wipeOperational();
+  const { admin, attrId, lineId } = await ensureConfig();
+
+  const inr = (await prisma.currency.findUnique({ where: { code: 'INR' } }))!;
+  const usd = (await prisma.currency.findUnique({ where: { code: 'USD' } }))!;
+  const eur = (await prisma.currency.findUnique({ where: { code: 'EUR' } }))!;
+  const gbp = (await prisma.currency.findUnique({ where: { code: 'GBP' } }))!;
+  const pcs = (await prisma.unit.findUnique({ where: { code: 'PCS' } }))!;
+
+  // --- buyers -------------------------------------------------------------
+  const buyerDefs = [
+    { code: 'AB', name: 'Ashford & Barnes Ltd.', country: 'United Kingdom', contactName: 'James Ashford', email: 'buying@ashfordbarnes.co.uk', phone: '+44 20 7946 0112', address: 'Unit 14, Kingsland Trade Park\nLondon E8 4QN', currency: gbp },
+    { code: 'HG', name: 'Heritage Home Goods', country: 'United States', contactName: 'Laura Chen', email: 'purchasing@heritagehome.com', phone: '+1 415 555 0184', address: '2200 Bayshore Blvd\nSan Francisco, CA 94134', currency: usd },
+    { code: 'MW', name: 'Möbelwerk Hansa GmbH', country: 'Germany', contactName: 'Anke Brandt', email: 'einkauf@moebelwerk-hansa.de', phone: '+49 40 3199 2255', address: 'Speicherstadt 8\n20457 Hamburg', currency: eur },
+  ];
+  const buyers: Record<string, { id: number; name: string; currencyId: number; rate: number }> = {};
+  for (const b of buyerDefs) {
+    const rec = await prisma.buyer.create({ data: { code: b.code, name: b.name, country: b.country, contactName: b.contactName, email: b.email, phone: b.phone, address: b.address } });
+    buyers[b.code] = { id: rec.id, name: rec.name, currencyId: b.currency.id, rate: b.currency.rateToBase };
+  }
+  console.log(`  ${buyerDefs.length} buyers`);
+
+  // --- suppliers ----------------------------------------------------------
+  const supplierDefs = [
+    { code: 'SUP-TIMBER', name: 'Sharma Timber Traders', type: 'MATERIAL', contactName: 'Ramesh Sharma', phone: '+91 98290 11111', gstNo: '08ABCDE1234F1Z5', address: 'Timber Market, Jodhpur', paymentTerms: '30 days' },
+    { code: 'SUP-PLY', name: 'Rajasthan Ply & Board', type: 'MATERIAL', contactName: 'Vinod Agarwal', phone: '+91 98290 22222', gstNo: '08PLYRB4321K1Z9', address: 'Boranada, Jodhpur', paymentTerms: '21 days' },
+    { code: 'SUP-METAL', name: 'Metal Craft Works', type: 'MATERIAL', contactName: 'Iqbal Khan', phone: '+91 98290 33333', gstNo: '08MNOPQ5678R1Z2', address: 'Industrial Area Phase II, Jodhpur', paymentTerms: '15 days' },
+    { code: 'SUP-GLASS', name: 'Jodhpur Glass House', type: 'MATERIAL', contactName: 'Suresh Jain', phone: '+91 98290 44444', gstNo: '08GLSSH8899T1Z4', address: 'Sardarpura, Jodhpur', paymentTerms: '15 days' },
+    { code: 'SUP-HDW', name: 'Shree Hardware Mart', type: 'MATERIAL', contactName: 'Dinesh Soni', phone: '+91 98290 55555', gstNo: '08HDWRE2211M1Z7', address: 'Nai Sarak, Jodhpur', paymentTerms: '30 days' },
+    { code: 'JOB-POLISH', name: 'Glaze Polishing Co.', type: 'JOBWORK', contactName: 'Mahesh Prajapat', phone: '+91 98290 66666', gstNo: '08GLZPL3344P1Z1', address: 'Basni Phase I, Jodhpur', paymentTerms: 'On delivery' },
+    { code: 'JOB-POWDER', name: 'Shakti Powder Coating', type: 'JOBWORK', contactName: 'Vikram Singh', phone: '+91 98290 77777', gstNo: '08SHKPC7788L1Z6', address: 'Boranada, Jodhpur', paymentTerms: '15 days' },
+    { code: 'JOB-CARVE', name: 'Precision Carving Works', type: 'JOBWORK', contactName: 'Mohan Lal', phone: '+91 98290 88888', address: 'Nagauri Gate, Jodhpur', paymentTerms: 'On delivery' },
+    { code: 'JOB-TILE', name: 'Marigold Tile Studio', type: 'JOBWORK', contactName: 'Pooja Rathore', phone: '+91 98290 99999', address: 'Pal Road, Jodhpur', paymentTerms: '15 days' },
+  ];
+  const sup: Record<string, number> = {};
+  for (const s of supplierDefs) sup[s.code] = (await prisma.supplier.create({ data: s })).id;
+  console.log(`  ${supplierDefs.length} suppliers`);
+
+  // --- raw items + stock --------------------------------------------------
+  const rawDefs = [
+    { code: 'RM-MANGO', name: 'Mango Wood', category: 'Wood', unit: 'CFT', reorderLevel: 60, openingQty: 240 },
+    { code: 'RM-OAK', name: 'Acacia / Oak Wood', category: 'Wood', unit: 'CFT', reorderLevel: 40, openingQty: 130 },
+    { code: 'RM-SHEESHAM', name: 'Reclaimed Sheesham', category: 'Wood', unit: 'CFT', reorderLevel: 30, openingQty: 74 },
+    { code: 'RM-PLY6', name: 'Ply 6mm', category: 'Ply', unit: 'SQFT', reorderLevel: 300, openingQty: 820 },
+    { code: 'RM-IRON', name: 'MS Iron Section', category: 'Metal', unit: 'KGS', reorderLevel: 150, openingQty: 460 },
+    { code: 'RM-GLASS', name: 'Glass 4mm', category: 'Glass', unit: 'SQFT', reorderLevel: 60, openingQty: 42 },
+    { code: 'RM-TILE', name: 'Hand-painted Tile 4x4', category: 'Ceramic', unit: 'PCS', reorderLevel: 400, openingQty: 1250 },
+    { code: 'RM-LACQ', name: 'Matt Lacquer', category: 'Polish', unit: 'LTR', reorderLevel: 80, openingQty: 62 },
+  ];
+  const raw: Record<string, number> = {};
+  for (const r of rawDefs) raw[r.code] = (await prisma.rawItem.create({ data: r })).id;
+
+  const stockDefs = [
+    { code: 'RM-MANGO', type: 'IN', qty: 120, rate: 612, supplier: 'SUP-TIMBER', days: 47, note: 'Seasoned mango, 22 nos logs' },
+    { code: 'RM-SHEESHAM', type: 'IN', qty: 46, rate: 875, supplier: 'SUP-TIMBER', days: 33, note: 'Reclaimed railway sleeper stock' },
+    { code: 'RM-IRON', type: 'IN', qty: 240, rate: 92, supplier: 'SUP-METAL', days: 30, note: '25x25 MS square section' },
+    { code: 'RM-PLY6', type: 'IN', qty: 600, rate: 31, supplier: 'SUP-PLY', days: 26, note: '8x4 sheets, 24 nos' },
+    { code: 'RM-TILE', type: 'IN', qty: 900, rate: 33, supplier: 'JOB-TILE', days: 24, note: 'Blue-yellow floral, 4x4' },
+    { code: 'RM-GLASS', type: 'IN', qty: 60, rate: 138, supplier: 'SUP-GLASS', days: 12, note: '4mm clear, cut to size' },
+    { code: 'RM-MANGO', type: 'OUT', qty: 96, rate: 0, days: 40, note: 'Issued to Aurora + Nordic batches' },
+    { code: 'RM-SHEESHAM', type: 'OUT', qty: 38, rate: 0, days: 22, note: 'Issued to Sunburst batch' },
+    { code: 'RM-IRON', type: 'OUT', qty: 185, rate: 0, days: 21, note: 'Issued for powder coating' },
+    { code: 'RM-TILE', type: 'OUT', qty: 780, rate: 0, days: 18, note: 'Issued to Jaipur range' },
+  ];
+  const stockIds: Record<string, number> = {};
+  for (const s of stockDefs) {
+    const rec = await prisma.stockTxn.create({
+      data: { rawItemId: raw[s.code], type: s.type, qty: s.qty, rate: s.rate, supplierId: s.supplier ? sup[s.supplier] : null, note: s.note, date: ago(s.days), createdById: admin.id },
+    });
+    if (s.type === 'IN') stockIds[`${s.code}-${s.days}`] = rec.id;
+  }
+  console.log(`  ${rawDefs.length} raw items, ${stockDefs.length} stock movements`);
+
+  // --- products -----------------------------------------------------------
+  if (!fs.existsSync(ASSETS)) throw new Error(`Demo photos missing at ${ASSETS}`);
+  fs.mkdirSync(UPLOADS, { recursive: true });
+
+  const productIds: Record<string, number> = {};
+  for (const p of PRODUCTS) {
+    const cbm = cbmOf(p.pack);
+    const created = await prisma.product.create({
+      data: {
+        factoryCode: p.code,
+        name: p.name,
+        alias: p.alias,
+        status: 'Active',
+        description: p.description,
+        itemTypeId: attrId.ITEM_TYPE[p.itemType],
+        productTypeId: attrId.PRODUCT_TYPE[p.type],
+        sizeId: attrId.SIZE[p.size],
+        colourId: attrId.COLOUR[p.colour],
+        materialId: attrId.MATERIAL[p.material],
+        finishId: attrId.FINISH[p.finish],
+        unitId: pcs.id,
+        stageLineId: lineId[p.stageLine],
+        prodLengthIn: p.dims.l,
+        prodWidthIn: p.dims.w,
+        prodHeightIn: p.dims.h,
+        netWeightKg: p.weight[0],
+        grossWeightKg: p.weight[1],
+        packLengthIn: p.pack.l,
+        packWidthIn: p.pack.w,
+        packHeightIn: p.pack.h,
+        piecesPerCarton: 1,
+        volumeBeforePackingCbm: cbmOf(p.dims),
+        volumeAfterPackingCbm: cbm,
+        createdById: admin.id,
+        buyers: { create: [{ buyerId: buyers[p.buyer].id, buyerCode: p.buyerCode }] },
+        costSheets: { create: [{ version: 1, isActive: true, currencyId: inr.id, factoryExpensePct: 15, marginPct: 18, groups: { create: p.groups(p.dims, cbm) as never } }] },
+      },
+    });
+    productIds[p.code] = created.id;
+
+    // Photo: copied into uploads and registered, exactly as an upload would be.
+    const src = path.join(ASSETS, p.image);
+    if (!fs.existsSync(src)) throw new Error(`Missing photo ${p.image}`);
+    const filename = `demo-${p.code.toLowerCase()}-${p.image}`;
+    fs.copyFileSync(src, path.join(UPLOADS, filename));
+    await prisma.productImage.create({ data: { productId: created.id, filename, originalName: p.image, url: `/uploads/${filename}`, isPrimary: true, caption: p.name, sortOrder: 0 } });
+  }
+  console.log(`  ${PRODUCTS.length} products with photos and costing`);
+
+  // Variants inside a collection.
+  for (const [a, b] of [
+    ['AB-2101', 'AB-2102'],
+    ['HG-2201', 'HG-2202'],
+  ]) {
+    await prisma.relatedProduct.create({ data: { productId: productIds[a], relatedId: productIds[b], relation: 'VARIANT', note: 'Same collection, different size' } });
+    await prisma.relatedProduct.create({ data: { productId: productIds[b], relatedId: productIds[a], relation: 'VARIANT', note: 'Same collection, different size' } });
+  }
+
+  // --- selling prices from the real costing engine -------------------------
+  const methods = await loadMethodMap();
+  const fobInr: Record<string, number> = {};
+  for (const code of Object.keys(productIds)) {
+    const full = await prisma.product.findUnique({ where: { id: productIds[code] }, include: { costSheets: { where: { isActive: true }, include: { groups: { include: { lines: true } } } } } });
+    const computed = computeCostSheet(full?.costSheets?.[0], methods) as any;
+    fobInr[code] = computed?.summary?.fob ?? 0;
+  }
+  /** Quoted price = FOB converted to the buyer's currency, nudged to a round number. */
+  const priceIn = (code: string, rate: number, uplift = 1.06) => {
+    const raw = (fobInr[code] / rate) * uplift;
+    return Math.round(raw / 5) * 5;
+  };
+
+  // --- proformas + orders -------------------------------------------------
+  let piNo = 0;
+  let ordNo = 0;
+  const nextPi = () => `PI-${YEAR}-${String(++piNo).padStart(4, '0')}`;
+  const nextOrd = () => `ORD-${YEAR}-${String(++ordNo).padStart(4, '0')}`;
+
+  interface PfLine { code: string; qty: number }
+  async function makeProforma(opts: { buyer: 'AB' | 'HG' | 'MW'; days: number; lines: PfLine[]; status: string; sentDays?: number; decidedDays?: number; rejectReason?: string; incoterms?: string; validDays?: number }) {
+    const b = buyers[opts.buyer];
+    const pf = await prisma.proforma.create({
+      data: {
+        number: nextPi(),
+        buyerId: b.id,
+        currencyId: b.currencyId,
+        status: opts.status,
+        date: ago(opts.days),
+        validUntil: ago(opts.days - (opts.validDays ?? 30)),
+        paymentTerms: '30% advance against PI, balance against B/L copy',
+        deliveryTerms: `${opts.lines.reduce((a, l) => a + l.qty, 0) > 60 ? '75' : '55'} days from advance receipt`,
+        incoterms: opts.incoterms ?? 'FOB Mundra',
+        bankDetails: 'Bank: State Bank of India, Sardarpura, Jodhpur\nA/C: 3812 4457 9910\nIFSC: SBIN0031234\nSWIFT: SBININBB245',
+        notes: 'Prices valid 30 days. Packing: 7-ply export carton, 1 pc per carton. Photographs indicative of finish.',
+        showImages: true,
+        exchangeRate: b.rate,
+        sentAt: opts.sentDays != null ? ago(opts.sentDays) : null,
+        decidedAt: opts.decidedDays != null ? ago(opts.decidedDays) : null,
+        rejectReason: opts.rejectReason ?? null,
+        createdById: admin.id,
+        lines: {
+          create: opts.lines.map((l, i) => {
+            const def = PRODUCTS.find((p) => p.code === l.code)!;
+            return { productId: productIds[l.code], description: `${def.name} — ${def.alias}`, qty: l.qty, unitPrice: priceIn(l.code, b.rate), sortOrder: i };
+          }),
+        },
+      },
+      include: { lines: true },
+    });
+    return pf;
+  }
+
+  async function makeOrder(pf: { id: number; buyerId: number; currencyId: number | null; exchangeRate: number | null; lines: { productId: number | null; qty: number; unitPrice: number }[] }, opts: { days: number; deliveryDays: number; status: string }) {
+    const order = await prisma.order.create({
+      data: {
+        number: nextOrd(),
+        buyerId: pf.buyerId,
+        currencyId: pf.currencyId,
+        status: opts.status,
+        orderDate: ago(opts.days),
+        deliveryDate: ago(-opts.deliveryDays),
+        incoterms: 'FOB Mundra',
+        exchangeRate: pf.exchangeRate,
+        proformaId: pf.id,
+        createdById: admin.id,
+      },
+    });
+    for (let i = 0; i < pf.lines.length; i++) {
+      const l = pf.lines[i];
+      const product = await prisma.product.findUnique({ where: { id: l.productId! }, select: { stageLineId: true } });
+      const line = await prisma.orderLine.create({ data: { orderId: order.id, productId: l.productId!, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i, stageLineId: product?.stageLineId ?? null } });
+      const steps = await prisma.stageLineStep.findMany({ where: { stageLineId: product!.stageLineId! }, orderBy: { sortOrder: 'asc' } });
+      for (let s = 0; s < steps.length; s++) await prisma.orderLineStage.create({ data: { orderLineId: line.id, name: steps[s].name, sortOrder: s } });
+    }
+    return prisma.order.findUnique({ where: { id: order.id }, include: { lines: { include: { stages: { orderBy: { sortOrder: 'asc' } }, product: true }, orderBy: { sortOrder: 'asc' } } } });
+  }
+
+  /** Hand pieces from one stage to another, recording a hop per stage crossed. */
+  async function move(lineId2: number, stages: { id: number; name: string; sortOrder: number }[], from: number | null, to: number | null, qty: number, days: number, note?: string) {
+    const kind = from == null ? 'RELEASE' : to == null ? 'COMPLETE' : to > from ? 'ADVANCE' : 'REJECT';
+    const created: number[] = [];
+    if (kind === 'ADVANCE') {
+      for (let s = from!; s < to!; s++) {
+        const m = await prisma.stageMove.create({
+          data: { orderLineId: lineId2, kind: 'ADVANCE', fromStageId: stages[s].id, toStageId: stages[s + 1].id, qty, date: ago(days), note: note ?? null, createdById: admin.id },
+        });
+        created.push(m.id);
+      }
+    } else {
+      const m = await prisma.stageMove.create({
+        data: {
+          orderLineId: lineId2,
+          kind,
+          fromStageId: from == null ? null : stages[from].id,
+          toStageId: to == null ? null : stages[to].id,
+          qty,
+          date: ago(days),
+          note: note ?? null,
+          createdById: admin.id,
+        },
+      });
+      created.push(m.id);
+    }
+    return created;
+  }
+
+  const outsource = async (stageId: number, vendorCode: string, rate: number) => prisma.orderLineStage.update({ where: { id: stageId }, data: { vendorId: sup[vendorCode], jobworkRate: rate } });
+
+  // 1. Ashford — shipped and fully paid.
+  const pf1 = await makeProforma({ buyer: 'AB', days: 74, sentDays: 73, decidedDays: 70, status: 'Accepted', lines: [{ code: 'AB-2101', qty: 40 }, { code: 'AB-2102', qty: 30 }] });
+  const ord1 = (await makeOrder(pf1, { days: 70, deliveryDays: -6, status: 'Shipped' }))!;
+  for (const line of ord1.lines) {
+    const st = line.stages;
+    await outsource(st[1].id, 'JOB-POWDER', 130); // powder coating
+    await move(line.id, st, null, 0, line.qty, 66, 'Full batch issued to the floor');
+    await move(line.id, st, 0, st.length - 1, line.qty, 58, 'Coated, fitted and QC passed');
+    await move(line.id, st, st.length - 1, null, line.qty, 52, 'Packed and loaded for Mundra');
+  }
+
+  // 2. Heritage — mid-production, tiles outsourced, a QC rejection in flight.
+  const pf2 = await makeProforma({ buyer: 'HG', days: 58, sentDays: 57, decidedDays: 54, status: 'Accepted', lines: [{ code: 'HG-2201', qty: 60 }, { code: 'HG-2202', qty: 40 }, { code: 'HG-2601', qty: 50 }] });
+  const ord2 = (await makeOrder(pf2, { days: 54, deliveryDays: 24, status: 'Production' }))!;
+  const photoMoves: number[] = [];
+  for (const line of ord2.lines) {
+    const st = line.stages;
+    const code = line.product.factoryCode;
+    if (code.startsWith('HG-22')) {
+      // Wood line: tiles set by an outside studio at stage 4, polish in-house.
+      await outsource(st[3].id, 'JOB-TILE', 240);
+      await move(line.id, st, null, 0, line.qty, 46, 'Carcasses cut and issued');
+      await move(line.id, st, 0, 3, line.qty, 38, 'Sanded and polished in-house, ready for tiles');
+      const done = Math.round(line.qty * 0.6);
+      const ids = await move(line.id, st, 3, 4, done, 24, 'Tiles set and returned from Marigold — grout cured');
+      photoMoves.push(ids[ids.length - 1]);
+      // QC rejects a few for chipped tiles; they go back to the tile studio.
+      const rejected = Math.max(2, Math.round(done * 0.1));
+      await move(line.id, st, 4, 3, rejected, 16, 'QC: 2 tiles chipped on transit — returned to studio');
+    } else {
+      // Metal line: coating outsourced, then fitted here.
+      await outsource(st[1].id, 'JOB-POWDER', 145);
+      await move(line.id, st, null, 0, line.qty, 44, 'Carcasses cut and issued');
+      await move(line.id, st, 0, 2, Math.round(line.qty * 0.8), 30, 'Legs coated matt black by Shakti');
+      await move(line.id, st, 2, 3, Math.round(line.qty * 0.5), 18, 'Fitted, awaiting QC');
+    }
+  }
+
+  // 3. Möbelwerk — carving outsourced, just under way.
+  const pf3 = await makeProforma({ buyer: 'MW', days: 34, sentDays: 33, decidedDays: 30, status: 'Accepted', lines: [{ code: 'MW-2501', qty: 24 }, { code: 'MW-2301', qty: 18 }], incoterms: 'FOB Mundra' });
+  const ord3 = (await makeOrder(pf3, { days: 30, deliveryDays: 52, status: 'Production' }))!;
+  for (const line of ord3.lines) {
+    const st = line.stages;
+    if (line.product.factoryCode === 'MW-2501') {
+      await outsource(st[2].id, 'JOB-CARVE', 620); // hand carving at the polishing slot
+      await move(line.id, st, null, 0, line.qty, 22, 'Almirah carcasses issued');
+      await move(line.id, st, 0, 2, line.qty, 14, 'Sanded, sent to Precision Carving');
+      await move(line.id, st, 2, 3, 10, 5, 'First 10 carved mandalas back — excellent depth');
+    } else {
+      await outsource(st[2].id, 'JOB-POLISH', 210);
+      await move(line.id, st, null, 0, line.qty, 20, 'Hutch panels issued');
+      await move(line.id, st, 0, 1, line.qty, 11, 'Raw sanding complete');
+    }
+  }
+
+  // 4. Ashford — confirmed last week, nothing on the floor yet.
+  const pf4 = await makeProforma({ buyer: 'AB', days: 16, sentDays: 15, decidedDays: 11, status: 'Accepted', lines: [{ code: 'AB-2401', qty: 26 }, { code: 'AB-2801', qty: 34 }] });
+  const ord4 = (await makeOrder(pf4, { days: 11, deliveryDays: 68, status: 'Confirmed' }))!;
+  for (const line of ord4.lines) {
+    await outsource(line.stages[1].id, 'JOB-POWDER', 150);
+  }
+
+  // Open proformas: one awaiting a reply, one rejected, one still a draft.
+  const pf5 = await makeProforma({ buyer: 'MW', days: 9, sentDays: 8, status: 'Sent', lines: [{ code: 'MW-2701', qty: 22 }, { code: 'MW-2301', qty: 14 }] });
+  const pf6 = await makeProforma({ buyer: 'HG', days: 21, sentDays: 20, decidedDays: 13, status: 'Rejected', rejectReason: 'Landed cost above their retail ladder — asked us to re-quote at 500+ pcs', lines: [{ code: 'HG-2601', qty: 120 }] });
+  const pf7 = await makeProforma({ buyer: 'AB', days: 2, status: 'Draft', lines: [{ code: 'AB-2101', qty: 60 }, { code: 'AB-2401', qty: 20 }, { code: 'AB-2801', qty: 40 }] });
+  console.log(`  7 proformas (2 open, 1 rejected, 4 accepted), 4 orders`);
+
+  // --- hand-over photos ---------------------------------------------------
+  let photoCount = 0;
+  const proofShots = ['jaipur-tiled-sideboard.jpg', 'jaipur-tiled-tall-cabinet.jpg'];
+  for (let i = 0; i < photoMoves.length && i < proofShots.length; i++) {
+    const filename = `move-demo-${i + 1}-${proofShots[i]}`;
+    fs.copyFileSync(path.join(ASSETS, proofShots[i]), path.join(UPLOADS, filename));
+    await prisma.stageMovePhoto.create({ data: { moveId: photoMoves[i], filename, originalName: proofShots[i], url: `/uploads/${filename}`, caption: 'Tile work as received', sortOrder: 0 } });
+    photoCount++;
+  }
+
+  // --- material sheets ----------------------------------------------------
+  let opNo = 0;
+  for (const order of [ord2, ord3]) {
+    for (const line of order.lines.slice(0, 2)) {
+      await prisma.operationSheet.create({
+        data: { number: `OP-${String(++opNo).padStart(4, '0')}`, productId: line.productId, orderId: order.id, orderLineId: line.id, qty: line.qty, createdById: admin.id, createdAt: ago(40) },
+      });
+    }
+  }
+
+  // --- money --------------------------------------------------------------
+  const value = async (orderId: number) => {
+    const o = await prisma.order.findUnique({ where: { id: orderId }, include: { lines: true } });
+    return round(o!.lines.reduce((a, l) => a + l.qty * l.unitPrice, 0));
+  };
+  const v1 = await value(ord1.id);
+  const v2 = await value(ord2.id);
+  const v3 = await value(ord3.id);
+  const v4 = await value(ord4.id);
+
+  const receipt = (buyerCode: 'AB' | 'HG' | 'MW', orderId: number | null, amount: number, days: number, ref: string) =>
+    prisma.ledgerEntry.create({
+      data: {
+        partyType: 'BUYER',
+        buyerId: buyers[buyerCode].id,
+        orderId,
+        partyName: buyers[buyerCode].name,
+        kind: 'PAYMENT',
+        amount: round(amount),
+        currency: buyerCode === 'AB' ? 'GBP' : buyerCode === 'HG' ? 'USD' : 'EUR',
+        date: ago(days),
+        ref,
+        createdById: admin.id,
+      },
+    });
+
+  // Ashford: order 1 settled, then a large transfer that clears the rest of
+  // order 1 and rolls straight on to order 4 — FIFO doing the work.
+  await receipt('AB', ord1.id, round(v1 * 0.3), 68, 'SWIFT 30% advance');
+  await receipt('AB', ord1.id, round(v1 * 0.7 + v4 * 0.3), 44, 'SWIFT balance + next advance');
+  // Heritage: 30% advance only.
+  await receipt('HG', ord2.id, round(v2 * 0.3), 52, 'SWIFT 30% advance');
+  // Möbelwerk: paid more than the order needs — the surplus waits on account.
+  await receipt('MW', ord3.id, round(v3 * 1.1), 28, 'SEPA advance (over-remitted)');
+
+  // Jobwork: part-pay the polishers, leave the coaters running.
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'JOBWORK', supplierId: sup['JOB-TILE'], orderId: ord2.id, partyName: 'Marigold Tile Studio', kind: 'PAYMENT', amount: 6000, currency: 'INR', date: ago(20), ref: 'NEFT part payment', createdById: admin.id },
+  });
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'JOBWORK', supplierId: sup['JOB-POWDER'], orderId: ord1.id, partyName: 'Shakti Powder Coating', kind: 'PAYMENT', amount: 9100, currency: 'INR', date: ago(50), ref: 'NEFT against ORD-0001', createdById: admin.id },
+  });
+
+  // Material: two deliveries billed, the rest still to be billed.
+  const billFor = async (key: string, supplierCode: string, amount: number, days: number, ref: string, note: string) => {
+    const id = stockIds[key];
+    if (!id) return;
+    await prisma.ledgerEntry.create({
+      data: { partyType: 'SUPPLIER', supplierId: sup[supplierCode], stockTxnId: id, partyName: supplierDefs.find((s) => s.code === supplierCode)!.name, kind: 'BILL', amount: round(amount), currency: 'INR', date: ago(days), ref, note, createdById: admin.id },
+    });
+  };
+  await billFor('RM-MANGO-47', 'SUP-TIMBER', 120 * 612, 46, 'STT/24-25/881', 'Seasoned mango, 22 logs');
+  await billFor('RM-IRON-30', 'SUP-METAL', 240 * 92, 29, 'MCW/1194', '25x25 MS square section');
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'SUPPLIER', supplierId: sup['SUP-TIMBER'], partyName: 'Sharma Timber Traders', kind: 'PAYMENT', amount: 50000, currency: 'INR', date: ago(30), ref: 'RTGS part payment', createdById: admin.id },
+  });
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'WORKER', partyName: 'Floor wages — week 31', kind: 'BILL', amount: 86400, currency: 'INR', date: ago(7), ref: 'WK31', note: '18 workers × 6 days', createdById: admin.id },
+  });
+  await prisma.ledgerEntry.create({
+    data: { partyType: 'WORKER', partyName: 'Floor wages — week 31', kind: 'PAYMENT', amount: 86400, currency: 'INR', date: ago(6), ref: 'CASH WK31', createdById: admin.id },
+  });
+
+  // Document counters continue from what the demo used.
+  await prisma.docSequence.update({ where: { key: 'PI' }, data: { lastNo: piNo } });
+  await prisma.docSequence.update({ where: { key: 'ORD' }, data: { lastNo: ordNo } });
+  await prisma.docSequence.update({ where: { key: 'OP' }, data: { lastNo: opNo } });
+
+  console.log(`  ${photoCount} hand-over photos, ${opNo} material sheets`);
+  console.log('\nOrder values:');
+  for (const [n, v, c] of [
+    [ord1.number, v1, 'GBP'],
+    [ord2.number, v2, 'USD'],
+    [ord3.number, v3, 'EUR'],
+    [ord4.number, v4, 'GBP'],
+  ] as [string, number, string][]) {
+    console.log(`  ${n}  ${c} ${v.toLocaleString('en-IN')}`);
+  }
+  console.log('\nDemo ready.  admin@saraswati.local / admin123');
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+  })
+  .finally(() => prisma.$disconnect());

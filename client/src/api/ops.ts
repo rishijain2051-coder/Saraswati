@@ -431,6 +431,8 @@ export interface PartyRow {
 }
 
 export interface StatementRow {
+  /** Stable identity, supplied by the server. */
+  key: string;
   date: string;
   type: 'ACCRUAL' | 'BILL' | 'INVOICE' | 'PAYMENT' | 'RECEIPT';
   description: string;

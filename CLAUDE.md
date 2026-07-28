@@ -185,6 +185,18 @@ npm run dev          # server :4000 + client :5173
 npm run build        # type-check + build both (run before declaring done)
 ```
 
+```bash
+npm run db:demo      # rebuild the investor demo (wipes operational data first)
+```
+
+`prisma/demoSeed.ts` builds a whole factory mid-season — 10 photographed products
+with real costing, three buyers in GBP/USD/EUR, proformas at every stage of the sales
+cycle, four orders at different points of production (mid-line outsourcing, a QC
+rejection, hand-over photos), and a money position that demonstrates FIFO settlement
+and credit on account. Photos live in `prisma/demo/assets/` (web-sized, tracked) and
+are copied into `uploads/` on seed, exactly as an upload would be. It clears
+operational data first but leaves configuration alone, so it is safe to re-run.
+
 `npm run build` runs `prisma generate`, which on Windows fails with `EPERM … rename
 query_engine-windows.dll.node` while a dev server holds the engine — stop `npm run dev`
 first. The seed is idempotent: it leaves the demo product `AB-00123` alone once it

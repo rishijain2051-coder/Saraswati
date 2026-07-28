@@ -215,6 +215,8 @@ export function jobworkTotalForLine(line: LineForEvents): number {
 // ---------------------------------------------------------------------------
 
 export interface StatementRow {
+  /** Stable identity for the row, so the UI never keys off an array index. */
+  key: string;
   date: Date | string;
   type: 'ACCRUAL' | 'BILL' | 'INVOICE' | 'PAYMENT' | 'RECEIPT';
   description: string;
@@ -229,12 +231,12 @@ export interface StatementRow {
 }
 
 /** Merge charges and settlements into one dated statement with a running balance. */
-export function buildStatement(rows: Omit<StatementRow, 'balance'>[]): StatementRow[] {
+export function buildStatement(rows: Omit<StatementRow, 'balance' | 'key'>[]): StatementRow[] {
   let balance = 0;
   return [...rows]
     .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-    .map((r) => {
+    .map((r, i) => {
       balance = round(balance + r.charge - r.settle);
-      return { ...r, balance };
+      return { ...r, key: `${r.type}-${i}-${new Date(r.date).getTime()}`, balance };
     });
 }

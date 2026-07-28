@@ -181,7 +181,7 @@ export default function PartyStatementPage() {
                   {
                     key: 'statement',
                     label: 'Statement',
-                    children: <Table<StatementRow> rowKey={(r, i) => `${r.date}-${i}`} size="small" columns={statementCols(c.symbol)} dataSource={c.statement} pagination={false} scroll={{ x: 900 }} />,
+                    children: <Table<StatementRow> rowKey="key" size="small" columns={statementCols(c.symbol)} dataSource={c.statement} pagination={false} scroll={{ x: 900 }} />,
                   },
                   {
                     key: 'orders',
@@ -305,7 +305,7 @@ export default function PartyStatementPage() {
             {
               key: 'statement',
               label: 'Statement',
-              children: <Table<StatementRow> rowKey={(r, i) => `${r.date}-${i}`} size="small" columns={statementCols(symbol)} dataSource={data.statement ?? []} pagination={false} scroll={{ x: 950 }} />,
+              children: <Table<StatementRow> rowKey="key" size="small" columns={statementCols(symbol)} dataSource={data.statement ?? []} pagination={false} scroll={{ x: 950 }} />,
             },
             ...(isJobwork
               ? [
