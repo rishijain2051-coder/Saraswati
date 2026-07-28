@@ -13,14 +13,16 @@ const { Title, Text } = Typography;
 
 const RELATION_LABEL: Record<string, string> = { VARIANT: 'Variant', PART: 'Part / Component', ACCESSORY: 'Accessory', SET: 'Same Set' };
 
-export default function ProductDetailPage() {
+export default function ProductDetailPage({ catalogueMode = false }: { catalogueMode?: boolean } = {}) {
   const { id } = useParams();
   const navigate = useNavigate();
   const { hasRole } = useAuth();
   const { data: p, isLoading, isError } = useProduct(id);
 
+  const backTo = catalogueMode ? '/products/catalogue' : '/products/list';
+
   if (isLoading) return <Skeleton active paragraph={{ rows: 8 }} />;
-  if (isError || !p) return <Result status="404" title="Product not found" extra={<Button onClick={() => navigate('/products/list')}>Back to list</Button>} />;
+  if (isError || !p) return <Result status="404" title="Product not found" extra={<Button onClick={() => navigate(backTo)}>Back</Button>} />;
 
   const symbol = p.costSheet?.currency?.symbol ?? '₹';
   const dim = (l?: number | null, w?: number | null, h?: number | null) =>
@@ -74,7 +76,7 @@ export default function ProductDetailPage() {
             <Descriptions.Item label="Volume — after packing">{p.volumeAfterPackingCbm != null ? `${num(p.volumeAfterPackingCbm, 3)} CBM` : '—'}</Descriptions.Item>
           </Descriptions>
         </Card>
-        {p.costSheet?.summary && (
+        {!catalogueMode && p.costSheet?.summary && (
           <Card size="small" style={{ marginTop: 16, textAlign: 'center', background: '#efebe9' }}>
             <Text type="secondary">FOB Cost (per piece)</Text>
             <Title level={2} style={{ margin: '4px 0', color: '#4e342e' }}>{money(p.costSheet.summary.fob, symbol)}</Title>
@@ -111,7 +113,9 @@ export default function ProductDetailPage() {
         items={[
           { title: <Link to="/"><HomeOutlined /></Link> },
           { title: <Link to="/products">Product Management</Link> },
-          { title: <Link to="/products/list">Product Details</Link> },
+          catalogueMode
+            ? { title: <Link to="/products/catalogue">Product Catalogue</Link> }
+            : { title: <Link to="/products/list">Product Details</Link> },
           { title: p.factoryCode },
         ]}
       />
@@ -127,8 +131,10 @@ export default function ProductDetailPage() {
           </div>
         </div>
         <Space>
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/products/list')}>Back</Button>
-          {hasRole('Operator') && (
+          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate(backTo)}>
+            {catalogueMode ? 'Back to Catalogue' : 'Back'}
+          </Button>
+          {!catalogueMode && hasRole('Operator') && (
             <Button type="primary" icon={<EditOutlined />} onClick={() => navigate(`/products/${p.id}/edit`)}>
               Edit
             </Button>
@@ -140,16 +146,19 @@ export default function ProductDetailPage() {
         defaultActiveKey="details"
         items={[
           { key: 'details', label: 'Details', children: detailsTab },
-          {
-            key: 'costing',
-            label: 'Costing Sheet',
-            children: p.costSheet ? <CostingSheetView sheet={p.costSheet} symbol={symbol} /> : <Empty description="No costing sheet" />,
-          },
+          // Costing sheet is hidden in catalogue (price-free) mode.
+          ...(!catalogueMode
+            ? [{
+                key: 'costing',
+                label: 'Costing Sheet',
+                children: p.costSheet ? <CostingSheetView sheet={p.costSheet} symbol={symbol} /> : <Empty description="No costing sheet" />,
+              }]
+            : []),
           { key: 'related', label: `Related (${p.related.length})`, children: relatedTab },
           {
             key: 'images',
             label: `Images (${p.images.length})`,
-            children: <ProductImages productId={p.id} images={p.images} editable={hasRole('Operator')} />,
+            children: <ProductImages productId={p.id} images={p.images} editable={!catalogueMode && hasRole('Operator')} />,
           },
         ]}
       />

@@ -11,6 +11,7 @@ import ProductListPage from './pages/product/ProductListPage';
 import ProductDetailPage from './pages/product/ProductDetailPage';
 import ProductWizardPage from './pages/product/ProductWizardPage';
 import MastersPage from './pages/settings/MastersPage';
+import UsersPage from './pages/settings/UsersPage';
 import {
   TeamOutlined,
   InboxOutlined,
@@ -47,6 +48,7 @@ export default function AppRoutes() {
         {/* Product Management (Phase 1) */}
         <Route path="products" element={<ProductModuleHome />} />
         <Route path="products/catalogue" element={<ProductCataloguePage />} />
+        <Route path="products/catalogue/:id" element={<ProductDetailPage catalogueMode />} />
         <Route path="products/list" element={<ProductListPage />} />
         <Route path="products/new" element={<ProductWizardPage />} />
         <Route path="products/:id" element={<ProductDetailPage />} />
@@ -54,6 +56,7 @@ export default function AppRoutes() {
 
         {/* Settings */}
         <Route path="settings/masters" element={<MastersPage />} />
+        <Route path="settings/users" element={<UsersPage />} />
 
         {/* Placeholder modules (future phases) */}
         <Route

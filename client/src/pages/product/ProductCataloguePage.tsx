@@ -1,54 +1,40 @@
-import { Breadcrumb, Card, Table, Tag, Typography, Statistic, Row, Col } from 'antd';
-import { HomeOutlined } from '@ant-design/icons';
-import { Link } from 'react-router-dom';
+import { Breadcrumb, Card, Col, Empty, Input, Row, Skeleton, Tag, Typography } from 'antd';
+import { HomeOutlined, AppstoreOutlined } from '@ant-design/icons';
+import { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import type { ColumnsType } from 'antd/es/table';
 import { api } from '../../api/client';
 import { statusColor } from '../../util/format';
-import ProductThumb from '../../components/ProductThumb';
 import type { ProductSummary } from '../../api/types';
 
 const { Title, Text } = Typography;
 
+function SquareImage({ url }: { url?: string | null }) {
+  return (
+    <div style={{ aspectRatio: '1 / 1', width: '100%', overflow: 'hidden', background: '#efebe9', display: 'grid', placeItems: 'center' }}>
+      {url ? (
+        <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+      ) : (
+        <AppstoreOutlined style={{ fontSize: 40, color: '#bcaaa4' }} />
+      )}
+    </div>
+  );
+}
+
 export default function ProductCataloguePage() {
+  const navigate = useNavigate();
+  const [q, setQ] = useState('');
+
   const { data, isLoading } = useQuery({
     queryKey: ['catalogue'],
     queryFn: async () => (await api.get<ProductSummary[]>('/products/catalogue')).data,
   });
 
-  const rows = data ?? [];
-  const active = rows.filter((r) => r.status === 'Active').length;
-  const types = new Set(rows.map((r) => r.productType).filter(Boolean)).size;
-
-  const columns: ColumnsType<ProductSummary> = [
-    { title: '', dataIndex: 'primaryImage', width: 64, render: (u) => <ProductThumb url={u} size={48} /> },
-    {
-      title: 'Factory Code',
-      dataIndex: 'factoryCode',
-      render: (c, r) => <Link to={`/products/${r.id}`} style={{ fontWeight: 600 }}>{c}</Link>,
-      sorter: (a, b) => a.factoryCode.localeCompare(b.factoryCode),
-    },
-    {
-      title: 'Product',
-      dataIndex: 'name',
-      render: (name, r) => (
-        <div>
-          <div>{name}</div>
-          {r.alias && <Text type="secondary" style={{ fontSize: 12 }}>{r.alias}</Text>}
-        </div>
-      ),
-    },
-    { title: 'Type', dataIndex: 'productType', render: (v) => v || '—' },
-    { title: 'Size', dataIndex: 'size', render: (v) => v || '—' },
-    { title: 'Colour', dataIndex: 'colour', render: (v) => v || '—' },
-    { title: 'Material', dataIndex: 'material', render: (v) => v || '—' },
-    {
-      title: 'Buyer',
-      dataIndex: 'buyers',
-      render: (bs: ProductSummary['buyers']) => (bs[0] ? `${bs[0].code}${bs[0].buyerCode ? ` · ${bs[0].buyerCode}` : ''}` : '—'),
-    },
-    { title: 'Status', dataIndex: 'status', render: (s) => <Tag color={statusColor(s)}>{s}</Tag> },
-  ];
+  const rows = (data ?? []).filter((p) => {
+    if (!q.trim()) return true;
+    const s = q.toLowerCase();
+    return p.factoryCode.toLowerCase().includes(s) || p.name.toLowerCase().includes(s) || (p.alias ?? '').toLowerCase().includes(s);
+  });
 
   return (
     <div>
@@ -60,24 +46,42 @@ export default function ProductCataloguePage() {
           { title: 'Product Catalogue' },
         ]}
       />
-      <Title level={3}>Product Catalogue</Title>
-      <Text type="secondary">A visual, at-a-glance list of every product. Open any product for full details and costing.</Text>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginBottom: 16 }}>
+        <div>
+          <Title level={3} style={{ margin: 0 }}>Product Catalogue</Title>
+          <Text type="secondary">Tap any product to see its full specs. Click through — no prices here.</Text>
+        </div>
+        <Input.Search allowClear placeholder="Search code / name" style={{ width: 260 }} onChange={(e) => setQ(e.target.value)} />
+      </div>
 
-      <Row gutter={16} style={{ margin: '16px 0' }}>
-        <Col xs={8}><Card size="small"><Statistic title="Products" value={rows.length} /></Card></Col>
-        <Col xs={8}><Card size="small"><Statistic title="Active" value={active} /></Card></Col>
-        <Col xs={8}><Card size="small"><Statistic title="Product Types" value={types} /></Card></Col>
-      </Row>
-
-      <Table<ProductSummary>
-        rowKey="id"
-        size="small"
-        loading={isLoading}
-        columns={columns}
-        dataSource={rows}
-        pagination={{ pageSize: 25, showTotal: (t) => `${t} products` }}
-        scroll={{ x: 900 }}
-      />
+      {isLoading ? (
+        <Skeleton active />
+      ) : rows.length === 0 ? (
+        <Empty description="No products" />
+      ) : (
+        <Row gutter={[16, 16]}>
+          {rows.map((p) => (
+            <Col key={p.id} xs={12} sm={8} md={6} lg={6}>
+              <Card
+                hoverable
+                className="module-card"
+                styles={{ body: { padding: 12 } }}
+                cover={<SquareImage url={p.primaryImage} />}
+                onClick={() => navigate(`/products/catalogue/${p.id}`)}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 6 }}>
+                  <Text strong style={{ fontSize: 15 }}>{p.factoryCode}</Text>
+                  <Tag color={statusColor(p.status)} style={{ marginInlineEnd: 0 }}>{p.status}</Tag>
+                </div>
+                <div style={{ color: '#595959', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p.name}>
+                  {p.name}
+                </div>
+                {p.productType && <Text type="secondary" style={{ fontSize: 12 }}>{p.productType}{p.size ? ` · ${p.size}` : ''}</Text>}
+              </Card>
+            </Col>
+          ))}
+        </Row>
+      )}
     </div>
   );
 }

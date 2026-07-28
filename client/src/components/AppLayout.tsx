@@ -7,6 +7,7 @@ import {
   ToolOutlined,
   ShoppingOutlined,
   SettingOutlined,
+  UsergroupAddOutlined,
   LogoutOutlined,
   UserOutlined,
   ProfileOutlined,
@@ -39,6 +40,9 @@ export default function AppLayout() {
     { key: '/sales', icon: <ShoppingOutlined />, label: <Link to="/sales">Finished & Sales</Link> },
     ...(hasRole('Manager')
       ? [{ key: '/settings/masters', icon: <SettingOutlined />, label: <Link to="/settings/masters">Master Data</Link> }]
+      : []),
+    ...(hasRole('Admin')
+      ? [{ key: '/settings/users', icon: <UsergroupAddOutlined />, label: <Link to="/settings/users">Users</Link> }]
       : []),
   ];
 
