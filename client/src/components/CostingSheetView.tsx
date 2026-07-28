@@ -1,7 +1,7 @@
 import { Card, Col, Divider, Row, Table, Tag, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useMeta } from '../api/hooks';
-import { headColor, money, num } from '../util/format';
+import { headColor, money, num, formatUpdated } from '../util/format';
 import type { CostLine, CostSheet } from '../api/types';
 
 const { Text, Title } = Typography;
@@ -68,7 +68,10 @@ export default function CostingSheetView({ sheet, symbol = '₹' }: { sheet: Cos
 
       <Col xs={24} lg={8}>
         <Card style={{ position: 'sticky', top: 12 }}>
-          <Title level={4} style={{ marginTop: 0 }}>Cost Summary</Title>
+          <Title level={4} style={{ marginTop: 0, marginBottom: 2 }}>Cost Summary</Title>
+          <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 12 }}>
+            Prices last updated: {formatUpdated(sheet.updatedAt)}
+          </Text>
           {summary && (
             <>
               <Row justify="space-between"><Text>Ex-Factory Cost</Text><Text strong>{money(summary.exFactory, symbol)}</Text></Row>

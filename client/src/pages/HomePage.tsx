@@ -1,7 +1,6 @@
 import { Card, Col, Row, Typography, Tag } from 'antd';
 import {
   TeamOutlined,
-  InboxOutlined,
   AppstoreOutlined,
   ToolOutlined,
   ShoppingOutlined,
@@ -13,10 +12,9 @@ const { Title, Text } = Typography;
 
 const MODULES = [
   { key: 'manforce', title: 'Manforce Management', icon: <TeamOutlined />, path: '/manforce', ready: false, desc: 'Workers, attendance, wages & productivity.' },
-  { key: 'raw', title: 'Raw Material Management', icon: <InboxOutlined />, path: '/raw-material', ready: false, desc: 'Stock, purchases & material consumption.' },
   { key: 'product', title: 'Product Management', icon: <AppstoreOutlined />, path: '/products', ready: true, desc: 'Catalogue, product details & costing sheets.' },
-  { key: 'operations', title: 'Operations Management', icon: <ToolOutlined />, path: '/operations', ready: false, desc: 'Operation sheets, jobs & production.' },
-  { key: 'sales', title: 'Finished Product & Sales', icon: <ShoppingOutlined />, path: '/sales', ready: false, desc: 'Finished goods, orders, containers & sales.' },
+  { key: 'operations', title: 'Operations Management', icon: <ToolOutlined />, path: '/operations', ready: true, desc: 'Orders, proformas, suppliers, stock, operation sheets, jobs & payments.' },
+  { key: 'sales', title: 'Finished Product & Sales', icon: <ShoppingOutlined />, path: '/sales', ready: false, desc: 'Finished goods, dispatch, containers & sales.' },
 ];
 
 export default function HomePage() {

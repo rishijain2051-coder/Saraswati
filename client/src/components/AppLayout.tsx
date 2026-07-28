@@ -12,6 +12,11 @@ import {
   UserOutlined,
   ProfileOutlined,
   TableOutlined,
+  DashboardOutlined,
+  FileDoneOutlined,
+  FileTextOutlined,
+  ShopOutlined,
+  WalletOutlined,
 } from '@ant-design/icons';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
@@ -35,8 +40,20 @@ export default function AppLayout() {
       ],
     },
     { key: '/manforce', icon: <TeamOutlined />, label: <Link to="/manforce">Manforce</Link> },
-    { key: '/raw-material', icon: <InboxOutlined />, label: <Link to="/raw-material">Raw Material</Link> },
-    { key: '/operations', icon: <ToolOutlined />, label: <Link to="/operations">Operations</Link> },
+    {
+      key: 'operations',
+      icon: <ToolOutlined />,
+      label: 'Operations',
+      children: [
+        { key: '/operations', icon: <DashboardOutlined />, label: <Link to="/operations">Dashboard</Link> },
+        { key: '/operations/orders', icon: <FileDoneOutlined />, label: <Link to="/operations/orders">Orders</Link> },
+        { key: '/operations/proformas', icon: <FileTextOutlined />, label: <Link to="/operations/proformas">Proformas</Link> },
+        { key: '/operations/suppliers', icon: <ShopOutlined />, label: <Link to="/operations/suppliers">Suppliers</Link> },
+        { key: '/operations/stock', icon: <InboxOutlined />, label: <Link to="/operations/stock">Stock</Link> },
+        { key: '/operations/sheets', icon: <ProfileOutlined />, label: <Link to="/operations/sheets">Operation Sheets</Link> },
+        { key: '/operations/payments', icon: <WalletOutlined />, label: <Link to="/operations/payments">Payments</Link> },
+      ],
+    },
     { key: '/sales', icon: <ShoppingOutlined />, label: <Link to="/sales">Finished & Sales</Link> },
     ...(hasRole('Manager')
       ? [{ key: '/settings/masters', icon: <SettingOutlined />, label: <Link to="/settings/masters">Master Data</Link> }]
@@ -51,6 +68,11 @@ export default function AppLayout() {
     if (p.startsWith('/products/catalogue')) return ['/products/catalogue'];
     if (p.startsWith('/products')) return ['/products/list'];
     if (p.startsWith('/settings/masters')) return ['/settings/masters'];
+    // Operations sub-sections — match the deepest section key.
+    for (const seg of ['orders', 'proformas', 'suppliers', 'stock', 'sheets', 'payments']) {
+      if (p.startsWith(`/operations/${seg}`)) return [`/operations/${seg}`];
+    }
+    if (p === '/operations') return ['/operations'];
     return [p];
   })();
 
@@ -80,7 +102,7 @@ export default function AppLayout() {
       </Header>
       <Layout>
         <Sider width={230} breakpoint="lg" collapsedWidth={0} theme="dark">
-          <Menu theme="dark" mode="inline" selectedKeys={selected} defaultOpenKeys={['products']} items={items} style={{ paddingTop: 8 }} />
+          <Menu theme="dark" mode="inline" selectedKeys={selected} defaultOpenKeys={['products', 'operations']} items={items} style={{ paddingTop: 8 }} />
         </Sider>
         <Content style={{ padding: 24, overflow: 'auto' }}>
           <Outlet />

@@ -35,3 +35,47 @@ body {
   font-weight: 600;
   letter-spacing: 0.4px;
 }
+
+/* Print / Save-as-PDF: show only the .print-area */
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+  .print-area,
+  .print-area * {
+    visibility: visible !important;
+  }
+  .print-area {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    padding: 0 8px;
+  }
+  .no-print {
+    display: none !important;
+  }
+}
+
+.doc-sheet {
+  background: #fff;
+  border: 1px solid #eee;
+  padding: 28px 32px;
+  max-width: 820px;
+  margin: 0 auto;
+}
+.doc-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+}
+.doc-table th,
+.doc-table td {
+  border: 1px solid #ddd;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+.doc-table th {
+  background: #efebe9;
+  text-align: left;
+}

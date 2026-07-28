@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Switch, Table, Tag, App } from 'antd';
+import { Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tag, App } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ColumnsType } from 'antd/es/table';
@@ -8,11 +8,13 @@ import { api, apiError } from '../api/client';
 export interface FieldDef {
   name: string;
   label: string;
-  type: 'text' | 'number' | 'switch';
+  type: 'text' | 'number' | 'switch' | 'select';
   required?: boolean;
   step?: number;
   defaultValue?: unknown;
   width?: number;
+  options?: { label: string; value: string | number }[];
+  hideInTable?: boolean;
 }
 
 interface Row {
@@ -83,15 +85,18 @@ export default function MasterCrud({
   };
 
   const columns: ColumnsType<Row> = [
-    ...fields.map((f) => ({
-      title: f.label,
-      dataIndex: f.name,
-      width: f.width,
-      render: (v: unknown) => {
-        if (f.type === 'switch') return v ? <Tag color="green">Yes</Tag> : <Tag>No</Tag>;
-        return v == null || v === '' ? '—' : String(v);
-      },
-    })),
+    ...fields
+      .filter((f) => !f.hideInTable)
+      .map((f) => ({
+        title: f.label,
+        dataIndex: f.name,
+        width: f.width,
+        render: (v: unknown) => {
+          if (f.type === 'switch') return v ? <Tag color="green">Yes</Tag> : <Tag>No</Tag>;
+          if (f.type === 'select') return v == null || v === '' ? '—' : <Tag>{String(v)}</Tag>;
+          return v == null || v === '' ? '—' : String(v);
+        },
+      })),
     {
       title: 'Actions',
       key: 'actions',
@@ -131,7 +136,15 @@ export default function MasterCrud({
               valuePropName={f.type === 'switch' ? 'checked' : 'value'}
               rules={f.required ? [{ required: true, message: `${f.label} is required` }] : undefined}
             >
-              {f.type === 'switch' ? <Switch /> : f.type === 'number' ? <InputNumber style={{ width: '100%' }} step={f.step ?? 1} /> : <Input />}
+              {f.type === 'switch' ? (
+                <Switch />
+              ) : f.type === 'number' ? (
+                <InputNumber style={{ width: '100%' }} step={f.step ?? 1} />
+              ) : f.type === 'select' ? (
+                <Select options={f.options} />
+              ) : (
+                <Input />
+              )}
             </Form.Item>
           ))}
         </Form>

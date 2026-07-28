@@ -12,10 +12,20 @@ import ProductDetailPage from './pages/product/ProductDetailPage';
 import ProductWizardPage from './pages/product/ProductWizardPage';
 import MastersPage from './pages/settings/MastersPage';
 import UsersPage from './pages/settings/UsersPage';
+import OperationsHome from './pages/operations/OperationsHome';
+import OrdersPage from './pages/operations/OrdersPage';
+import OrderEditPage from './pages/operations/OrderEditPage';
+import OrderDetailPage from './pages/operations/OrderDetailPage';
+import ProformasPage from './pages/operations/ProformasPage';
+import ProformaEditPage from './pages/operations/ProformaEditPage';
+import ProformaDetailPage from './pages/operations/ProformaDetailPage';
+import SuppliersPage from './pages/operations/SuppliersPage';
+import StockPage from './pages/operations/StockPage';
+import SheetsPage from './pages/operations/SheetsPage';
+import SheetDetailPage from './pages/operations/SheetDetailPage';
+import PaymentsPage from './pages/operations/PaymentsPage';
 import {
   TeamOutlined,
-  InboxOutlined,
-  ToolOutlined,
   ShoppingOutlined,
 } from '@ant-design/icons';
 
@@ -58,23 +68,25 @@ export default function AppRoutes() {
         <Route path="settings/masters" element={<MastersPage />} />
         <Route path="settings/users" element={<UsersPage />} />
 
+        {/* Operations (Phase 2) */}
+        <Route path="operations" element={<OperationsHome />} />
+        <Route path="operations/orders" element={<OrdersPage />} />
+        <Route path="operations/orders/new" element={<OrderEditPage />} />
+        <Route path="operations/orders/:id" element={<OrderDetailPage />} />
+        <Route path="operations/orders/:id/edit" element={<OrderEditPage />} />
+        <Route path="operations/proformas" element={<ProformasPage />} />
+        <Route path="operations/proformas/new" element={<ProformaEditPage />} />
+        <Route path="operations/proformas/:id" element={<ProformaDetailPage />} />
+        <Route path="operations/proformas/:id/edit" element={<ProformaEditPage />} />
+        <Route path="operations/suppliers" element={<SuppliersPage />} />
+        <Route path="operations/stock" element={<StockPage />} />
+        <Route path="operations/sheets" element={<SheetsPage />} />
+        <Route path="operations/sheets/:id" element={<SheetDetailPage />} />
+        <Route path="operations/payments" element={<PaymentsPage />} />
+
         {/* Placeholder modules (future phases) */}
-        <Route
-          path="manforce"
-          element={<PlaceholderModule title="Manforce Management" icon={<TeamOutlined />} />}
-        />
-        <Route
-          path="raw-material"
-          element={<PlaceholderModule title="Raw Material Management" icon={<InboxOutlined />} />}
-        />
-        <Route
-          path="operations"
-          element={<PlaceholderModule title="Operations Management" icon={<ToolOutlined />} />}
-        />
-        <Route
-          path="sales"
-          element={<PlaceholderModule title="Finished Product & Sales Management" icon={<ShoppingOutlined />} />}
-        />
+        <Route path="manforce" element={<PlaceholderModule title="Manforce Management" icon={<TeamOutlined />} />} />
+        <Route path="sales" element={<PlaceholderModule title="Finished Product & Sales Management" icon={<ShoppingOutlined />} />} />
 
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

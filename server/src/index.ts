@@ -10,6 +10,9 @@ import metaRoutes from './routes/meta.routes';
 import usersRoutes from './routes/users.routes';
 import mastersRoutes from './routes/masters.routes';
 import productsRoutes from './routes/products.routes';
+import opsSuppliersRoutes from './routes/ops.suppliers.routes';
+import opsOrdersRoutes from './routes/ops.orders.routes';
+import opsProductionRoutes from './routes/ops.production.routes';
 
 const app = express();
 
@@ -27,6 +30,9 @@ app.use('/api/meta', authenticate, metaRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api', mastersRoutes);
 app.use('/api/products', productsRoutes);
+app.use('/api', opsSuppliersRoutes);
+app.use('/api', opsOrdersRoutes);
+app.use('/api', opsProductionRoutes);
 
 app.use(errorHandler);
 

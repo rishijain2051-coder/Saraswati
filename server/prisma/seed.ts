@@ -232,6 +232,45 @@ async function main() {
     },
   });
 
+  // --- Operations reference data ------------------------------------------
+  const sequences = [
+    { key: 'PI', prefix: 'PI', useYear: true },
+    { key: 'ORD', prefix: 'ORD', useYear: true },
+    { key: 'OP', prefix: 'OP', useYear: false },
+    { key: 'PO', prefix: 'PO', useYear: false },
+  ];
+  for (const s of sequences) {
+    await prisma.docSequence.upsert({ where: { key: s.key }, update: { prefix: s.prefix, useYear: s.useYear }, create: s });
+  }
+
+  const suppliers = [
+    { code: 'SUP-WOOD', name: 'Sharma Timber Traders', type: 'MATERIAL', contactName: 'Ramesh Sharma', phone: '+91 98290 11111', gstNo: '08ABCDE1234F1Z5', address: 'Jodhpur, Rajasthan', paymentTerms: '30 days' },
+    { code: 'SUP-METAL', name: 'Metal Craft Works', type: 'MATERIAL', contactName: 'Iqbal Khan', phone: '+91 98290 22222', gstNo: '08MNOPQ5678R1Z2', address: 'Jodhpur, Rajasthan', paymentTerms: '15 days' },
+    { code: 'JOB-POLISH', name: 'Glaze Polishing Co.', type: 'JOBWORK', contactName: 'Suresh', phone: '+91 98290 33333', address: 'Jodhpur, Rajasthan', paymentTerms: 'On delivery' },
+    { code: 'JOB-CARVE', name: 'Precision Carving', type: 'JOBWORK', contactName: 'Mohan Lal', phone: '+91 98290 44444', address: 'Jodhpur, Rajasthan', paymentTerms: 'On delivery' },
+  ];
+  for (const s of suppliers) {
+    await prisma.supplier.upsert({ where: { code: s.code }, update: s, create: s });
+  }
+
+  if ((await prisma.productionStageTemplate.count({ where: { productTypeId: null } })) === 0) {
+    const stages = ['Cutting', 'Assembly', 'Polishing', 'Packing'];
+    for (let i = 0; i < stages.length; i++) {
+      await prisma.productionStageTemplate.create({ data: { productTypeId: null, name: stages[i], sortOrder: i } });
+    }
+  }
+
+  const rawItems = [
+    { code: 'RM-MANGO', name: 'Mango Wood', category: 'Wood', unit: 'CFT', reorderLevel: 50, openingQty: 200 },
+    { code: 'RM-OAK', name: 'Oak Wood', category: 'Wood', unit: 'SQFT', reorderLevel: 40, openingQty: 120 },
+    { code: 'RM-IRON', name: 'Powdercoated Iron', category: 'Metal', unit: 'KGS', reorderLevel: 100, openingQty: 300 },
+    { code: 'RM-PLY6', name: 'Ply 6mm', category: 'Ply', unit: 'SQFT', reorderLevel: 60, openingQty: 90 },
+    { code: 'RM-GLASS', name: 'Glass 4mm', category: 'Glass', unit: 'SQFT', reorderLevel: 20, openingQty: 15 },
+  ];
+  for (const r of rawItems) {
+    await prisma.rawItem.upsert({ where: { code: r.code }, update: r, create: r });
+  }
+
   console.log('Seed complete.');
   console.log('  Admin login : admin@saraswati.local / admin123');
   console.log('  Manager login: manager@saraswati.local / manager123');

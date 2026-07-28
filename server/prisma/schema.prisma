@@ -45,6 +45,8 @@ model Currency {
   updatedAt  DateTime @updatedAt
 
   costSheets CostSheet[]
+  orders     Order[]
+  proformas  Proforma[]
 }
 
 model Unit {
@@ -74,6 +76,7 @@ model AttributeValue {
   productsColour   Product[] @relation("ProductColour")
   productsMaterial Product[] @relation("ProductMaterial")
   productsFinish   Product[] @relation("ProductFinish")
+  stageTemplates   ProductionStageTemplate[] @relation("StageTemplateProductType")
 
   @@unique([type, value])
 }
@@ -91,7 +94,10 @@ model Buyer {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  products ProductBuyer[]
+  products  ProductBuyer[]
+  orders    Order[]
+  proformas Proforma[]
+  ledger    LedgerEntry[]  @relation("BuyerLedger")
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +157,10 @@ model Product {
   images      ProductImage[]
   relatedFrom RelatedProduct[] @relation("RelatedFrom")
   relatedTo   RelatedProduct[] @relation("RelatedTo")
+
+  orderLines      OrderLine[]
+  proformaLines   ProformaLine[]
+  operationSheets OperationSheet[]
 
   @@index([productTypeId])
   @@index([status])
@@ -284,4 +294,204 @@ model CostLine {
   sortOrder Int     @default(0)
 
   group CostGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Operations module (Phase 2) — orders, proformas, suppliers, stock,
+// operation sheets, jobs/stages, payments. Raw Material folded in here.
+// ---------------------------------------------------------------------------
+
+model Supplier {
+  id           Int      @id @default(autoincrement())
+  code         String   @unique
+  name         String
+  type         String   @default("MATERIAL") // MATERIAL | JOBWORK | BOTH
+  contactName  String?
+  email        String?
+  phone        String?
+  gstNo        String?
+  address      String?
+  paymentTerms String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  stockTxns StockTxn[]
+  opStages  OpStage[]
+  ledger    LedgerEntry[] @relation("SupplierLedger")
+}
+
+model RawItem {
+  id           Int      @id @default(autoincrement())
+  code         String   @unique
+  name         String
+  category     String?
+  unit         String   @default("PCS")
+  reorderLevel Float    @default(0)
+  openingQty   Float    @default(0)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  txns StockTxn[]
+}
+
+model StockTxn {
+  id          Int      @id @default(autoincrement())
+  rawItemId   Int
+  type        String // IN | OUT
+  qty         Float
+  rate        Float    @default(0) // cost per unit (IN valuation)
+  supplierId  Int?
+  orderRef    String? // optional reference to an order number (for OUT)
+  note        String?
+  date        DateTime @default(now())
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  rawItem  RawItem   @relation(fields: [rawItemId], references: [id], onDelete: Cascade)
+  supplier Supplier? @relation(fields: [supplierId], references: [id])
+}
+
+model Order {
+  id           Int       @id @default(autoincrement())
+  number       String    @unique
+  buyerId      Int
+  currencyId   Int?
+  status       String    @default("Confirmed") // Confirmed|Production|Ready|Shipped|Closed|Cancelled
+  orderDate    DateTime  @default(now())
+  deliveryDate DateTime?
+  incoterms    String?
+  exchangeRate Float? // buyer currency rateToBase snapshot
+  notes        String?
+  proformaId   Int?      @unique
+  createdById  Int?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  buyer    Buyer            @relation(fields: [buyerId], references: [id])
+  currency Currency?        @relation(fields: [currencyId], references: [id])
+  proforma Proforma?        @relation("ProformaOrder", fields: [proformaId], references: [id])
+  lines    OrderLine[]
+  sheets   OperationSheet[]
+}
+
+model OrderLine {
+  id        Int   @id @default(autoincrement())
+  orderId   Int
+  productId Int
+  qty       Int   @default(1)
+  unitPrice Float @default(0) // in order currency
+  sortOrder Int   @default(0)
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+}
+
+model Proforma {
+  id            Int       @id @default(autoincrement())
+  number        String    @unique
+  buyerId       Int
+  currencyId    Int?
+  status        String    @default("Draft") // Draft|Sent|Accepted|Rejected
+  date          DateTime  @default(now())
+  validUntil    DateTime?
+  paymentTerms  String?
+  deliveryTerms String?
+  incoterms     String?
+  bankDetails   String?
+  notes         String?
+  exchangeRate  Float?
+  createdById   Int?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  buyer    Buyer          @relation(fields: [buyerId], references: [id])
+  currency Currency?      @relation(fields: [currencyId], references: [id])
+  lines    ProformaLine[]
+  order    Order?         @relation("ProformaOrder")
+}
+
+model ProformaLine {
+  id          Int    @id @default(autoincrement())
+  proformaId  Int
+  productId   Int?
+  description String
+  qty         Int    @default(1)
+  unitPrice   Float  @default(0)
+  sortOrder   Int    @default(0)
+
+  proforma Proforma @relation(fields: [proformaId], references: [id], onDelete: Cascade)
+  product  Product? @relation(fields: [productId], references: [id])
+}
+
+model OperationSheet {
+  id          Int      @id @default(autoincrement())
+  number      String   @unique
+  productId   Int
+  orderId     Int?
+  qty         Int      @default(1)
+  status      String   @default("Draft") // Draft|InProgress|Completed
+  notes       String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  product Product   @relation(fields: [productId], references: [id])
+  order   Order?    @relation(fields: [orderId], references: [id])
+  stages  OpStage[]
+}
+
+model OpStage {
+  id               Int     @id @default(autoincrement())
+  operationSheetId Int
+  name             String
+  sortOrder        Int     @default(0)
+  mode             String  @default("INHOUSE") // INHOUSE | OUTSOURCED
+  vendorId         Int?
+  jobworkCost      Float   @default(0)
+  status           String  @default("NOT_STARTED") // NOT_STARTED|IN_PROGRESS|DONE
+  qtyDone          Int     @default(0)
+  assignee         String? // worker name (Manforce master later)
+  note             String?
+
+  sheet  OperationSheet @relation(fields: [operationSheetId], references: [id], onDelete: Cascade)
+  vendor Supplier?      @relation(fields: [vendorId], references: [id])
+}
+
+model ProductionStageTemplate {
+  id            Int     @id @default(autoincrement())
+  productTypeId Int? // null = default template
+  name          String
+  sortOrder     Int     @default(0)
+  isActive      Boolean @default(true)
+
+  productType AttributeValue? @relation("StageTemplateProductType", fields: [productTypeId], references: [id])
+}
+
+model LedgerEntry {
+  id          Int      @id @default(autoincrement())
+  partyType   String // SUPPLIER | JOBWORK | BUYER | WORKER
+  supplierId  Int?
+  buyerId     Int?
+  partyName   String // snapshot / for WORKER
+  kind        String // BILL | PAYMENT
+  amount      Float
+  currency    String?  @default("INR")
+  date        DateTime @default(now())
+  ref         String?
+  note        String?
+  createdById Int?
+  createdAt   DateTime @default(now())
+
+  supplier Supplier? @relation("SupplierLedger", fields: [supplierId], references: [id])
+  buyer    Buyer?    @relation("BuyerLedger", fields: [buyerId], references: [id])
+}
+
+model DocSequence {
+  id      Int     @id @default(autoincrement())
+  key     String  @unique // PI | ORD | OP | PO
+  prefix  String
+  useYear Boolean @default(false)
+  lastNo  Int     @default(0)
 }

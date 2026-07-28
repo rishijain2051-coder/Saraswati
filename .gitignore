@@ -24,3 +24,6 @@ coverage/
 
 # Office temp lock files
 ~$*
+
+# db backups
+*.bak

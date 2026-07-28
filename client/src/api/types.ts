@@ -118,6 +118,8 @@ export interface CostSheet {
   notes?: string | null;
   groups: CostGroup[];
   summary?: CostSummary;
+  updatedAt?: string;
+  createdAt?: string;
 }
 
 export interface ProductBuyerLink {
