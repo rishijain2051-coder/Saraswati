@@ -21,3 +21,6 @@ server/uploads/*
 .DS_Store
 .vite/
 coverage/
+
+# Office temp lock files
+~$*
