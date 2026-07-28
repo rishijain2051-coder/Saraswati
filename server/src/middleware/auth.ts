@@ -21,10 +21,30 @@ export const ROLE_RANK: Record<string, number> = {
   Admin: 4,
 };
 
+/** Name of the httpOnly cookie that lets `<img>` requests reach /uploads. */
+export const SESSION_COOKIE = 'saraswati_session';
+
 /** Require a valid bearer token; attaches req.user. */
 export function authenticate(req: Request, _res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
+  if (!token) return next(new ApiError(401, 'Not authenticated'));
+  try {
+    req.user = verifyToken(token);
+    next();
+  } catch {
+    next(new ApiError(401, 'Invalid or expired session. Please sign in again.'));
+  }
+}
+
+/**
+ * Same check for uploaded files, but a cookie is accepted as well as a header.
+ * A browser loading `<img src="/uploads/…">` cannot attach an Authorization header,
+ * so login issues an httpOnly session cookie purely for this path.
+ */
+export function authenticateUpload(req: Request, _res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  const token = (header?.startsWith('Bearer ') ? header.slice(7) : undefined) ?? (req.cookies?.[SESSION_COOKIE] as string | undefined);
   if (!token) return next(new ApiError(401, 'Not authenticated'));
   try {
     req.user = verifyToken(token);

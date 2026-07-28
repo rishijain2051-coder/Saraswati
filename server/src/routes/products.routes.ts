@@ -2,38 +2,21 @@ import { Router } from 'express';
 import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
-import multer from 'multer';
-import { nanoid } from 'nanoid';
 import { prisma } from '../db';
 import { ApiError, asyncHandler } from '../lib/http';
 import { authenticate, requireRole } from '../middleware/auth';
 import { computeCostSheet } from '../lib/productCosting';
 import { loadMethodMap } from '../lib/methods';
 import type { MethodMap } from '../lib/costing';
+import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
 
 const router = Router();
 router.use(authenticate);
 
 const canEdit = requireRole('Operator');
 
-// ---------------------------------------------------------------------------
-// Image upload storage
-// ---------------------------------------------------------------------------
-
-const uploadDir = path.join(__dirname, '..', '..', 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
-
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadDir),
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase();
-      cb(null, `${Date.now()}-${nanoid(8)}${ext}`);
-    },
-  }),
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => cb(null, /^image\//.test(file.mimetype)),
-});
+// Image upload storage — see lib/imageUpload.ts for why contents are checked.
+const upload = imageUploader('');
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -404,6 +387,20 @@ router.delete(
   requireRole('Manager'),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const product = await prisma.product.findUnique({ where: { id }, select: { factoryCode: true, name: true } });
+    if (!product) throw new ApiError(404, 'Product not found.');
+
+    // Say what is in the way instead of letting a foreign key surface as a 500.
+    const [orderLines, proformaLines, sheets] = await Promise.all([
+      prisma.orderLine.count({ where: { productId: id } }),
+      prisma.proformaLine.count({ where: { productId: id } }),
+      prisma.operationSheet.count({ where: { productId: id } }),
+    ]);
+    if (orderLines + proformaLines + sheets > 0) {
+      const bits = [orderLines && `${orderLines} order line(s)`, proformaLines && `${proformaLines} proforma line(s)`, sheets && `${sheets} material sheet(s)`].filter(Boolean).join(', ');
+      throw new ApiError(409, `${product.factoryCode} is used by ${bits}. Set it to Discontinued instead of deleting.`);
+    }
+
     const images = await prisma.productImage.findMany({ where: { productId: id } });
     await prisma.product.delete({ where: { id } });
     for (const img of images) {
@@ -426,8 +423,8 @@ router.post(
     const id = Number(req.params.id);
     const product = await prisma.product.findUnique({ where: { id }, include: { images: true } });
     if (!product) throw new ApiError(404, 'Product not found.');
-    const files = (req.files as Express.Multer.File[]) || [];
-    if (files.length === 0) throw new ApiError(400, 'No image files received.');
+    // Contents are checked, not just the declared mimetype.
+    const files = keepRealImages((req.files as Express.Multer.File[]) || []);
 
     let hasPrimary = product.images.some((i) => i.isPrimary);
     let order = product.images.length;

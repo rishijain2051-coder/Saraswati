@@ -184,6 +184,32 @@ npm --workspace server run db:studio   # browse the database
 `npm run build` runs `prisma generate`, which on Windows cannot replace its query
 engine while a dev server is holding it — stop `npm run dev` first.
 
+## Security
+
+- **`JWT_SECRET` is required in production** and rejected if it is a placeholder or
+  under 32 characters. In development, leaving it blank generates a random secret per
+  boot rather than falling back to a value committed in the source.
+- **CORS is an allowlist**, not `*`. Development defaults to the Vite dev server;
+  production reads `CORS_ORIGINS`.
+- **Uploads are not public.** Product photos and hand-over shots sit behind the same
+  authentication as the API. Because an `<img>` tag cannot send an Authorization
+  header, login also issues an httpOnly session cookie used only for `/uploads`, and
+  files are served with `nosniff` and a restrictive CSP.
+- **Uploads are checked by content, not by their declared type.** A file's magic bytes
+  must really be JPEG, PNG, GIF or WebP; anything else is deleted on arrival, so a
+  renamed script cannot be parked in a directory the browser fetches from.
+- **Sign-in attempts are throttled** per IP and e-mail.
+- **Document numbers are allocated atomically**, so simultaneous order or proforma
+  creation cannot mint the same number twice.
+- **Piece movements are validated inside the write transaction**, so two clearances of
+  the same pieces cannot both succeed.
+- Anyone can rotate their own password from the account menu; the last active Admin
+  cannot be demoted, deactivated or deleted.
+- `npm run verify` and the delete guards throughout are there to keep these true —
+  run it before shipping.
+
+Copy `server/.env.example` to `server/.env` before deploying.
+
 ## Notes and limits
 
 - **Stock is deliberately decoupled from production.** Material sheets say what a job
@@ -192,5 +218,13 @@ engine while a dev server is holding it — stop `npm run dev` first.
 - **Wages are recorded against a typed worker name** until the Manforce module lands,
   so a spelling change starts a new account.
 - **Receivables convert at the rate snapshotted on the order**, not today's rate.
+- **Money is stored as `Float`** and rounded at every boundary by a shared `round()`
+  helper (mirrored on the client, asserted in `npm run verify`). Exact decimal storage
+  would mean integer paisa throughout; the rounding discipline is what holds the
+  totals together today.
+- **The login token lives in `localStorage`**, which is readable by any script on the
+  page. The defence is that there is no way to get a script onto the page: uploads are
+  content-checked and served with `nosniff`. Moving to a cookie-only session would
+  need CSRF protection across every mutating route.
 - `mailto:` cannot attach a file — that is a limit of the URI scheme, not a bug; the
   `.eml` draft exists for exactly this reason.

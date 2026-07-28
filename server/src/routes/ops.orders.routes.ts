@@ -2,8 +2,6 @@ import { Router } from 'express';
 import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
-import multer from 'multer';
-import { nanoid } from 'nanoid';
 import { prisma } from '../db';
 import { ApiError, asyncHandler } from '../lib/http';
 import { authenticate, requireRole } from '../middleware/auth';
@@ -15,24 +13,15 @@ import { buildBoard, expandHops, MOVE_KINDS, validateMove, type MoveRow } from '
 import { loadOrder, loadSerializedOrder, materializeStages, orderInclude, resolveStageLineId, serializeOrders, syncOrderStatus } from '../lib/orderBoard';
 import { proformaPdf } from '../lib/docPdf';
 import { buildEml, mailtoUrl, proformaMail } from '../lib/mailDraft';
+import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
 
 const router = Router();
 router.use(authenticate);
 const canEdit = requireRole('Operator');
 const canManage = requireRole('Manager');
 
-// Hand-over photos share the product-image upload folder, served at /uploads.
-const uploadDir = path.join(__dirname, '..', '..', 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
-
-const uploadPhotos = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadDir),
-    filename: (_req, file, cb) => cb(null, `move-${Date.now()}-${nanoid(8)}${path.extname(file.originalname).toLowerCase()}`),
-  }),
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => cb(null, /^image\//.test(file.mimetype)),
-});
+// Hand-over photos share the product-image folder, served at /uploads behind auth.
+const uploadPhotos = imageUploader('move-');
 
 export const ORDER_STATUSES = ['Confirmed', 'Production', 'Ready', 'Shipped', 'Closed', 'Cancelled'] as const;
 export const PROFORMA_STATUSES = ['Draft', 'Sent', 'Accepted', 'Rejected'] as const;
@@ -421,8 +410,7 @@ router.post(
     const moveId = Number(req.params.id);
     const move = await prisma.stageMove.findUnique({ where: { id: moveId }, include: { photos: true, orderLine: { select: { orderId: true } } } });
     if (!move) throw new ApiError(404, 'Movement not found.');
-    const files = (req.files as Express.Multer.File[]) ?? [];
-    if (files.length === 0) throw new ApiError(400, 'No images were uploaded.');
+    const files = keepRealImages((req.files as Express.Multer.File[]) ?? []);
 
     let order = move.photos.length;
     for (const file of files) {

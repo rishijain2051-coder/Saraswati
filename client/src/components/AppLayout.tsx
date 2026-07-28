@@ -1,4 +1,5 @@
-import { Layout, Menu, Avatar, Dropdown, Typography, Tag } from 'antd';
+import { useState } from 'react';
+import { App, Layout, Menu, Avatar, Dropdown, Typography, Tag, Modal, Form, Input } from 'antd';
 import {
   HomeOutlined,
   AppstoreOutlined,
@@ -9,6 +10,7 @@ import {
   SettingOutlined,
   UsergroupAddOutlined,
   LogoutOutlined,
+  KeyOutlined,
   UserOutlined,
   ProfileOutlined,
   TableOutlined,
@@ -20,13 +22,32 @@ import {
 } from '@ant-design/icons';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
+import { apiError } from '../api/client';
 
 const { Header, Sider, Content } = Layout;
 
 export default function AppLayout() {
-  const { user, logout, hasRole } = useAuth();
+  const { user, logout, hasRole, changePassword } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
+  const { message } = App.useApp();
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pwForm] = Form.useForm();
+  const [pwSaving, setPwSaving] = useState(false);
+
+  const submitPassword = async (v: { currentPassword: string; newPassword: string }) => {
+    setPwSaving(true);
+    try {
+      await changePassword(v.currentPassword, v.newPassword);
+      message.success('Password changed.');
+      setPwOpen(false);
+      pwForm.resetFields();
+    } catch (e) {
+      message.error(apiError(e));
+    } finally {
+      setPwSaving(false);
+    }
+  };
 
   const items = [
     { key: '/', icon: <HomeOutlined />, label: <Link to="/">Home</Link> },
@@ -90,6 +111,7 @@ export default function AppLayout() {
             items: [
               { key: 'role', disabled: true, label: <Tag color="#6d4c41">{user?.role}</Tag> },
               { type: 'divider' },
+              { key: 'password', icon: <KeyOutlined />, label: 'Change password', onClick: () => setPwOpen(true) },
               { key: 'logout', icon: <LogoutOutlined />, label: 'Sign out', onClick: () => { logout(); navigate('/login'); } },
             ],
           }}
@@ -108,6 +130,30 @@ export default function AppLayout() {
           <Outlet />
         </Content>
       </Layout>
+
+      <Modal title="Change password" open={pwOpen} onCancel={() => setPwOpen(false)} onOk={() => pwForm.submit()} confirmLoading={pwSaving} okText="Change" destroyOnHidden>
+        <Form form={pwForm} layout="vertical" onFinish={submitPassword} style={{ marginTop: 12 }}>
+          <Form.Item name="currentPassword" label="Current password" rules={[{ required: true, message: 'Enter your current password.' }]}>
+            <Input.Password autoComplete="current-password" />
+          </Form.Item>
+          <Form.Item name="newPassword" label="New password" rules={[{ required: true, min: 8, message: 'Use at least 8 characters.' }]}>
+            <Input.Password autoComplete="new-password" />
+          </Form.Item>
+          <Form.Item
+            name="confirm"
+            label="Confirm new password"
+            dependencies={['newPassword']}
+            rules={[
+              { required: true, message: 'Type it again.' },
+              ({ getFieldValue }) => ({
+                validator: (_, v) => (!v || v === getFieldValue('newPassword') ? Promise.resolve() : Promise.reject(new Error('The two passwords do not match.'))),
+              }),
+            ]}
+          >
+            <Input.Password autoComplete="new-password" />
+          </Form.Item>
+        </Form>
+      </Modal>
     </Layout>
   );
 }

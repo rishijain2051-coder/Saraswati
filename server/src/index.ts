@@ -4,7 +4,7 @@ import cookieParser from 'cookie-parser';
 import path from 'node:path';
 import { env } from './env';
 import { errorHandler } from './lib/http';
-import { authenticate } from './middleware/auth';
+import { authenticate, authenticateUpload } from './middleware/auth';
 import authRoutes from './routes/auth.routes';
 import metaRoutes from './routes/meta.routes';
 import usersRoutes from './routes/users.routes';
@@ -16,23 +16,55 @@ import opsProductionRoutes from './routes/ops.production.routes';
 
 const app = express();
 
-app.use(cors());
+// Only the app's own origins may call the API. Wide-open CORS would let any site a
+// logged-in user visits drive the ERP with their credentials.
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // same-origin, curl, server-to-server
+      cb(null, env.CORS_ORIGINS.includes(origin));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: '4mb' }));
 app.use(cookieParser());
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'saraswati-erp' }));
 
-// Serve uploaded product images.
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+/**
+ * Uploaded product photos and hand-over proof shots are business data, so they are
+ * not public files. `<img>` tags cannot send an Authorization header, which is why
+ * login also sets an httpOnly cookie — `authenticateUpload` accepts either.
+ *
+ * `nosniff` stops a file that slipped through as an image from being interpreted as
+ * HTML or script, and everything is served as an attachment-safe download rather
+ * than being rendered in place.
+ */
+app.use(
+  '/uploads',
+  authenticateUpload,
+  express.static(path.join(__dirname, '..', 'uploads'), {
+    index: false,
+    dotfiles: 'deny',
+    setHeaders: (res) => {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'");
+      res.setHeader('Cache-Control', 'private, max-age=300');
+    },
+  })
+);
 
+// Each router also applies `authenticate` internally; guarding at the mount as well
+// means a route added above that line cannot accidentally be published.
 app.use('/api/auth', authRoutes);
 app.use('/api/meta', authenticate, metaRoutes);
-app.use('/api/users', usersRoutes);
-app.use('/api', mastersRoutes);
-app.use('/api/products', productsRoutes);
-app.use('/api', opsSuppliersRoutes);
-app.use('/api', opsOrdersRoutes);
-app.use('/api', opsProductionRoutes);
+app.use('/api/users', authenticate, usersRoutes);
+app.use('/api', authenticate, mastersRoutes);
+app.use('/api/products', authenticate, productsRoutes);
+app.use('/api', authenticate, opsSuppliersRoutes);
+app.use('/api', authenticate, opsOrdersRoutes);
+app.use('/api', authenticate, opsProductionRoutes);
 
 app.use(errorHandler);
 

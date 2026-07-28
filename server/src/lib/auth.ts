@@ -18,7 +18,7 @@ export function verifyPassword(plain: string, hash: string): Promise<boolean> {
 }
 
 export function signToken(payload: JwtPayload): string {
-  return jwt.sign(payload, env.JWT_SECRET, { expiresIn: '12h' });
+  return jwt.sign(payload, env.JWT_SECRET, { expiresIn: env.TOKEN_TTL as jwt.SignOptions['expiresIn'] });
 }
 
 export function verifyToken(token: string): JwtPayload {

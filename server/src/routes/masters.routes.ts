@@ -70,7 +70,17 @@ router.delete(
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const cur = await prisma.currency.findUnique({ where: { id } });
-    if (cur?.isBase) throw new ApiError(400, 'Cannot delete the base currency.');
+    if (!cur) throw new ApiError(404, 'Currency not found.');
+    if (cur.isBase) throw new ApiError(400, 'Cannot delete the base currency.');
+    const [orders, proformas, sheets] = await Promise.all([
+      prisma.order.count({ where: { currencyId: id } }),
+      prisma.proforma.count({ where: { currencyId: id } }),
+      prisma.costSheet.count({ where: { currencyId: id } }),
+    ]);
+    if (orders + proformas + sheets > 0) {
+      const bits = [orders && `${orders} order(s)`, proformas && `${proformas} proforma(s)`, sheets && `${sheets} costing sheet(s)`].filter(Boolean).join(', ');
+      throw new ApiError(409, `${cur.code} is used by ${bits}. Deactivate it instead of deleting.`);
+    }
     await prisma.currency.delete({ where: { id } });
     res.status(204).end();
   })
@@ -147,7 +157,10 @@ router.delete(
   '/units/:id',
   canEdit,
   asyncHandler(async (req, res) => {
-    await prisma.unit.delete({ where: { id: Number(req.params.id) } });
+    const id = Number(req.params.id);
+    const inUse = await prisma.product.count({ where: { unitId: id } });
+    if (inUse > 0) throw new ApiError(409, `This unit is used by ${inUse} product(s). Deactivate it instead of deleting.`);
+    await prisma.unit.delete({ where: { id } });
     res.status(204).end();
   })
 );
@@ -207,7 +220,20 @@ router.delete(
   '/buyers/:id',
   canEdit,
   asyncHandler(async (req, res) => {
-    await prisma.buyer.delete({ where: { id: Number(req.params.id) } });
+    const id = Number(req.params.id);
+    const buyer = await prisma.buyer.findUnique({ where: { id } });
+    if (!buyer) throw new ApiError(404, 'Buyer not found.');
+    const [orders, proformas, products, ledger] = await Promise.all([
+      prisma.order.count({ where: { buyerId: id } }),
+      prisma.proforma.count({ where: { buyerId: id } }),
+      prisma.productBuyer.count({ where: { buyerId: id } }),
+      prisma.ledgerEntry.count({ where: { buyerId: id } }),
+    ]);
+    if (orders + proformas + products + ledger > 0) {
+      const bits = [orders && `${orders} order(s)`, proformas && `${proformas} proforma(s)`, products && `${products} product link(s)`, ledger && `${ledger} money entry/entries`].filter(Boolean).join(', ');
+      throw new ApiError(409, `${buyer.name} has ${bits}. Deactivate them instead of deleting.`);
+    }
+    await prisma.buyer.delete({ where: { id } });
     res.status(204).end();
   })
 );
@@ -259,7 +285,14 @@ router.delete(
   '/attributes/:id',
   canEdit,
   asyncHandler(async (req, res) => {
-    await prisma.attributeValue.delete({ where: { id: Number(req.params.id) } });
+    const id = Number(req.params.id);
+    const attr = await prisma.attributeValue.findUnique({ where: { id } });
+    if (!attr) throw new ApiError(404, 'Value not found.');
+    const inUse = await prisma.product.count({
+      where: { OR: [{ itemTypeId: id }, { productTypeId: id }, { sizeId: id }, { colourId: id }, { materialId: id }, { finishId: id }] },
+    });
+    if (inUse > 0) throw new ApiError(409, `"${attr.value}" is used by ${inUse} product(s). Deactivate it instead of deleting.`);
+    await prisma.attributeValue.delete({ where: { id } });
     res.status(204).end();
   })
 );

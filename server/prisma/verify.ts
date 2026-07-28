@@ -11,7 +11,7 @@
  * The board and allocation invariants are checked the same way: pure functions, fixed
  * inputs, expected outputs.
  */
-import { BUILTIN_METHODS, round, type MethodMap } from '../src/lib/costing';
+import { BUILTIN_METHODS, round, suggestCostDim, type MethodMap } from '../src/lib/costing';
 import { computeCostSheet } from '../src/lib/productCosting';
 import { rowToMethodDef } from '../src/lib/methods';
 import { buildBoard, expandHops, validateMove, type MoveRow, type StageRow } from '../src/lib/production';
@@ -223,6 +223,21 @@ const st = buildStatement([
 ]);
 check('running balance walks the rows', st.map((r) => r.balance), [1000, 600, 1100]);
 check('rows carry a stable key', st.every((r) => typeof r.key === 'string' && r.key.length > 0), true);
+
+// ---------------------------------------------------------------------------
+// 5. Rounding — the same helper decides every money figure on both sides
+// ---------------------------------------------------------------------------
+
+console.log('\n--- rounding ---');
+check('near-tie rounds up', round(1.005), 1.01);
+check('negatives round symmetrically', round(-1.005), -1.01);
+check('a negative is the mirror of its positive', round(-2.675), -round(2.675));
+check('plain values are untouched', [round(0), round(12.34), round(-12.34)], [0, 12.34, -12.34]);
+check('three decimals work too', round(1.0005, 3), 1.001);
+check('infinities pass through', [round(Infinity), round(-Infinity)], [Infinity, -Infinity]);
+// The client mirrors this exactly; suggestCostDim must agree with the server.
+check('cost-dim suggestion matches the server rule', suggestCostDim(25, 20), round(25 * 1.2, 3));
+check('a thousand small amounts still add up', round(Array.from({ length: 1000 }, () => 0.01).reduce((a, b) => round(a + b), 0)), 10);
 
 console.log(failed === 0 ? '\nALL SELF-CHECKS PASSED' : `\n${failed} SELF-CHECK(S) FAILED`);
 if (failed) process.exitCode = 1;

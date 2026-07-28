@@ -2,7 +2,9 @@ import axios from 'axios';
 
 export const TOKEN_KEY = 'saraswati_erp_token';
 
-export const api = axios.create({ baseURL: '/api' });
+// `withCredentials` lets the httpOnly session cookie ride along; it is what allows
+// <img src="/uploads/…"> to load files that are no longer served publicly.
+export const api = axios.create({ baseURL: '/api', withCredentials: true });
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem(TOKEN_KEY);

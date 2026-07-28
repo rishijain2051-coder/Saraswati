@@ -15,8 +15,20 @@ export type MethodMap = Record<string, MethodLike>;
 
 const n = (v: number | null | undefined) => (typeof v === 'number' && isFinite(v) ? v : 0);
 
+/**
+ * Must stay identical to `round()` in server/src/lib/costing.ts, or a live preview
+ * can show a different number from the one the API stores. Rounds half away from
+ * zero, nudging the magnitude so near-ties still go up and negatives behave.
+ */
+export function round(value: number, dp = 2): number {
+  if (!isFinite(value)) return value;
+  const f = Math.pow(10, dp);
+  const r = Math.round((Math.abs(value) + Number.EPSILON) * f) / f;
+  return value < 0 ? -r : r;
+}
+
 export function suggestCostDim(actual: number | null | undefined, wastagePct: number | null | undefined): number {
-  return Math.round(n(actual) * (1 + n(wastagePct) / 100) * 1000) / 1000;
+  return round(n(actual) * (1 + n(wastagePct) / 100), 3);
 }
 
 function lineVars(ln: CostLine): Record<string, number> {
@@ -47,7 +59,7 @@ export function groupTotal(g: CostGroup, methods: MethodMap): number {
   return g.lines.reduce((s, ln) => s + lineAmount(m, ln), 0);
 }
 
-const r2 = (v: number) => Math.round((v + Number.EPSILON) * 100) / 100;
+const r2 = (v: number) => round(v, 2);
 
 export function rollup(groups: CostGroup[], methods: MethodMap, factoryExpensePct = 15, marginPct = 15): CostSummary {
   const headTotals: Record<string, number> = {};

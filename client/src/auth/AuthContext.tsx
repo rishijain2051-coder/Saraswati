@@ -7,6 +7,8 @@ interface AuthContextValue {
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => void;
+  /** Anyone may rotate their own password without an Admin. */
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   hasRole: (min: 'Viewer' | 'Operator' | 'Manager' | 'Admin') => boolean;
 }
 
@@ -38,6 +40,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false));
   }, []);
 
+  /**
+   * Quietly renew the session while someone is working. A shift on the factory floor
+   * outlasts the token, and being thrown out mid-entry loses whatever was on screen.
+   */
+  useEffect(() => {
+    if (!user) return;
+    const renew = () => {
+      api
+        .post<{ token: string; user: User }>('/auth/refresh')
+        .then((res) => localStorage.setItem(TOKEN_KEY, res.data.token))
+        .catch(() => undefined); // an expired token is handled by the 401 handler
+    };
+    const timer = setInterval(renew, 30 * 60 * 1000);
+    const onFocus = () => renew();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const login = async (email: string, password: string) => {
     const res = await api.post<{ token: string; user: User }>('/auth/login', { email, password });
     localStorage.setItem(TOKEN_KEY, res.data.token);
@@ -45,8 +68,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = () => {
+    // Clears the upload cookie too; failure is fine, the local token is gone either way.
+    api.post('/auth/logout').catch(() => undefined);
     localStorage.removeItem(TOKEN_KEY);
     setUser(null);
+  };
+
+  const changePassword = async (currentPassword: string, newPassword: string) => {
+    const res = await api.post<{ token: string }>('/auth/change-password', { currentPassword, newPassword });
+    localStorage.setItem(TOKEN_KEY, res.data.token);
   };
 
   const value = useMemo<AuthContextValue>(
@@ -55,6 +85,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       login,
       logout,
+      changePassword,
       hasRole: (min) => (RANK[user?.role ?? ''] ?? 0) >= RANK[min],
     }),
     [user, loading]

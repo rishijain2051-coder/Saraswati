@@ -177,7 +177,18 @@ export function rollup(input: RollupInput, methods: MethodMap): Rollup {
   };
 }
 
+/**
+ * Round half away from zero, nudging by an epsilon so values that binary floating
+ * point stores just under a tie (1.005 as 1.00499…) still round up.
+ *
+ * The nudge is applied to the magnitude, not the signed value: adding it to a
+ * negative number pushes it the wrong way, which made round(-1.005) give -1.00 while
+ * round(1.005) gave 1.01. Negative amounts are real here — a credit balance, an
+ * over-payment, a statement that has gone into credit.
+ */
 export function round(value: number, dp = 2): number {
+  if (!isFinite(value)) return value;
   const f = Math.pow(10, dp);
-  return Math.round((value + Number.EPSILON) * f) / f;
+  const r = Math.round((Math.abs(value) + Number.EPSILON) * f) / f;
+  return value < 0 ? -r : r;
 }

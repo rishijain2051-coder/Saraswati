@@ -171,6 +171,29 @@ the reason and stops. `POST .../reopen` puts it back to Draft to revise and re-s
 - Downloads go through axios as a blob (`fetchDocument` in `client/src/api/ops.ts`) so
   the bearer token is sent; server errors arrive as a Blob and are unwrapped there.
 
+## Security invariants
+
+Undoing any of these reopens a hole that was closed deliberately:
+
+- `env.ts` **throws** on a missing/placeholder `JWT_SECRET` in production and generates
+  a random one in dev. Never reintroduce a hardcoded fallback.
+- CORS is an allowlist from `CORS_ORIGINS`; `cors()` with no options is wide open.
+- `/uploads` sits behind `authenticateUpload`, which accepts the bearer header **or**
+  the httpOnly `saraswati_session` cookie that login sets — an `<img>` tag cannot send
+  a header. The client's axios instance uses `withCredentials`. Files go out with
+  `nosniff` + CSP.
+- All image uploads go through `lib/imageUpload.ts`: extension allow-list, then the
+  magic bytes are checked and anything that is not really an image is unlinked. A
+  declared mimetype is attacker-controlled and proves nothing.
+- `nextDocNumber` uses an atomic `{ increment: 1 }`. A read-then-write would let two
+  callers mint the same number, because SQLite takes no lock on the read.
+- `POST /orders/:id/moves` validates **inside** the write transaction; so does undo.
+- Delete routes report what references a record instead of letting a foreign key
+  surface as a 500 — products, buyers, suppliers, raw items, currencies, units,
+  attributes, stage lines, stock receipts, users.
+- `round()` nudges the magnitude, not the signed value, so negatives round
+  symmetrically; `client/src/util/costing.ts` mirrors it exactly.
+
 ## Conventions
 
 - SQLite has no Prisma enums — enum-like fields are `String` validated with zod in routes.
