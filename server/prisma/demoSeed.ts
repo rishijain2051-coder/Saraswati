@@ -20,6 +20,7 @@ import { BUILTIN_METHODS, round } from '../src/lib/costing';
 import { computeCostSheet } from '../src/lib/productCosting';
 import { loadMethodMap } from '../src/lib/methods';
 import { seedManforceDefaults } from './manforceSeed';
+import { wipeOperational as wipe } from './wipe';
 
 const prisma = new PrismaClient();
 
@@ -542,46 +543,8 @@ async function seedWorkforce(adminId: number) {
 
 // ---------------------------------------------------------------------------
 
-async function wipeOperational() {
-  // Change-log rows point at records by id. Left behind, they would resurface on
-  // whichever new product or order happens to be given the same id.
-  await prisma.changeLog.deleteMany();
-  // The workforce goes next: its rows reference movements and the ledger, and a
-  // worker left behind would carry attendance for a factory that no longer exists.
-  await prisma.statutoryPostingLine.deleteMany();
-  await prisma.statutoryPosting.deleteMany();
-  await prisma.workerDeduction.deleteMany();
-  await prisma.workerAdvance.deleteMany();
-  await prisma.attendance.deleteMany();
-  await prisma.workerStatutory.deleteMany();
-  await prisma.workerDocument.deleteMany();
-  await prisma.stageMoveWorker.deleteMany();
-  await prisma.worker.deleteMany();
-  await prisma.contractor.deleteMany();
-  await prisma.stageMovePhoto.deleteMany();
-  await prisma.stageMove.deleteMany();
-  await prisma.orderLineStage.deleteMany();
-  await prisma.operationSheet.deleteMany();
-  await prisma.ledgerEntry.deleteMany();
-  await prisma.orderLine.deleteMany();
-  await prisma.order.deleteMany();
-  await prisma.proformaLine.deleteMany();
-  await prisma.proforma.deleteMany();
-  await prisma.stockTxn.deleteMany();
-  await prisma.rawItem.deleteMany();
-  await prisma.productImage.deleteMany();
-  await prisma.costLine.deleteMany();
-  await prisma.costGroup.deleteMany();
-  await prisma.costSheet.deleteMany();
-  await prisma.productBuyer.deleteMany();
-  await prisma.relatedProduct.deleteMany();
-  await prisma.product.deleteMany();
-  await prisma.buyer.deleteMany();
-  await prisma.supplier.deleteMany();
-  for (const f of fs.existsSync(UPLOADS) ? fs.readdirSync(UPLOADS) : []) {
-    if (f !== '.gitkeep') fs.unlinkSync(path.join(UPLOADS, f));
-  }
-}
+/** Shared with `db:clean` — see `wipe.ts` for what counts as operational and why. */
+const wipeOperational = () => wipe(prisma);
 
 async function ensureConfig() {
   // The demo advertises these two logins, so it ENFORCES them rather than upserting

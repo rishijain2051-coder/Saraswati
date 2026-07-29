@@ -10,6 +10,8 @@
   "scripts": {
     "db:setup": "npm --workspace server run db:setup",
     "db:demo": "npm --workspace server run db:demo",
+    "db:fill": "npm --workspace server run db:fill",
+    "db:clean": "npm --workspace server run db:clean",
     "verify": "npm --workspace server run verify",
     "dev": "concurrently -k -n SERVER,CLIENT -c blue,green \"npm --workspace server run dev\" \"npm --workspace client run dev\"",
     "dev:server": "npm --workspace server run dev",

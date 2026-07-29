@@ -40,7 +40,7 @@ export default function RoutingDrawer({ order, line, onClose }: { order: Order; 
   useEffect(() => {
     if (!line) return;
     setStageLineId(line.stageLineId ?? null);
-    setStages(line.board.stages.map((s: StageCell) => ({ id: s.id, name: s.name, sortOrder: s.sortOrder, vendorId: s.vendorId, jobworkRate: s.jobworkRate, labourRate: s.labourRate })));
+    setStages(line.board.stages.map((s: StageCell) => ({ id: s.id, name: s.name, sortOrder: s.sortOrder, vendorId: s.vendorId, jobworkRate: s.jobworkRate ?? 0, labourRate: s.labourRate ?? 0 })));
     setBulkVendor(0);
     setBulkFrom(undefined);
     setBulkTo(undefined);

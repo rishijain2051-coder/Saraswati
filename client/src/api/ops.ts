@@ -115,6 +115,8 @@ export interface StageCell {
   rejectedIn: number;
   reached: number;
   jobworkValue: number;
+  /** In-house piece work earned so far = cleared × labourRate (0 when outsourced). */
+  labourValue: number;
 }
 
 export interface LineBoard {

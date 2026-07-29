@@ -395,6 +395,9 @@ router.get(
       const paid = round(pos.buckets.reduce((a, b) => a + b.paid, 0));
       rows.push({
         partyType: 'JOBWORK',
+        // Without this the Payments page falls back to looking the vendor up by name,
+        // and the statement route refuses it — the id is right here.
+        partyId: vendorId,
         supplierId: vendorId,
         partyName: name,
         accrued,

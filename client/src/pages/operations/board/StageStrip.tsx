@@ -61,9 +61,11 @@ export default function StageStrip({ order, line, editable, onMove }: { order: O
               </Tag>
             </Tooltip>
           ) : stage ? (
-            <Tag icon={<HomeOutlined />} style={{ margin: 0 }}>
-              In-house
-            </Tag>
+            <Tooltip title={stage.labourRate ? `In-house piece work · ₹${stage.labourRate}/pc to whoever clears it` : 'In-house · day-wage work, no piece rate'}>
+              <Tag icon={<HomeOutlined />} style={{ margin: 0 }}>
+                {stage.labourRate ? `₹${stage.labourRate}/pc` : 'In-house'}
+              </Tag>
+            </Tooltip>
           ) : null}
           {stage && stage.rejectedIn > 0 && (
             <Tooltip title={`${stage.rejectedIn} pc(s) have come back here after a rejection`}>

@@ -14,6 +14,8 @@
     "db:setup": "prisma db push && tsx prisma/seed.ts",
     "db:reset": "prisma db push --force-reset && tsx prisma/seed.ts",
     "db:demo": "tsx prisma/demoSeed.ts",
+    "db:fill": "tsx prisma/demoSeed.ts",
+    "db:clean": "tsx prisma/cleanSlate.ts",
     "verify": "tsx prisma/verify.ts",
     "db:studio": "prisma studio",
     "db:workers": "tsx prisma/migrateWorkers.ts"

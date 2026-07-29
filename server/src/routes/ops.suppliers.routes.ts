@@ -97,17 +97,23 @@ async function balances(): Promise<Record<number, { inQty: number; outQty: numbe
   return map;
 }
 
+/**
+ * Attach the derived stock figures. Every route that returns a raw item goes through
+ * this, so a created or edited item comes back in the same shape the list does — a bare
+ * Prisma row would be missing `balance` and `low`, which the client declares as always
+ * present.
+ */
+function decorateRawItem<T extends { id: number; openingQty: number; reorderLevel: number }>(it: T, bal: Awaited<ReturnType<typeof balances>>) {
+  const b = bal[it.id] || { inQty: 0, outQty: 0 };
+  const balance = round(it.openingQty + b.inQty - b.outQty, 3);
+  return { ...it, inQty: round(b.inQty, 3), outQty: round(b.outQty, 3), balance, low: balance <= it.reorderLevel };
+}
+
 router.get(
   '/raw-items',
   asyncHandler(async (_req, res) => {
     const [items, bal] = await Promise.all([prisma.rawItem.findMany({ orderBy: { name: 'asc' } }), balances()]);
-    res.json(
-      items.map((it) => {
-        const b = bal[it.id] || { inQty: 0, outQty: 0 };
-        const balance = round(it.openingQty + b.inQty - b.outQty, 3);
-        return { ...it, inQty: round(b.inQty, 3), outQty: round(b.outQty, 3), balance, low: balance <= it.reorderLevel };
-      })
-    );
+    res.json(items.map((it) => decorateRawItem(it, bal)));
   })
 );
 
@@ -126,7 +132,8 @@ router.post(
   canEdit,
   asyncHandler(async (req, res) => {
     const data = rawItemSchema.parse(req.body);
-    res.status(201).json(await prisma.rawItem.create({ data: { ...data, code: data.code.toUpperCase() } }));
+    const created = await prisma.rawItem.create({ data: { ...data, code: data.code.toUpperCase() } });
+    res.status(201).json(decorateRawItem(created, await balances()));
   })
 );
 
@@ -135,7 +142,8 @@ router.patch(
   canEdit,
   asyncHandler(async (req, res) => {
     const data = rawItemSchema.partial().parse(req.body);
-    res.json(await prisma.rawItem.update({ where: { id: Number(req.params.id) }, data: { ...data, ...(data.code ? { code: data.code.toUpperCase() } : {}) } }));
+    const updated = await prisma.rawItem.update({ where: { id: Number(req.params.id) }, data: { ...data, ...(data.code ? { code: data.code.toUpperCase() } : {}) } });
+    res.json(decorateRawItem(updated, await balances()));
   })
 );
 

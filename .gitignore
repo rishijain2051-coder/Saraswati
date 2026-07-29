@@ -13,9 +13,6 @@ server/.env
 server/prisma/*.db
 server/prisma/*.db-journal
 
-# uploads (user data)
-server/uploads/*
-!server/uploads/.gitkeep
 
 # misc
 .DS_Store

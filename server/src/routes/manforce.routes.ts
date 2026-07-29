@@ -194,7 +194,10 @@ router.put(
       where: { id: 1 },
       data: { ...data, ...(weeklyOffDays ? { weeklyOffDays: [...new Set(weeklyOffDays)].sort((a, b) => a - b).join(',') } : {}) },
     });
-    res.json({ ...updated, weeklyOffDayList: parseWeeklyOffDays(updated.weeklyOffDays) });
+    // Same shape as the GET, holidays included — the client declares them as always
+    // present, and a caller that trusted the response would read back none.
+    const holidays = await prisma.holiday.findMany({ orderBy: { date: 'asc' } });
+    res.json({ ...updated, weeklyOffDayList: parseWeeklyOffDays(updated.weeklyOffDays), holidays });
   })
 );
 

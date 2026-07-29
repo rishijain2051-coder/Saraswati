@@ -342,6 +342,8 @@ npm run build        # type-check + build both (run before declaring done)
 ```bash
 npm run verify       # DB-free self-checks — run these before declaring done
 npm run db:demo      # rebuild the investor demo (wipes operational data first)
+npm run db:fill      # same thing, named for what it does — fill the DB with examples
+npm run db:clean     # clean slate: operational data to zero, doc numbering reset
 npm run db:workers   # migrate typed wage names onto worker records (idempotent)
 ```
 
@@ -354,6 +356,14 @@ suggestion maths (name normalisation, which source leads, the outlier threshold)
 needs no database, so it survives any wipe — **this is now the authority for the costing
 formulas**, not a seeded product. Add a case here whenever you touch `costing.ts`,
 `production.ts`, `finance.ts`, `workforce.ts` or `suggest.ts`.
+
+`prisma/cleanSlate.ts` (`db:clean`) is the opposite of the demo seed and shares its wipe
+list: every operational table to zero, uploads unlinked, and all six DocSequence
+counters back to 0 so numbering restarts at 001. Configuration is deliberately kept —
+logins, currencies, units, attributes, cost formulas, stage lines, trades, holidays,
+workforce settings and statutory components — because that is setup, not data. **If you
+add a model, add it to BOTH `wipeOperational()` and `cleanSlate.ts`**, or a wipe will
+leave orphans behind that resurface on whichever new record reuses their id.
 
 `prisma/demoSeed.ts` builds a whole factory mid-season — 10 photographed products
 with real costing, three buyers in GBP/USD/EUR, proformas at every stage of the sales

@@ -339,6 +339,15 @@ check('re-done work earns again, and says so', pieceEvents[2].label, 'Polishing 
 check('piece earnings reconcile with the board', round(pieceEvents.reduce((a, e) => a + e.amount, 0)), round(buildBoard(10, inHouse, labourLine.moves as never).stages[1].cleared * 40));
 check('a clearance with nobody named pays nobody', labourEvents({ id: 1, number: 'ORD-1' }, { ...labourLine, moves: [withWorkers(2, 'ADVANCE', 1, 2, 10, 2)] } as never), []);
 
+// The board is what the UI reads a stage's rate back out of. It was once built
+// field-by-field without labourRate, so a rate saved fine but always displayed as
+// blank — and the move drawer refused to attribute work to anyone.
+const rateBoard = buildBoard(10, inHouse, labourLine.moves as never);
+check('the board carries each stage its in-house piece rate', rateBoard.stages.map((s) => s.labourRate), [0, 40, 0]);
+check('and prices the pieces cleared out of it', rateBoard.stages[1].labourValue, 320); // 8 cleared x 40
+check('an outsourced stage reports no in-house labour value', buildBoard(10, inHouse.map((s) => ({ ...s, vendorId: 99, jobworkRate: 10 })), labourLine.moves as never).stages[1].labourValue, 0);
+check('the stage labour value agrees with the piece earnings', round(rateBoard.stages.reduce((a, s) => a + s.labourValue, 0)), round(pieceEvents.reduce((a, e) => a + e.amount, 0)));
+
 console.log('\n--- naming workers on a movement ---');
 const polishing = { vendorId: null, labourRate: 40, name: 'Polishing' };
 check('pieces must add up to the movement', validateMoveWorkers(10, [{ workerId: 7, pieces: 4 }, { workerId: 8, pieces: 2 }], polishing), 'The pieces per worker add up to 6, but 10 pc are being moved.');
@@ -435,7 +444,12 @@ check('nothing anywhere means nothing to suggest', assemble('k', 'x', [emptySrc]
 
 console.log('\n--- the window ---');
 check('a window is a cut-off date in the past', windowStart(365)! < new Date(), true);
-check('365 days back is 365 days back', Math.round((Date.now() - windowStart(365)!.getTime()) / 86400000), 365);
+// Measured from today's local midnight, not from now: windowStart snaps to midnight so
+// the whole cut-off day counts, which made a "now" comparison read 366 after midday.
+const localMidnight = new Date();
+localMidnight.setHours(0, 0, 0, 0);
+check('365 days back is 365 days back', Math.round((localMidnight.getTime() - windowStart(365)!.getTime()) / 86400000), 365);
+check('the cut-off is a local midnight, so the whole day counts', [windowStart(365)!.getHours(), windowStart(365)!.getMinutes()], [0, 0]);
 check('zero days means no limit', windowStart(0), null);
 
 console.log(failed === 0 ? '\nALL SELF-CHECKS PASSED' : `\n${failed} SELF-CHECK(S) FAILED`);

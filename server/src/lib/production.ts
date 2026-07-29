@@ -29,6 +29,8 @@ export interface StageRow {
   sortOrder: number;
   vendorId: number | null;
   jobworkRate: number;
+  /** ₹ per piece an in-house worker earns for clearing this stage. 0 = day-wage work. */
+  labourRate?: number;
   note?: string | null;
   vendor?: { id: number; name: string } | null;
 }
@@ -50,6 +52,8 @@ export interface StageCell {
   vendorId: number | null;
   vendor?: { id: number; name: string } | null;
   jobworkRate: number;
+  /** ₹ per piece an in-house worker earns for clearing this stage. 0 = day-wage work. */
+  labourRate: number;
   note?: string | null;
   /** Pieces sitting at this stage right now. */
   at: number;
@@ -63,6 +67,8 @@ export interface StageCell {
   reached: number;
   /** Jobwork payable so far for this stage = cleared × rate (0 when in-house). */
   jobworkValue: number;
+  /** In-house piece work earned so far = cleared × labourRate (0 when outsourced). */
+  labourValue: number;
 }
 
 export interface LineBoard {
@@ -91,6 +97,7 @@ export function buildBoard(qty: number, stages: StageRow[], moves: MoveRow[]): L
       vendorId: s.vendorId ?? null,
       vendor: s.vendor ?? null,
       jobworkRate: s.jobworkRate ?? 0,
+      labourRate: s.labourRate ?? 0,
       note: s.note ?? null,
       at: 0,
       cleared: 0,
@@ -98,6 +105,7 @@ export function buildBoard(qty: number, stages: StageRow[], moves: MoveRow[]): L
       rejectedIn: 0,
       reached: 0,
       jobworkValue: 0,
+      labourValue: 0,
     });
   }
 
@@ -138,7 +146,12 @@ export function buildBoard(qty: number, stages: StageRow[], moves: MoveRow[]): L
   }
 
   const cellList = ordered.map((s) => cells.get(s.id)!);
-  for (const c of cellList) c.jobworkValue = r2(c.vendorId ? c.cleared * (c.jobworkRate || 0) : 0);
+  for (const c of cellList) {
+    c.jobworkValue = r2(c.vendorId ? c.cleared * (c.jobworkRate || 0) : 0);
+    // In-house piece work is priced exactly as vendor jobwork is, off the same
+    // `cleared` figure, so the two can never disagree about what work was done.
+    c.labourValue = r2(!c.vendorId ? c.cleared * (c.labourRate || 0) : 0);
+  }
 
   const jobworkMap = new Map<number, { vendorId: number; vendorName: string; stages: string[]; pieces: number; amount: number }>();
   for (const c of cellList) {
