@@ -253,6 +253,91 @@ belongs to. That is the one thing the suggestions cannot tell you, because an ed
 overwrites the old value. Only figures are logged, so the list stays readable; a save
 that changed nothing records nothing.
 
+## Four ways to sell
+
+A buyer has two independent settings, so every combination works rather than being a
+special case:
+
+- **Channel** — B2B (trade) or B2C (an end customer).
+- **Market** — Overseas or Domestic.
+
+The market is what changes the paperwork. An **overseas** buyer is quoted **FOB** in their
+own currency, zero-rated, on a *Proforma Invoice* numbered `PI-` / `ORD-`. A **domestic**
+buyer is quoted **Non-FOB in rupees** — the same costing roll-up with forwarding, CHA and
+ICD excluded, because none of that applies to a lorry to Mumbai — on a *Quotation*
+numbered `DPI-` / `DORD-`, carrying GST.
+
+**Whether GST splits into CGST + SGST or becomes IGST is worked out, never typed.** The
+app compares the buyer's state with your own (Master Data → **Company**): same state
+splits it in half, a different state charges IGST. Change either address and the split
+follows. A domestic buyer cannot be saved without a state, because the alternative is a
+wrong tax figure nobody notices.
+
+**Extra costs and discounts go on the document.** Freight, packing, loading, a dealer
+discount — each a line of its own under the subtotal, each taxed at its own rate rather
+than smeared across the products, and a percentage is always a percentage of the goods so
+the order you type them in cannot change the total. Individual lines can carry their own
+discount too. Accepting a quotation copies all of it onto the order, so the order is worth
+exactly what was quoted.
+
+```
+Items                    ₹ 17,880.00
+  Home delivery          ₹    900.00   (GST 18%)
+  Festive discount       ₹ −2,000.00   (GST 18%)
+Taxable value            ₹ 16,780.00
+  CGST @ 9%              ₹  1,510.20
+  SGST @ 9%              ₹  1,510.20
+GRAND TOTAL              ₹ 19,800.40
+```
+
+## Deleting things is safe
+
+Products, orders, proformas, material sheets and payments are never destroyed by a delete.
+They move to a **Trash** drawer on the list page — with a count on the button — and one
+click puts them back exactly as they were, production history and all. A deleted order
+leaves the money totals the same way a cancelled one does, and coming back restores its
+value to the paisa.
+
+Nothing expires. Items wait in the trash until somebody decides, and destroying one for
+good is Admin-only.
+
+## Paperwork on an order
+
+Attach the buyer's PO, the bill of lading, customs forms, a packing list, an inspection
+certificate or a drawing — PDF, Word, Excel, images, CSV, text, ZIP, DWG or EML, up to
+25 MB each. Every file's **contents** are checked against its name, so an HTML page renamed
+`.pdf` is rejected and deleted rather than stored.
+
+## Printing
+
+Proformas, **order confirmations** and **material sheets** all generate a proper PDF with
+your letterhead and logo. The order confirmation doubles as a job card: each line names the
+production route it follows. The material sheet is the costing explosion as a working
+document — per piece beside per order, so one column checks a cut and the other raises a
+purchase.
+
+## Will it be on time?
+
+**Operations → Delivery** lists every order by how urgent it is: late first, then at risk,
+then on track. Progress comes straight off each production board, so the page is never out
+of step with the floor.
+
+Set how long each stage usually takes once (Master Data → Stage Lines) and an order will
+**schedule itself backwards** from its delivery date. Adjust any date by hand; the bar
+chart shows the plan with the board's actual progress behind it, and a stage that is past
+its date with pieces still sitting on it goes red.
+
+## Money in other currencies
+
+The Payments page shows what is outstanding **per currency**, valued twice: at the rate each
+order was booked at and at today's. The difference is flagged green or red — it is
+unrealised, so it is shown as a movement rather than mixed into a total.
+
+```
+USD  25,000 outstanding   82.6 -> 84.5   ₹20,65,000 -> ₹21,12,500   ↑ ₹47,500
+GBP   8,700 outstanding  105.6 -> 105.6   ₹9,18,720 -> ₹9,18,720   no change
+```
+
 ## Project layout
 
 ```
@@ -269,6 +354,11 @@ server/
   src/lib/manforce.ts      loads the above into positions and statements
   src/lib/suggest.ts       "what did we use last time" — derived, never stored
   src/lib/changeLog.ts     who changed which figure, and what it was
+  src/lib/pricing.ts       what a document is worth: discounts, charges, GST
+  src/lib/company.ts       who we are; our state decides the tax split
+  src/lib/scheduling.ts    when work should happen, and is it late
+  src/lib/softDelete.ts    the trash: filtering lives in the query layer
+  src/lib/documentUpload.ts attachment validation by magic bytes
   src/lib/docPdf.ts        proforma PDF
   src/lib/mailDraft.ts     .eml draft with attachment
 client/

@@ -11,7 +11,7 @@
  * A plain `mailto:` link (subject + body, no attachment) is still offered
  * alongside it for people who send from webmail.
  */
-import { company } from './company';
+import { type CompanyProfile } from './company';
 
 const CRLF = '\r\n';
 
@@ -121,9 +121,18 @@ export interface ProformaMailInput {
   incoterms?: string | null;
   paymentTerms?: string | null;
   deliveryTerms?: string | null;
-  buyer: { name: string; contactName?: string | null; email?: string | null };
-  lines: { description: string; qty: number; unitPrice: number }[];
+  buyer: { name: string; contactName?: string | null; email?: string | null; market?: string | null };
+  /**
+   * `amount` is the line NET, straight from the pricing engine. The body must never
+   * recompute qty x unitPrice: on a discounted or taxed document that prints a figure
+   * the attached PDF contradicts, in the same message.
+   */
+  lines: { description: string; qty: number; unitPrice: number; amount: number }[];
+  /** Subtotal, charges and the tax split, so the body explains its own total. */
+  totals?: { subtotal: number; chargeTotal: number; taxTotal: number; cgst: number; sgst: number; igst: number; taxed: boolean; intraState: boolean } | null;
   senderName?: string | null;
+  /** Us — the sign-off and the subject line. */
+  company: CompanyProfile;
 }
 
 /** Subject + plain-text + HTML body for "here is your proforma invoice". */
@@ -131,7 +140,7 @@ export function proformaMail(p: ProformaMailInput): { subject: string; text: str
   const code = p.currencyCode || 'INR';
   const greeting = p.buyer.contactName ? `Dear ${p.buyer.contactName},` : `Dear Sir / Madam,`;
   const facts: [string, string][] = [
-    ['Proforma No.', p.number],
+    [`${p.buyer.market === 'DOMESTIC' ? 'Quotation' : 'Proforma'} No.`, p.number],
     ['Date', fmtDate(p.date)],
     ['Items', String(p.lines.length)],
     ['Total value', money(p.total, code)],
@@ -141,19 +150,38 @@ export function proformaMail(p: ProformaMailInput): { subject: string; text: str
     ['Delivery terms', p.deliveryTerms ?? ''],
   ].filter(([, v]) => !!v) as [string, string][];
 
-  const subject = `Proforma Invoice ${p.number} — ${company.name}`;
-  const signOff = [p.senderName || '', company.name, company.phone, company.email, company.website].filter(Boolean);
+  // A domestic buyer gets a quotation, not a proforma invoice.
+  const docLabel = p.buyer.market === 'DOMESTIC' ? 'Quotation' : 'Proforma Invoice';
+  const subject = `${docLabel} ${p.number} — ${p.company.legalName}`;
+  const signOff = [p.senderName || '', p.company.legalName, p.company.phone, p.company.email, p.company.website].filter(Boolean);
+
+  // Rows between the lines and the total, so the difference is never unexplained.
+  const t = p.totals;
+  const summaryLines: [string, string][] = [];
+  if (t && (t.chargeTotal !== 0 || t.taxed)) {
+    summaryLines.push(['Subtotal', money(t.subtotal, code)]);
+    if (t.chargeTotal !== 0) summaryLines.push(['Charges / discounts', money(t.chargeTotal, code)]);
+    if (t.taxed && t.taxTotal !== 0) {
+      if (t.intraState) {
+        summaryLines.push(['CGST', money(t.cgst, code)]);
+        summaryLines.push(['SGST', money(t.sgst, code)]);
+      } else {
+        summaryLines.push(['IGST', money(t.igst, code)]);
+      }
+    }
+  }
 
   const pad = Math.max(...facts.map(([k]) => k.length));
   const text = [
     greeting,
     '',
-    `Please find attached our proforma invoice ${p.number} for your kind review.`,
+    `Please find attached our ${docLabel.toLowerCase()} ${p.number} for your kind review.`,
     '',
     ...facts.map(([k, v]) => `  ${k.padEnd(pad)}  :  ${v}`),
     '',
     'Item summary:',
-    ...p.lines.map((l, i) => `  ${i + 1}. ${l.description} — ${l.qty} pcs @ ${money(l.unitPrice, code)} = ${money(l.qty * l.unitPrice, code)}`),
+    ...p.lines.map((l, i) => `  ${i + 1}. ${l.description} — ${l.qty} pcs @ ${money(l.unitPrice, code)} = ${money(l.amount, code)}`),
+    ...summaryLines.map(([k, v]) => `     ${k.padStart(22)}  :  ${v}`),
     '',
     'Kindly confirm your acceptance so that we may schedule production and share the delivery plan.',
     '',
@@ -163,7 +191,7 @@ export function proformaMail(p: ProformaMailInput): { subject: string; text: str
 
   const html = `<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222">
 <p>${esc(greeting)}</p>
-<p>Please find attached our proforma invoice <b>${esc(p.number)}</b> for your kind review.</p>
+<p>Please find attached our ${esc(docLabel.toLowerCase())} <b>${esc(p.number)}</b> for your kind review.</p>
 <table cellpadding="4" cellspacing="0" style="font-size:13px;border-collapse:collapse">
 ${facts.map(([k, v]) => `<tr><td style="color:#777">${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}
 </table>
@@ -174,10 +202,11 @@ ${p.lines
   .map(
     (l, i) =>
       `<tr><td>${i + 1}</td><td>${esc(l.description)}</td><td align="right">${l.qty}</td><td align="right">${esc(money(l.unitPrice, code))}</td><td align="right"><b>${esc(
-        money(l.qty * l.unitPrice, code)
+        money(l.amount, code)
       )}</b></td></tr>`
   )
   .join('')}
+${summaryLines.map(([k, v]) => `<tr><td colspan="4" align="right" style="color:#777">${esc(k)}</td><td align="right">${esc(v)}</td></tr>`).join('')}
 <tr><td colspan="4" align="right"><b>Total</b></td><td align="right"><b>${esc(money(p.total, code))}</b></td></tr>
 </table>
 <p>Kindly confirm your acceptance so that we may schedule production and share the delivery plan.</p>

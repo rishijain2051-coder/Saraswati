@@ -7,9 +7,14 @@ import dayjs from 'dayjs';
 import type { ColumnsType } from 'antd/es/table';
 import { api, apiError } from '../../api/client';
 import { useBuyers, useCurrencies, useProduct, useProducts } from '../../api/hooks';
-import { useProforma, suggestPrice, type ProformaLineDto } from '../../api/ops';
+import { useProforma, suggestPrice, type DocCharge, type ProformaLineDto } from '../../api/ops';
 import { PriceHint } from '../../components/HistoryHint';
 import { money } from '../../util/format';
+import { documentTotals, isDomestic, lineGross, lineNet } from '../../util/pricing';
+import ChargesEditor from '../../components/ChargesEditor';
+import DocumentTotalsPanel from '../../components/DocumentTotals';
+import { useCompany } from '../../api/hooks';
+import { Alert, Divider, Tag } from 'antd';
 
 const { Title, Text } = Typography;
 
@@ -108,6 +113,7 @@ export default function ProformaEditPage() {
     bankDetails: 'Bank: State Bank of India\nA/C: 000000000000\nIFSC: SBIN0000000\nSWIFT: SBININBB000',
   });
   const [lines, setLines] = useState<LineDraft[]>([]);
+  const [charges, setCharges] = useState<DocCharge[]>([]);
 
   useEffect(() => {
     if (editing && pf) {
@@ -123,7 +129,21 @@ export default function ProformaEditPage() {
         notes: pf.notes ?? '',
         showImages: pf.showImages,
       });
-      setLines(pf.lines.map((l) => ({ key: newKey(), productId: l.productId ?? null, imageId: l.imageId ?? null, description: l.description, qty: l.qty, unitPrice: l.unitPrice })));
+      setLines(
+        pf.lines.map((l) => ({
+          key: newKey(),
+          productId: l.productId ?? null,
+          imageId: l.imageId ?? null,
+          description: l.description,
+          qty: l.qty,
+          unitPrice: l.unitPrice,
+          discountPct: l.discountPct ?? 0,
+          discountAmt: l.discountAmt ?? 0,
+          gstRatePct: l.gstRatePct ?? 0,
+          hsnCode: l.hsnCode ?? null,
+        }))
+      );
+      setCharges(pf.charges ?? []);
     } else if (!editing && currencies && f.currencyId === undefined) {
       const nonBase = currencies.find((c) => !c.isBase) ?? currencies[0];
       setF((s: any) => ({ ...s, currencyId: nonBase?.id }));
@@ -132,17 +152,33 @@ export default function ProformaEditPage() {
 
   const set = (patch: any) => setF((s: any) => ({ ...s, ...patch }));
   const symbol = currencies?.find((c) => c.id === f.currencyId)?.symbol ?? '₹';
-  const total = lines.reduce((s, l) => s + (l.qty || 0) * (l.unitPrice || 0), 0);
+
+  // The buyer decides everything about how this document is priced: which basis the
+  // suggestion uses, whether GST applies, and which series it will be numbered in.
+  const buyer = buyers?.find((b) => b.id === f.buyerId);
+  const domestic = isDomestic(buyer?.market);
+  const { data: company } = useCompany();
+
+  // The same engine the server runs, so the figures below match what will be saved.
+  const totals = documentTotals(
+    lines.map((l) => ({ qty: l.qty || 0, unitPrice: l.unitPrice || 0, discountPct: l.discountPct, discountAmt: l.discountAmt, gstRatePct: l.gstRatePct })),
+    // Only the charges that will actually be SAVED — a nameless row is filtered out on
+    // save, so including it here made the preview total higher than the stored one.
+    charges.filter((c) => c.name.trim()),
+    { market: buyer?.market, buyerState: buyer?.state, companyState: company?.state }
+  );
 
   const setLine = (key: string, patch: Partial<LineDraft>) => setLines((ls) => ls.map((l) => (l.key === key ? { ...l, ...patch } : l)));
-  const addLine = () => setLines((ls) => [...ls, { key: newKey(), productId: null, imageId: null, description: '', qty: 1, unitPrice: 0 }]);
+  const addLine = () => setLines((ls) => [...ls, { key: newKey(), productId: null, imageId: null, description: '', qty: 1, unitPrice: 0, discountPct: 0, discountAmt: 0, gstRatePct: domestic ? 18 : 0, hsnCode: null }]);
 
   const pickProduct = async (key: string, productId: number) => {
     const p = products?.find((x) => x.id === productId);
     setLine(key, { productId, imageId: null, description: p?.name ?? '' });
     try {
-      const r = await suggestPrice(productId, f.currencyId);
-      setLine(key, { unitPrice: r.suggested });
+      // The buyer's market decides the basis: Non-FOB in rupees for a domestic sale,
+      // FOB converted for an export. The response also carries the tax classification.
+      const r = await suggestPrice(productId, f.currencyId, f.buyerId);
+      setLine(key, { unitPrice: r.suggested, ...(domestic ? { gstRatePct: r.gstRatePct ?? 0, hsnCode: r.hsnCode ?? null } : {}) });
     } catch (e) {
       message.error(apiError(e));
     }
@@ -163,7 +199,22 @@ export default function ProformaEditPage() {
         showImages: !!f.showImages,
         lines: lines
           .filter((l) => l.description.trim())
-          .map((l) => ({ productId: l.productId ?? null, imageId: l.imageId ?? null, description: l.description, qty: l.qty, unitPrice: l.unitPrice })),
+          .map((l) => ({
+            productId: l.productId ?? null,
+            imageId: l.imageId ?? null,
+            description: l.description,
+            qty: l.qty,
+            unitPrice: l.unitPrice,
+            discountPct: l.discountPct ?? 0,
+            discountAmt: l.discountAmt ?? 0,
+            // Rates are only meaningful on a domestic document; an export is zero-rated
+            // and the server ignores them anyway.
+            gstRatePct: domestic ? l.gstRatePct ?? 0 : 0,
+            hsnCode: domestic ? l.hsnCode ?? null : null,
+          })),
+        charges: charges
+          .filter((c) => c.name.trim())
+          .map((c) => ({ name: c.name, kind: c.kind, amount: c.amount, pct: c.pct, gstRatePct: domestic && c.isTaxable ? c.gstRatePct : 0, isTaxable: c.isTaxable, note: c.note ?? null })),
       };
       return editing ? api.put(`/proformas/${id}`, body) : api.post('/proformas', body);
     },
@@ -230,7 +281,56 @@ export default function ProformaEditPage() {
         </Space.Compact>
       ),
     },
-    { title: 'Amount', key: 'amt', align: 'right', width: 120, render: (_, r) => <b>{money((r.qty || 0) * (r.unitPrice || 0), symbol)}</b> },
+    {
+      title: 'Disc %',
+      dataIndex: 'discountPct',
+      width: 92,
+      render: (v, r) => <InputNumber min={0} max={100} value={v ?? 0} style={{ width: 82 }} onChange={(val) => setLine(r.key, { discountPct: val ?? 0 })} />,
+    },
+    {
+      title: `Disc ${symbol}`,
+      dataIndex: 'discountAmt',
+      width: 100,
+      render: (v, r) => <InputNumber min={0} value={v ?? 0} style={{ width: 90 }} onChange={(val) => setLine(r.key, { discountAmt: val ?? 0 })} />,
+    },
+    ...(domestic
+      ? ([
+          {
+            title: 'HSN',
+            dataIndex: 'hsnCode',
+            width: 90,
+            render: (v: string | null, r: LineDraft) => <Input value={v ?? ''} style={{ width: 80 }} placeholder="9403" onChange={(e) => setLine(r.key, { hsnCode: e.target.value })} />,
+          },
+          {
+            title: 'GST %',
+            dataIndex: 'gstRatePct',
+            width: 90,
+            render: (v: number, r: LineDraft) => <InputNumber min={0} max={100} value={v ?? 0} style={{ width: 80 }} onChange={(val) => setLine(r.key, { gstRatePct: val ?? 0 })} />,
+          },
+        ] as ColumnsType<LineDraft>)
+      : []),
+    {
+      title: 'Amount',
+      key: 'amt',
+      align: 'right',
+      width: 120,
+      // Net of this line's own discount, so it agrees with the subtotal below.
+      render: (_, r) => {
+        // The engine's own maths, never a copy of the rule.
+        const gross = lineGross(r as never);
+        const net = lineNet(r as never);
+        return (
+          <span>
+            {net !== gross && (
+              <Text type="secondary" delete style={{ fontSize: 11, display: 'block' }}>
+                {money(gross, symbol)}
+              </Text>
+            )}
+            <b>{money(net, symbol)}</b>
+          </span>
+        );
+      },
+    },
     {
       title: '',
       key: 'x',
@@ -275,6 +375,13 @@ export default function ProformaEditPage() {
               options={(buyers ?? []).map((b) => ({ label: `${b.code} · ${b.name}${b.email ? '' : '  (no e-mail)'}`, value: b.id }))}
               onChange={(v) => set({ buyerId: v })}
             />
+            {buyer && (
+              <div style={{ marginTop: 4 }}>
+                <Tag color={domestic ? 'geekblue' : 'gold'}>{domestic ? 'Domestic' : 'Overseas'}</Tag>
+                <Tag>{buyer.channel === 'B2C' ? 'B2C' : 'B2B'}</Tag>
+                {domestic && <Text type="secondary" style={{ fontSize: 11 }}>{buyer.state ?? 'no state'}{buyer.gstNo ? ` · ${buyer.gstNo}` : ' · no GSTIN'}</Text>}
+              </div>
+            )}
           </Col>
           <Col xs={12} md={4}>
             <Text type="secondary">Currency</Text>
@@ -296,10 +403,12 @@ export default function ProformaEditPage() {
             <Text type="secondary">Delivery terms</Text>
             <Input value={f.deliveryTerms} onChange={(e) => set({ deliveryTerms: e.target.value })} placeholder="Within 60 days" />
           </Col>
-          <Col xs={12} md={5}>
-            <Text type="secondary">Incoterms</Text>
-            <Input value={f.incoterms} onChange={(e) => set({ incoterms: e.target.value })} placeholder="FOB Mundra" />
-          </Col>
+          {!domestic && (
+            <Col xs={12} md={5}>
+              <Text type="secondary">Incoterms</Text>
+              <Input value={f.incoterms} onChange={(e) => set({ incoterms: e.target.value })} placeholder="FOB Mundra" />
+            </Col>
+          )}
           <Col xs={12} md={3}>
             <Text type="secondary" style={{ display: 'block' }}>
               Show photos
@@ -318,14 +427,60 @@ export default function ProformaEditPage() {
       </Card>
 
       <Card size="small" title="Lines" extra={<Button size="small" icon={<PlusOutlined />} onClick={addLine}>Add line</Button>}>
-        <Table<LineDraft> rowKey="key" size="small" columns={cols} dataSource={lines} pagination={false} scroll={{ x: 900 }} locale={{ emptyText: 'No lines yet — add one.' }} />
-        <div style={{ textAlign: 'right', marginTop: 12 }}>
-          <Text type="secondary">Total: </Text>
-          <Text strong style={{ fontSize: 16 }}>
-            {money(total, symbol)}
-          </Text>
-        </div>
-        <Text type="secondary" style={{ fontSize: 12 }}>
+        <Table<LineDraft> rowKey="key" size="small" columns={cols} dataSource={lines} pagination={false} scroll={{ x: 1100 }} locale={{ emptyText: 'No lines yet — add one.' }} />
+
+        <Divider style={{ margin: '16px 0 12px' }} />
+        <ChargesEditor charges={charges} subtotal={totals.subtotal} symbol={symbol} taxed={domestic} defaultGstPct={18} onChange={setCharges} />
+
+        <Divider style={{ margin: '16px 0 12px' }} />
+        <DocumentTotalsPanel totals={totals} symbol={symbol} />
+
+        {/*
+          A domestic document whose lines all sit at 0% shows a CGST+SGST tag above a
+          total with no tax in it. That happens whenever the buyer is switched to
+          domestic after the lines were added, so offer the fix rather than just warning.
+        */}
+        {domestic && lines.length > 0 && lines.every((l) => !(l.gstRatePct ?? 0)) && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginTop: 12 }}
+            message="No GST rate on any line"
+            description={
+              <Space direction="vertical" size={4}>
+                <span>This is a domestic sale, so it should carry GST — but every line is at 0%, so no tax is being charged.</span>
+                <Button size="small" onClick={() => setLines((ls) => ls.map((l) => ({ ...l, gstRatePct: 18, hsnCode: l.hsnCode || '9403' })))}>
+                  Set every line to 18% (HSN 9403)
+                </Button>
+              </Space>
+            }
+          />
+        )}
+        {totals.mismatchedChargeRates.length > 0 && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginTop: 12 }}
+            message={`A discount is taxed at ${totals.mismatchedChargeRates.map((r) => `${r}%`).join(', ')}, which none of the goods use`}
+            description="That relieves more tax than the goods carry and prints a negative GST line. Set the discount's rate to match the products it applies to."
+          />
+        )}
+        {totals.overDiscounted && (
+          <Alert type="error" showIcon style={{ marginTop: 12 }} message="The discounts are larger than the goods" description="The total has been held at zero. Check the discount amounts." />
+        )}
+        {domestic && !company?.state && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginTop: 12 }}
+            message="Your company has no state set"
+            description="Without it, this sale is treated as inter-state and charged IGST. Set it in Master Data → Company."
+          />
+        )}
+        {domestic && buyer && !buyer.gstNo && buyer.channel === 'B2B' && (
+          <Alert type="info" showIcon style={{ marginTop: 12 }} message={`${buyer.name} has no GSTIN on file`} description="A trade buyer normally needs one on the document. Add it in Master Data → Buyers." />
+        )}
+        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 10 }}>
           Photos print on the PI and on the PDF that goes out by e-mail. Each line uses the product's primary photo unless you pick another.
         </Text>
       </Card>

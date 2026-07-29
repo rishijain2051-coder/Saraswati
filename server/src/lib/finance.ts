@@ -16,6 +16,7 @@
  */
 import { round } from './costing';
 import { buildBoard, clearances, type MoveRow, type StageRow } from './production';
+import { documentValueOf, type PricedCharge, type PricedLine } from './pricing';
 
 // ---------------------------------------------------------------------------
 // FIFO allocation
@@ -130,7 +131,16 @@ export interface FinanceOrderLike {
   orderDate: Date | string;
   exchangeRate: number | null;
   currency?: { code: string; symbol: string } | null;
-  lines: { qty: number; unitPrice: number }[];
+  /** Lines carry their discounts and GST rate, because the debt is the taxed total. */
+  lines: PricedLine[];
+  /** Freight, packing, a dealer discount — part of what is owed. */
+  charges?: PricedCharge[] | null;
+  /** Market and state decide whether GST applies and how it splits. */
+  buyer?: { market?: string | null; state?: string | null } | null;
+  /** The basis frozen at creation. Preferred over the live buyer — see pricing.ts. */
+  taxMarket?: string | null;
+  taxBuyerState?: string | null;
+  taxCompanyState?: string | null;
 }
 
 export interface FinanceEntryLike {
@@ -160,15 +170,33 @@ export interface FinanceContext {
   materialPaid: Map<number, number>;
   wagesBilled: Map<number, number>;
   wagesPaid: Map<number, number>;
+  /**
+   * Our own state, carried here so everything reading this context prices tax the same
+   * way. Loaded once per request alongside the rest of it.
+   */
+  companyState: string | null;
 }
 
 const bump = (m: Map<number, number>, k: number, v: number) => m.set(k, round((m.get(k) ?? 0) + v));
 
 /**
+ * A finite number, or zero. `round()` deliberately passes NaN and Infinity through so a
+ * broken calculation is visible rather than silently plausible — which is right for the
+ * costing engine, but in a SUMMED report one bad row would take every other row with it.
+ */
+const fin = (v: number | null | undefined) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/**
  * Allocate every payment across everything outstanding, once, and index the result
  * by order. `jobworkPerOrder` comes from the board (pieces cleared × rate).
  */
-export function buildFinanceContext(orders: FinanceOrderLike[], entries: FinanceEntryLike[], jobworkPerOrder: Map<number, Map<number, number>>): FinanceContext {
+export function buildFinanceContext(
+  orders: FinanceOrderLike[],
+  entries: FinanceEntryLike[],
+  jobworkPerOrder: Map<number, Map<number, number>>,
+  /** Our own state, for the CGST+SGST vs IGST decision on domestic orders. */
+  companyState?: string | null
+): FinanceContext {
   const ctx: FinanceContext = {
     received: new Map(),
     buyerCredit: new Map(),
@@ -178,6 +206,7 @@ export function buildFinanceContext(orders: FinanceOrderLike[], entries: Finance
     materialPaid: new Map(),
     wagesBilled: new Map(),
     wagesPaid: new Map(),
+    companyState: companyState ?? null,
   };
   const live = orders.filter((o) => o.status !== 'Cancelled');
 
@@ -194,7 +223,10 @@ export function buildFinanceContext(orders: FinanceOrderLike[], entries: Finance
         orderId: o.id,
         label: o.number,
         date: o.orderDate,
-        gross: round(o.lines.reduce((a, l) => a + l.qty * l.unitPrice, 0)),
+        // The whole debt, through the one pricing engine: line discounts, document
+        // charges and GST included. Summing qty x price here would leave the Payments
+        // page disagreeing with the order it is settling.
+        gross: documentValueOf(o, companyState),
       }));
       const result = allocateFifo(buckets, inCcy.map((e) => ({ id: e.id, date: e.date, amount: e.amount, orderId: e.orderId })));
       for (const b of result.buckets) if (b.orderId != null) ctx.received.set(b.orderId, b.paid);
@@ -343,4 +375,127 @@ export function buildStatement(rows: Omit<StatementRow, 'balance' | 'key'>[]): S
       balance = round(balance + r.charge - r.settle);
       return { ...r, key: `${r.type}-${i}-${new Date(r.date).getTime()}`, balance };
     });
+}
+
+// ---------------------------------------------------------------------------
+// Multi-currency receivables and the forex position
+// ---------------------------------------------------------------------------
+
+/** One order's receivable, in the buyer's currency and in rupees two ways. */
+export interface ForexOrderRow {
+  orderId: number;
+  currency: string;
+  /** In the buyer's own currency. */
+  invoicedFcy: number;
+  receivedFcy: number;
+  receivableFcy: number;
+  /** The rate snapshotted when the order was created. */
+  snapshotRate: number;
+  /** Today's rate from the currency master. */
+  currentRate: number;
+  /** Rupees at the rate we booked the order at. */
+  receivableInr: number;
+  /** Rupees if it were settled at today's rate. */
+  receivableAtCurrentRate: number;
+  /**
+   * Positive means the rupee value of what we are owed has RISEN since the order was
+   * booked (the foreign currency strengthened) — a gain when it is collected. Negative
+   * is the reverse. Unrealised either way: nothing is booked until money arrives.
+   */
+  forexGainLoss: number;
+}
+
+export interface ForexCurrencyRow {
+  currency: string;
+  symbol: string;
+  totalFcy: number;
+  totalInrAtSnapshot: number;
+  totalInrAtCurrent: number;
+  forexGainLoss: number;
+  orderCount: number;
+  /** What the outstanding orders average out to, for comparison with the live rate. */
+  averageSnapshotRate: number;
+  currentRate: number;
+}
+
+export interface ForexSummary {
+  byCurrency: ForexCurrencyRow[];
+  totalInrAtSnapshot: number;
+  totalInrAtCurrent: number;
+  netForexGainLoss: number;
+  /** True when anything is outstanding in a currency other than rupees. */
+  hasForeignExposure: boolean;
+}
+
+/**
+ * Group what is outstanding by currency and value it twice: at the rate each order was
+ * booked at, and at today's.
+ *
+ * Pure — it takes the already-allocated per-order figures and the live rates, so it
+ * cannot disagree with the FIFO result it is built from. Rupee orders are included for
+ * completeness but can never show a gain or loss, because their rate is 1 by definition.
+ */
+export function receivablesByCurrency(rows: ForexOrderRow[], symbolOf: (code: string) => string): ForexSummary {
+  const byCode = new Map<string, ForexCurrencyRow & { rateWeight: number }>();
+
+  for (const raw of rows) {
+    // Rates reach here from `Order.exchangeRate` and the currency master, and the master
+    // is filled in by a human pasting the ICEGATE table. One bad parse would otherwise
+    // turn the WHOLE net position into NaN — every currency, not just the broken one —
+    // because `round()` passes non-finite values straight through. Treat a nonsense
+    // figure as zero for this order rather than poisoning the report.
+    const r = {
+      ...raw,
+      receivableFcy: fin(raw.receivableFcy),
+      snapshotRate: fin(raw.snapshotRate),
+      currentRate: fin(raw.currentRate),
+      receivableInr: fin(raw.receivableInr),
+      receivableAtCurrentRate: fin(raw.receivableAtCurrentRate),
+    };
+    // Nothing outstanding is nothing to report — a settled order is not exposure.
+    if (r.receivableFcy <= 0) continue;
+    const row =
+      byCode.get(r.currency) ??
+      byCode
+        .set(r.currency, {
+          currency: r.currency,
+          symbol: symbolOf(r.currency),
+          totalFcy: 0,
+          totalInrAtSnapshot: 0,
+          totalInrAtCurrent: 0,
+          forexGainLoss: 0,
+          orderCount: 0,
+          averageSnapshotRate: 0,
+          currentRate: r.currentRate,
+          rateWeight: 0,
+        })
+        .get(r.currency)!;
+
+    row.totalFcy = round(row.totalFcy + r.receivableFcy);
+    row.totalInrAtSnapshot = round(row.totalInrAtSnapshot + r.receivableInr);
+    row.totalInrAtCurrent = round(row.totalInrAtCurrent + r.receivableAtCurrentRate);
+    row.orderCount += 1;
+    // Weighted by what is outstanding, so a large old order moves the average more than
+    // a small recent one — which is what makes it comparable with the live rate.
+    row.rateWeight = round(row.rateWeight + r.receivableFcy * r.snapshotRate);
+  }
+
+  const byCurrency = [...byCode.values()]
+    .map(({ rateWeight, ...row }) => ({
+      ...row,
+      averageSnapshotRate: row.totalFcy > 0 ? round(rateWeight / row.totalFcy, 4) : 0,
+      forexGainLoss: round(row.totalInrAtCurrent - row.totalInrAtSnapshot),
+    }))
+    .sort((a, b) => b.totalInrAtCurrent - a.totalInrAtCurrent);
+
+  const totalInrAtSnapshot = round(byCurrency.reduce((a, c) => a + c.totalInrAtSnapshot, 0));
+  const totalInrAtCurrent = round(byCurrency.reduce((a, c) => a + c.totalInrAtCurrent, 0));
+
+  return {
+    byCurrency,
+    totalInrAtSnapshot,
+    totalInrAtCurrent,
+    netForexGainLoss: round(totalInrAtCurrent - totalInrAtSnapshot),
+    hasForeignExposure: byCurrency.some((c) => c.currency !== 'INR' && c.totalFcy > 0),
+  };
 }

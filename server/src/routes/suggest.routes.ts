@@ -72,6 +72,9 @@ router.post(
         group: {
           costSheet: {
             isActive: true,
+            // A product in the trash was removed for a reason; suggesting its rates back
+            // would be offering the very figure somebody just rejected.
+            product: { deletedAt: null },
             ...(since ? { createdAt: { gte: since } } : {}),
             ...(body.productId ? { productId: { not: body.productId } } : {}),
           },
@@ -156,7 +159,7 @@ router.post(
 
     const stages = stageNames.length
       ? await prisma.orderLineStage.findMany({
-          where: { orderLine: { order: { status: { not: 'Cancelled' }, ...(since ? { orderDate: { gte: since } } : {}) } } },
+          where: { orderLine: { order: { status: { not: 'Cancelled' }, deletedAt: null, ...(since ? { orderDate: { gte: since } } : {}) } } },
           select: {
             name: true,
             jobworkRate: true,
@@ -239,11 +242,11 @@ router.get(
 
     const [orderLines, proformaLines] = await Promise.all([
       prisma.orderLine.findMany({
-        where: { productId: q.productId, order: { status: { not: 'Cancelled' }, ...(since ? { orderDate: { gte: since } } : {}) } },
+        where: { productId: q.productId, order: { status: { not: 'Cancelled' }, deletedAt: null, ...(since ? { orderDate: { gte: since } } : {}) } },
         select: { unitPrice: true, qty: true, order: { select: { id: true, number: true, orderDate: true, buyerId: true, buyer: { select: { name: true } }, currency: { select: { code: true } } } } },
       }),
       prisma.proformaLine.findMany({
-        where: { productId: q.productId, proforma: { ...(since ? { date: { gte: since } } : {}) } },
+        where: { productId: q.productId, proforma: { deletedAt: null, ...(since ? { date: { gte: since } } : {}) } },
         select: { unitPrice: true, qty: true, proforma: { select: { id: true, number: true, date: true, status: true, buyerId: true, buyer: { select: { name: true } }, currency: { select: { code: true } } } } },
       }),
     ]);
@@ -314,7 +317,7 @@ router.get(
     if (q.kind === 'JOBWORK' || q.kind === 'LABOUR') {
       const key = normalizeKey(q.stage);
       const stages = await prisma.orderLineStage.findMany({
-        where: { orderLine: { order: { status: { not: 'Cancelled' }, ...(since ? { orderDate: { gte: since } } : {}) } } },
+        where: { orderLine: { order: { status: { not: 'Cancelled' }, deletedAt: null, ...(since ? { orderDate: { gte: since } } : {}) } } },
         select: {
           name: true,
           jobworkRate: true,
@@ -372,7 +375,7 @@ router.get(
       if (item) {
         const key = normalizeKey(item.name);
         const lines = await prisma.costLine.findMany({
-          where: { group: { costSheet: { isActive: true, ...(since ? { createdAt: { gte: since } } : {}) } } },
+          where: { group: { costSheet: { isActive: true, product: { deletedAt: null }, ...(since ? { createdAt: { gte: since } } : {}) } } },
           select: { rate: true, unit: true, group: { select: { name: true, costSheet: { select: { createdAt: true, product: { select: { id: true, factoryCode: true, name: true } } } } } } },
         });
         sources.push(

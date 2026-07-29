@@ -5,6 +5,8 @@ import {
   EditOutlined,
   ArrowLeftOutlined,
   ProfileOutlined,
+  FilePdfOutlined,
+  CalendarOutlined,
   BranchesOutlined,
   UndoOutlined,
   ShopOutlined,
@@ -18,14 +20,16 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import dayjs from 'dayjs';
 import { api, apiError } from '../../api/client';
-import { useOrder, ORDER_STATUSES, ORDER_STATUS_COLOR, MOVE_COLOR, MOVE_LABEL, OPS_KEYS, type MoveKind, type OrderLineDto } from '../../api/ops';
+import { useOrder, fetchDocument, DELIVERY_COLOUR, DELIVERY_TEXT, ORDER_STATUSES, ORDER_STATUS_COLOR, MOVE_COLOR, MOVE_LABEL, OPS_KEYS, type MoveKind, type OrderLineDto } from '../../api/ops';
 import { useAuth } from '../../auth/AuthContext';
 import { money } from '../../util/format';
 import StageStrip from './board/StageStrip';
 import MoveDrawer, { type MoveTarget } from './board/MoveDrawer';
 import RoutingDrawer from './board/RoutingDrawer';
+import ScheduleDrawer from './board/ScheduleDrawer';
 import BulkClearDrawer from './board/BulkClearDrawer';
 import ChangeLogList from '../../components/ChangeLogList';
+import OrderAttachments from './OrderAttachments';
 
 const { Title, Text } = Typography;
 
@@ -40,6 +44,7 @@ export default function OrderDetailPage() {
 
   const [moveTarget, setMoveTarget] = useState<MoveTarget | null>(null);
   const [routingLine, setRoutingLine] = useState<OrderLineDto | null>(null);
+  const [scheduleLine, setScheduleLine] = useState<OrderLineDto | null>(null);
   const [historyLine, setHistoryLine] = useState<OrderLineDto | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
 
@@ -53,7 +58,7 @@ export default function OrderDetailPage() {
       message.success('Status updated.');
       invalidate();
     },
-    onError: (e) => message.error(apiError(e)),
+    onError: (e: unknown) => message.error(apiError(e)),
   });
 
   const undoMove = useMutation({
@@ -127,6 +132,12 @@ export default function OrderDetailPage() {
             {o.number}
           </Title>
           <Tag color={ORDER_STATUS_COLOR[o.status] ?? 'default'}>{o.status}</Tag>
+          {/* Will it make its date? Derived from the board, so always current. */}
+          {o.delivery && o.delivery.status !== 'NO_DATE' && (
+            <Tooltip title={o.delivery.reason}>
+              <Tag color={DELIVERY_COLOUR[o.delivery.status] ?? 'default'}>{DELIVERY_TEXT[o.delivery.status] ?? o.delivery.status}</Tag>
+            </Tooltip>
+          )}
           <Text type="secondary">
             {o.buyer.name}
             {o.deliveryDate ? ` · delivery ${dayjs(o.deliveryDate).format('DD MMM YYYY')}` : ''}
@@ -141,6 +152,12 @@ export default function OrderDetailPage() {
               Clear a stage
             </Button>
           )}
+          <Button
+            icon={<FilePdfOutlined />}
+            onClick={() => fetchDocument(`/orders/${o.id}/pdf`, `${o.number}.pdf`, true).catch((e) => message.error(apiError(e)))}
+          >
+            Order PDF
+          </Button>
           {editable && <Select value={o.status} style={{ width: 150 }} onChange={confirmStatus} options={ORDER_STATUSES.map((x) => ({ label: x, value: x }))} />}
           {editable && (
             <Button icon={<EditOutlined />} onClick={() => navigate(`/operations/orders/${o.id}/edit`)}>
@@ -173,6 +190,24 @@ export default function OrderDetailPage() {
               Order value
             </Text>
             <div style={{ fontSize: 18, fontWeight: 700, color: '#4e342e' }}>{money(o.total, symbol)}</div>
+            {/* A domestic order's total is goods + charges + GST, so say which is which. */}
+            {(o.totals?.taxed || (o.totals?.charges?.length ?? 0) > 0) && (
+              <Tooltip
+                title={
+                  <span>
+                    Items {money(o.totals.subtotal, symbol)}
+                    {o.totals.chargeTotal !== 0 && <> · charges {money(o.totals.chargeTotal, symbol)}</>}
+                    {o.totals.taxed && (
+                      <> · {o.totals.intraState ? `CGST+SGST ${money(o.totals.taxTotal, symbol)}` : `IGST ${money(o.totals.igst, symbol)}`}</>
+                    )}
+                  </span>
+                }
+              >
+                <Tag color={o.totals.taxed ? (o.totals.intraState ? 'geekblue' : 'purple') : 'gold'} style={{ marginTop: 4 }}>
+                  {o.totals.taxed ? (o.totals.intraState ? 'incl. CGST + SGST' : 'incl. IGST') : 'export · zero rated'}
+                </Tag>
+              </Tooltip>
+            )}
           </Col>
         </Row>
       </Card>
@@ -299,6 +334,18 @@ export default function OrderDetailPage() {
                     Who makes this?
                   </Button>
                 )}
+                {editable && !l.needsStageLine && (
+                  <Button size="small" icon={<CalendarOutlined />} onClick={() => setScheduleLine(l)}>
+                    {l.schedule ? 'Schedule' : 'Set a schedule'}
+                  </Button>
+                )}
+                {l.schedule?.isBehind && (
+                  <Tooltip title={`A stage is ${l.schedule.daysLate} day(s) past its planned end.`}>
+                    <Tag color="orange" style={{ margin: 0 }}>
+                      behind
+                    </Tag>
+                  </Tooltip>
+                )}
                 <Button size="small" icon={<HistoryOutlined />} disabled={l.history.length === 0} onClick={() => setHistoryLine(l)}>
                   History ({l.history.length})
                 </Button>
@@ -373,6 +420,10 @@ export default function OrderDetailPage() {
 
           {/* Who changed a price or a stage rate, and what it was before — the one
               question the live order cannot answer, because an edit overwrites it. */}
+          <div style={{ marginTop: 16 }}>
+            <OrderAttachments orderId={o.id} orderNumber={o.number} />
+          </div>
+
           <Card size="small" title="Change history" style={{ marginTop: 16 }}>
             <ChangeLogList rootType="Order" rootId={o.id} what="order" compact />
           </Card>
@@ -427,6 +478,7 @@ export default function OrderDetailPage() {
 
       <MoveDrawer order={o} target={moveTarget} onClose={() => setMoveTarget(null)} />
       <RoutingDrawer order={o} line={routingLine} onClose={() => setRoutingLine(null)} />
+      <ScheduleDrawer order={o} line={scheduleLine} onClose={() => setScheduleLine(null)} />
       <BulkClearDrawer order={o} open={bulkOpen} onClose={() => setBulkOpen(false)} />
 
       <Modal open={!!historyLine} onCancel={() => setHistoryLine(null)} footer={null} width={680} title={historyLine ? `Movements — ${historyLine.product.factoryCode}` : ''}>

@@ -53,6 +53,8 @@ export interface StageLineStep {
   id: number;
   name: string;
   sortOrder: number;
+  /** How long this step usually takes, for auto-scheduling. Null = an equal share. */
+  defaultDays?: number | null;
 }
 
 export interface StageLine {
@@ -153,13 +155,175 @@ export interface StageMoveHistory {
   labourValue: number;
 }
 
+// --- scheduling and delivery ------------------------------------------------
+
+export const DELIVERY_TEXT: Record<string, string> = {
+  LATE: 'Late',
+  AT_RISK: 'At risk',
+  ON_TRACK: 'On track',
+  DELIVERED: 'Delivered',
+  NO_DATE: 'No date',
+};
+
+export const DELIVERY_COLOUR: Record<string, string> = {
+  LATE: 'red',
+  AT_RISK: 'orange',
+  ON_TRACK: 'green',
+  DELIVERED: 'default',
+  NO_DATE: 'default',
+};
+
+/** Will this order make its date? Derived on every read, never stored. */
+export interface DeliveryVerdict {
+  status: string;
+  percentComplete: number;
+  daysToDelivery: number | null;
+  daysLate: number;
+  reason: string;
+}
+
+export interface DeliveryRow {
+  orderId: number;
+  number: string;
+  status: string;
+  buyerId: number;
+  buyerName: string;
+  market: string;
+  orderDate: string;
+  deliveryDate?: string | null;
+  expectedDelivery?: string | null;
+  qty: number;
+  done: number;
+  wip: number;
+  deliveryStatus: string;
+  percentComplete: number;
+  daysToDelivery: number | null;
+  daysLate: number;
+  reason: string;
+}
+
+export interface DeliveryStatusResponse {
+  rows: DeliveryRow[];
+  counts: Record<string, number>;
+}
+
+/** One stage of the schedule, compared with what the board shows. */
+export interface StageEstimate {
+  orderLineStageId: number;
+  name: string;
+  sortOrder: number;
+  estimatedStart: string | null;
+  estimatedEnd: string | null;
+  status: 'NOT_STARTED' | 'IN_PROGRESS' | 'DONE' | 'OVERDUE' | 'AHEAD' | string;
+  daysRemaining: number | null;
+  daysOverdue: number;
+}
+
+export interface LineSchedule {
+  stages: StageEstimate[];
+  estimatedCompletion: string | null;
+  percentComplete: number;
+  isBehind: boolean;
+  daysLate: number;
+}
+
+export const STAGE_STATUS_COLOUR: Record<string, string> = {
+  NOT_STARTED: '#e0e0e0',
+  IN_PROGRESS: '#42a5f5',
+  DONE: '#66bb6a',
+  AHEAD: '#26a69a',
+  OVERDUE: '#ef5350',
+};
+
+/** Paperwork attached to an order. */
+export interface OrderAttachment {
+  id: number;
+  orderId: number;
+  filename: string;
+  originalName?: string | null;
+  url: string;
+  label?: string | null;
+  note?: string | null;
+  sizeBytes?: number | null;
+  createdAt: string;
+}
+
+export const ATTACHMENT_LABELS = ['PO_COPY', 'SHIPPING', 'CUSTOMS', 'PACKING_LIST', 'INSPECTION', 'DRAWING', 'OTHER'] as const;
+
+export const ATTACHMENT_LABEL_TEXT: Record<string, string> = {
+  PO_COPY: 'Buyer PO copy',
+  SHIPPING: 'Shipping document',
+  CUSTOMS: 'Customs document',
+  PACKING_LIST: 'Packing list',
+  INSPECTION: 'Inspection certificate',
+  DRAWING: 'Drawing',
+  OTHER: 'Other',
+};
+
+/** A document-level extra cost or discount: freight, packing, a dealer discount. */
+export interface DocCharge {
+  id?: number;
+  name: string;
+  kind: 'CHARGE' | 'DISCOUNT' | string;
+  /** Always stored positive; `kind` carries the sign. */
+  amount: number;
+  /** A percentage of the line subtotal. May be set alongside `amount`. */
+  pct: number;
+  gstRatePct: number;
+  /** False for something added after tax, e.g. a round-off. */
+  isTaxable: boolean;
+  note?: string | null;
+  sortOrder?: number;
+}
+
+/** One GST slab on a document. */
+export interface TaxRow {
+  ratePct: number;
+  taxable: number;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  total: number;
+}
+
+/**
+ * The full breakdown behind a document's total, from the server's pricing engine.
+ * `client/src/util/pricing.ts` computes the identical shape for live editing.
+ */
+export interface DocumentTotals {
+  subtotal: number;
+  grossSubtotal: number;
+  lineDiscount: number;
+  charges: { name: string; kind: string; value: number; isTaxable: boolean; gstRatePct: number }[];
+  chargeTotal: number;
+  taxableValue: number;
+  taxRows: TaxRow[];
+  cgst: number;
+  sgst: number;
+  igst: number;
+  taxTotal: number;
+  untaxedCharges: number;
+  grandTotal: number;
+  /** True when CGST+SGST applied, false for IGST. Meaningless when `taxed` is false. */
+  intraState: boolean;
+  /** False for an export, which is zero-rated end to end. */
+  taxed: boolean;
+}
+
 export interface OrderLineDto {
   id: number;
   productId: number;
   qty: number;
   unitPrice: number;
   sortOrder: number;
+  /** Net of this line's own discount — what it contributes to the subtotal. */
   amount: number;
+  grossAmount: number;
+  discountPct: number;
+  discountAmt: number;
+  /** Domestic only; ignored on an export, which is zero-rated. */
+  gstRatePct: number;
+  hsnCode?: string | null;
   product: { id: number; factoryCode: string; name: string; primaryImage?: string | null; stageLineId?: number | null; unit?: { code: string } | null };
   stageLineId?: number | null;
   stageLine?: { id: number; code: string; name: string } | null;
@@ -169,6 +333,8 @@ export interface OrderLineDto {
   outsourcedStages: { id: number; name: string; stage: string; sortOrder: number }[];
   needsStageLine: boolean;
   board: LineBoard;
+  /** When this line SHOULD be at each stage, versus where it is. Null until scheduled. */
+  schedule?: LineSchedule | null;
   history: StageMoveHistory[];
   sheet?: { id: number; number: string } | null;
 }
@@ -210,7 +376,22 @@ export interface Order {
   exchangeRate?: number | null;
   proforma?: { id: number; number: string; status: string } | null;
   lines: OrderLineDto[];
+  charges: DocCharge[];
+  attachments: OrderAttachment[];
+  /** The grand total — what the buyer owes, charges and GST included. */
+  /**
+   * The tax basis frozen when the document was created. Preferred over the live buyer,
+   * so correcting an address later cannot restate a document already issued.
+   */
+  taxMarket?: string | null;
+  taxBuyerState?: string | null;
+  taxCompanyState?: string | null;
   total: number;
+  /** Subtotal, charges and the CGST/SGST/IGST breakdown behind `total`. */
+  totals: DocumentTotals;
+  /** Will this make its date? Derived from the board, never stored. */
+  delivery: DeliveryVerdict;
+  expectedDelivery?: string | null;
   summary: { ordered: number; done: number; wip: number; pending: number; progressPct: number };
   jobwork: { vendorId: number; vendorName: string; pieces: number; amount: number; stages: string[] }[];
   money: OrderMoney;
@@ -243,6 +424,12 @@ export interface ProformaLineDto {
   qty: number;
   unitPrice: number;
   amount?: number;
+  grossAmount?: number;
+  discountPct?: number;
+  discountAmt?: number;
+  /** Domestic only; ignored on an export, which is zero-rated. */
+  gstRatePct?: number;
+  hsnCode?: string | null;
   specs?: string | null;
   image?: { id: number; url: string; filename: string } | null;
   product?: {
@@ -275,6 +462,16 @@ export interface Proforma {
   rejectReason?: string | null;
   order?: { id: number; number: string } | null;
   lines: ProformaLineDto[];
+  charges: DocCharge[];
+  /** Subtotal, charges and the CGST/SGST/IGST breakdown behind `total`. */
+  /**
+   * The tax basis frozen when the document was created. Preferred over the live buyer,
+   * so correcting an address later cannot restate a document already issued.
+   */
+  taxMarket?: string | null;
+  taxBuyerState?: string | null;
+  taxCompanyState?: string | null;
+  totals: DocumentTotals;
   total: number;
   canEdit: boolean;
 }
@@ -583,7 +780,7 @@ export const usePartyStatement = (partyType?: PartyType, partyId?: number | stri
 export const useOpsDashboard = () => useQuery({ queryKey: ['ops-dashboard'], queryFn: () => get<OpsDashboard>('/ops/dashboard') });
 
 /** Every query key that a movement or a money entry can invalidate. */
-export const OPS_KEYS = [['orders'], ['order'], ['ops-dashboard'], ['receivables'], ['payables'], ['finance-summary'], ['finance-parties'], ['statement'], ['payments'], ['stock-txns']];
+export const OPS_KEYS = [['orders'], ['order'], ['ops-dashboard'], ['receivables'], ['payables'], ['finance-summary'], ['finance-parties'], ['statement'], ['payments'], ['stock-txns'], ['finance-receivables-summary'], ['delivery-status']];
 
 /** Upload hand-over photos onto a movement. */
 export async function uploadMovePhotos(moveId: number, files: File[]): Promise<Order> {
@@ -594,8 +791,17 @@ export async function uploadMovePhotos(moveId: number, files: File[]): Promise<O
 export const useMailDraft = (proformaId?: number | string, enabled = true) =>
   useQuery({ enabled: enabled && proformaId != null, queryKey: ['pi-mail', proformaId], queryFn: () => get<MailDraftInfo>(`/proformas/${proformaId}/mail`) });
 
-export async function suggestPrice(productId: number, currencyId?: number) {
-  return get<{ fobInr: number; rate: number; currencyCode: string; suggested: number }>('/ops/price', { productId, currencyId });
+/**
+ * The costed floor for a product, on the right basis for the buyer's market: Non-FOB in
+ * rupees for a domestic sale, FOB converted for an export. Also returns the product's
+ * tax classification so a domestic line can seed its GST rate in the same round-trip.
+ */
+export async function suggestPrice(productId: number, currencyId?: number, buyerId?: number) {
+  return get<{ fobInr: number; basis: 'FOB' | 'NON_FOB'; rate: number; currencyCode: string; suggested: number; gstRatePct: number; hsnCode: string | null }>('/ops/price', {
+    productId,
+    currencyId,
+    buyerId,
+  });
 }
 
 /**

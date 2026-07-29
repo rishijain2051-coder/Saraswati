@@ -90,8 +90,23 @@ model Buyer {
   phone       String?
   address     String?
   isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+
+  /// Who they are: B2B (trade) or B2C (end customer). Independent of `market`, so all
+  /// four combinations exist — an overseas importer, a domestic dealer, a walk-in, a
+  /// web order from abroad.
+  channel String @default("B2B") // B2B | B2C
+  /// Where they are: OVERSEAS sells at FOB in their currency and is zero-rated;
+  /// DOMESTIC sells at Non-FOB in rupees and carries GST.
+  market  String @default("OVERSEAS") // OVERSEAS | DOMESTIC
+
+  /// GSTIN. Required in practice for a domestic B2B buyer, absent for B2C, and
+  /// meaningless overseas.
+  gstNo String?
+  /// The buyer's state, which decides CGST+SGST versus IGST against the company's own.
+  state String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   products  ProductBuyer[]
   orders    Order[]
@@ -141,9 +156,21 @@ model Product {
   volumeBeforePackingCbm Float?
   volumeAfterPackingCbm  Float?
 
+  /// Tax classification for domestic sales. Seeds the rate on a domestic proforma or
+  /// order line, which can then override it. Exports are zero-rated, so neither field
+  /// has any effect on an overseas document.
+  hsnCode    String?
+  gstRatePct Float   @default(18)
+
   createdById Int?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  /// Soft delete. Set instead of removing the row, so nothing is ever unrecoverable.
+  /// EVERY query that feeds a list or the money engine must filter `deletedAt: null` —
+  /// see lib/softDelete.ts. Filtering happens at the query layer, never inside the pure
+  /// functions, exactly as a cancelled order is excluded.
+  deletedAt DateTime?
 
   itemType    AttributeValue? @relation("ProductItemType", fields: [itemTypeId], references: [id])
   productType AttributeValue? @relation("ProductType", fields: [productTypeId], references: [id])
@@ -167,6 +194,7 @@ model Product {
 
   @@index([productTypeId])
   @@index([status])
+  @@index([deletedAt])
 }
 
 model ProductBuyer {
@@ -397,6 +425,11 @@ model StageLineStep {
   name        String
   sortOrder   Int    @default(0)
 
+  /// How long this step usually takes. Used to auto-schedule an order backwards from
+  /// its delivery date; steps left null fall back to an equal share of what is left.
+  /// Stating it once here is what makes a generated schedule believable.
+  defaultDays Int?
+
   stageLine StageLine  @relation(fields: [stageLineId], references: [id], onDelete: Cascade)
   costLines CostLine[]
 }
@@ -421,12 +454,75 @@ model Order {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
+  /// The factory's own estimate of when this will actually ship. Distinct from
+  /// `deliveryDate`, which is what the buyer asked for — comparing the two is the
+  /// whole point of delivery tracking.
+  expectedDelivery DateTime?
+
+  /// The tax basis, SNAPSHOTTED when the document is created — the same discipline as
+  /// `exchangeRate` and the stage steps. Read live, a later correction to the buyer's
+  /// market or state would silently restate every document already issued: a GST
+  /// quotation would reprint as an untaxed export, and receivables would move.
+  taxMarket       String?
+  taxBuyerState   String?
+  taxCompanyState String?
+
+  /// Soft delete. Set instead of removing the row, so nothing is ever unrecoverable.
+  /// EVERY query that feeds a list or the money engine must filter `deletedAt: null` —
+  /// see lib/softDelete.ts. Filtering happens at the query layer, never inside the pure
+  /// functions, exactly as a cancelled order is excluded.
+  deletedAt DateTime?
+
   buyer    Buyer            @relation(fields: [buyerId], references: [id])
   currency Currency?        @relation(fields: [currencyId], references: [id])
   proforma Proforma?        @relation("ProformaOrder", fields: [proformaId], references: [id])
-  lines    OrderLine[]
-  sheets   OperationSheet[]
-  ledger   LedgerEntry[]
+  lines       OrderLine[]
+  charges     OrderCharge[]
+  attachments OrderAttachment[]
+  schedules   OrderLineSchedule[]
+  sheets      OperationSheet[]
+  ledger      LedgerEntry[]
+
+  @@index([deletedAt])
+}
+
+/// A file hanging off an order: the buyer's PO, a bill of lading, customs paperwork, a
+/// packing list, an inspection certificate. Validated by extension AND magic bytes in
+/// lib/documentUpload.ts — a declared mimetype is attacker-controlled and proves nothing,
+/// exactly as for product images.
+model OrderAttachment {
+  id           Int      @id @default(autoincrement())
+  orderId      Int
+  filename     String
+  originalName String?
+  url          String
+  /// PO_COPY | SHIPPING | CUSTOMS | PACKING_LIST | INSPECTION | OTHER
+  label        String?
+  note         String?
+  sizeBytes    Int?
+  uploadedById Int?
+  createdAt    DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+/// The accepted proforma's charges, copied onto the order so the order is worth exactly
+/// what was quoted. Same shape and same maths as ProformaCharge.
+model OrderCharge {
+  id         Int     @id @default(autoincrement())
+  orderId    Int
+  name       String
+  kind       String  @default("CHARGE") // CHARGE | DISCOUNT
+  amount     Float   @default(0)
+  pct        Float   @default(0)
+  gstRatePct Float   @default(0)
+  isTaxable  Boolean @default(true)
+  note       String?
+  sortOrder  Int     @default(0)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 }
 
 model OrderLine {
@@ -437,6 +533,14 @@ model OrderLine {
   unitPrice Float @default(0) // in order currency
   sortOrder Int   @default(0)
 
+  /// Carried over from the proforma that was accepted, so the order is worth exactly
+  /// what was quoted. Same maths as ProformaLine — `lineNet()` in lib/pricing.ts.
+  discountPct Float @default(0)
+  discountAmt Float @default(0)
+
+  gstRatePct Float   @default(0)
+  hsnCode    String?
+
   /// Which route this line follows. WHO does each stage lives on the stage rows,
   /// so any mix is possible — e.g. 1-3 in-house, 4 outsourced, 5-6 in-house.
   stageLineId Int?
@@ -445,9 +549,45 @@ model OrderLine {
   product   Product    @relation(fields: [productId], references: [id])
   stageLine StageLine? @relation(fields: [stageLineId], references: [id])
 
-  stages OrderLineStage[]
-  moves  StageMove[]
-  sheet  OperationSheet?
+  stages   OrderLineStage[]
+  moves    StageMove[]
+  sheet    OperationSheet?
+  schedule OrderLineSchedule?
+}
+
+/// When an order line SHOULD be at each stage.
+///
+/// A deliberate overlay on the board, not a replacement: `StageMove` says where pieces
+/// ARE and that stays derived from the ledger. Nothing here ever feeds a quantity.
+model OrderLineSchedule {
+  id            Int       @id @default(autoincrement())
+  orderLineId   Int       @unique
+  orderId       Int
+  /// When this line is expected to be fully finished.
+  estimatedDone DateTime?
+  createdById   Int?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  orderLine OrderLine       @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
+  order     Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  stages    StageSchedule[]
+
+  @@index([orderId])
+}
+
+/// Estimated start and end for one stage of one order line.
+model StageSchedule {
+  id               Int       @id @default(autoincrement())
+  scheduleId       Int
+  orderLineStageId Int
+  estimatedStart   DateTime?
+  estimatedEnd     DateTime?
+
+  schedule       OrderLineSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  orderLineStage OrderLineStage    @relation(fields: [orderLineStageId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, orderLineStageId])
 }
 
 /// One stage of one order line — the snapshot of a StageLineStep.
@@ -466,8 +606,9 @@ model OrderLineStage {
 
   orderLine OrderLine   @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
   vendor    Supplier?   @relation("StageVendor", fields: [vendorId], references: [id])
-  movesFrom StageMove[] @relation("MoveFrom")
-  movesTo   StageMove[] @relation("MoveTo")
+  movesFrom      StageMove[]     @relation("MoveFrom")
+  movesTo        StageMove[]     @relation("MoveTo")
+  stageSchedules StageSchedule[]
 
   @@unique([orderLineId, sortOrder])
 }
@@ -553,6 +694,14 @@ model Proforma {
   bankDetails   String?
   notes         String?
   exchangeRate  Float?
+
+  /// The tax basis, SNAPSHOTTED when the document is created — the same discipline as
+  /// `exchangeRate` and the stage steps. Read live, a later correction to the buyer's
+  /// market or state would silently restate every document already issued: a GST
+  /// quotation would reprint as an untaxed export, and receivables would move.
+  taxMarket       String?
+  taxBuyerState   String?
+  taxCompanyState String?
   showImages    Boolean   @default(true) // print product photos on the PI
   sentAt        DateTime?
   decidedAt     DateTime? // when it was accepted or rejected
@@ -561,10 +710,45 @@ model Proforma {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  buyer    Buyer          @relation(fields: [buyerId], references: [id])
-  currency Currency?      @relation(fields: [currencyId], references: [id])
+  /// Soft delete. Set instead of removing the row, so nothing is ever unrecoverable.
+  /// EVERY query that feeds a list or the money engine must filter `deletedAt: null` —
+  /// see lib/softDelete.ts. Filtering happens at the query layer, never inside the pure
+  /// functions, exactly as a cancelled order is excluded.
+  deletedAt DateTime?
+
+  buyer    Buyer            @relation(fields: [buyerId], references: [id])
+  currency Currency?        @relation(fields: [currencyId], references: [id])
   lines    ProformaLine[]
-  order    Order?         @relation("ProformaOrder")
+  charges  ProformaCharge[]
+  order    Order?           @relation("ProformaOrder")
+
+  @@index([deletedAt])
+}
+
+/// An extra cost or a discount that belongs to the whole document rather than to one
+/// product — freight, packing, loading, a dealer discount.
+///
+/// A charge carries its OWN gst rate instead of being apportioned across the product
+/// lines, because that is how a real invoice bills freight and because apportioning
+/// would make the tax on a line depend on unrelated lines. `isTaxable` false is for
+/// something added after tax, e.g. a round-off.
+model ProformaCharge {
+  id         Int     @id @default(autoincrement())
+  proformaId Int
+  name       String
+  /// CHARGE adds, DISCOUNT subtracts. Amounts are always stored positive; the kind is
+  /// what decides the sign, so a discount can never accidentally read as a charge.
+  kind       String  @default("CHARGE") // CHARGE | DISCOUNT
+  /// Either a flat amount or a percentage of the line subtotal. Both may be set; the
+  /// percentage is worked out first and the flat amount added to it.
+  amount     Float   @default(0)
+  pct        Float   @default(0)
+  gstRatePct Float   @default(0)
+  isTaxable  Boolean @default(true)
+  note       String?
+  sortOrder  Int     @default(0)
+
+  proforma Proforma @relation(fields: [proformaId], references: [id], onDelete: Cascade)
 }
 
 model ProformaLine {
@@ -576,6 +760,16 @@ model ProformaLine {
   qty         Int    @default(1)
   unitPrice   Float  @default(0)
   sortOrder   Int    @default(0)
+
+  /// Per-line discount. The percentage comes off the gross first, then the flat amount
+  /// — see `lineNet()` in lib/pricing.ts, which is the only place this is worked out.
+  discountPct Float @default(0)
+  discountAmt Float @default(0)
+
+  /// Tax for this line, seeded from the product and overridable. Ignored entirely on an
+  /// overseas document, where exports are zero-rated.
+  gstRatePct Float   @default(0)
+  hsnCode    String?
 
   proforma Proforma      @relation(fields: [proformaId], references: [id], onDelete: Cascade)
   product  Product?      @relation(fields: [productId], references: [id])
@@ -597,9 +791,17 @@ model OperationSheet {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  /// Soft delete. Set instead of removing the row, so nothing is ever unrecoverable.
+  /// EVERY query that feeds a list or the money engine must filter `deletedAt: null` —
+  /// see lib/softDelete.ts. Filtering happens at the query layer, never inside the pure
+  /// functions, exactly as a cancelled order is excluded.
+  deletedAt DateTime?
+
   product   Product    @relation(fields: [productId], references: [id])
   order     Order?     @relation(fields: [orderId], references: [id], onDelete: Cascade)
   orderLine OrderLine? @relation(fields: [orderLineId], references: [id], onDelete: Cascade)
+
+  @@index([deletedAt])
 }
 
 /// Money that actually moved, plus manually-entered bills.
@@ -640,6 +842,12 @@ model LedgerEntry {
   createdById          Int?
   createdAt            DateTime @default(now())
 
+  /// Soft delete. Set instead of removing the row, so nothing is ever unrecoverable.
+  /// EVERY query that feeds a list or the money engine must filter `deletedAt: null` —
+  /// see lib/softDelete.ts. Filtering happens at the query layer, never inside the pure
+  /// functions, exactly as a cancelled order is excluded.
+  deletedAt DateTime?
+
   supplier   Supplier?           @relation("SupplierLedger", fields: [supplierId], references: [id])
   buyer      Buyer?              @relation("BuyerLedger", fields: [buyerId], references: [id])
   order      Order?              @relation(fields: [orderId], references: [id])
@@ -654,17 +862,55 @@ model LedgerEntry {
   @@index([partyType, buyerId])
   @@index([partyType, workerId])
   @@index([partyType, contractorId])
+
+  @@index([deletedAt])
 }
 
 model DocSequence {
   id      Int     @id @default(autoincrement())
-  key     String  @unique // PI | ORD | OP | WRK | CTR | STP
+  key     String  @unique // PI | ORD | OP | WRK | CTR | STP | DPI | DORD
   prefix  String
   useYear Boolean @default(false)
   lastNo  Int     @default(0)
 }
 
 /// App-wide settings that belong to no single module. Singleton (id = 1).
+/// Who WE are. Singleton (id = 1), Admin-editable in Master Data → Company.
+///
+/// `state` is not decoration: comparing it with the buyer's state is what decides
+/// CGST+SGST (same state) versus IGST (different), so the tax split is derived rather
+/// than typed. The address and GSTIN also give documents a letterhead.
+model Company {
+  id Int @id @default(1)
+
+  legalName String  @default("Saraswati Export")
+  tradeName String?
+  addressL1 String?
+  addressL2 String?
+  city      String?
+  state     String?
+  pincode   String?
+  country   String  @default("India")
+
+  gstNo String?
+  panNo String?
+  iecNo String? // importer-exporter code, for export documents
+  cinNo String?
+
+  phone   String?
+  email   String?
+  website String?
+
+  /// Printed on a proforma when the buyer has to remit money.
+  bankDetails String?
+
+  /// Letterhead logo, in server/uploads. Stored as a filename only, like every other
+  /// upload, so the served URL is built the same way.
+  logoFilename String?
+
+  updatedAt DateTime @updatedAt
+}
+
 model AppSetting {
   id Int @id @default(1)
 

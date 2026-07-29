@@ -1,12 +1,13 @@
 import { useMemo, useState } from 'react';
-import { App, Breadcrumb, Button, Card, Popconfirm, Progress, Segmented, Space, Table, Tag, Typography } from 'antd';
+import TrashDrawer, { TrashButton } from '../../components/TrashDrawer';
+import { App, Breadcrumb, Button, Card, Popconfirm, Progress, Segmented, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { HomeOutlined, PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { api, apiError } from '../../api/client';
-import { useOrders, ORDER_STATUS_COLOR, type Order } from '../../api/ops';
+import { useOrders, DELIVERY_COLOUR, DELIVERY_TEXT, ORDER_STATUS_COLOR, type Order } from '../../api/ops';
 import { useAuth } from '../../auth/AuthContext';
 import { money } from '../../util/format';
 import { MiniStrip } from './board/StageStrip';
@@ -21,6 +22,7 @@ const FILTERS = ['All', 'Live', 'Confirmed', 'Production', 'Ready', 'Shipped', '
 export default function OrdersPage() {
   const navigate = useNavigate();
   const { hasRole } = useAuth();
+  const [trashOpen, setTrashOpen] = useState(false);
   const { message } = App.useApp();
   const qc = useQueryClient();
   const { data, isLoading } = useOrders();
@@ -45,7 +47,22 @@ export default function OrdersPage() {
 
   const columns: ColumnsType<Order> = [
     { title: 'Order No.', dataIndex: 'number', width: 150, render: (n, r) => <Link to={`/operations/orders/${r.id}`} style={{ fontWeight: 600 }}>{n}</Link> },
-    { title: 'Buyer', dataIndex: ['buyer', 'name'], width: 180 },
+    {
+      title: 'Buyer',
+      dataIndex: ['buyer', 'name'],
+      width: 210,
+      // The market explains the currency and why some orders carry tax and others do not.
+      render: (v: string, r: Order) => (
+        <span>
+          {v}
+          <br />
+          <Tag color={r.buyer?.market === 'DOMESTIC' ? 'geekblue' : 'gold'} style={{ marginTop: 2 }}>
+            {r.buyer?.market === 'DOMESTIC' ? 'Domestic' : 'Overseas'}
+          </Tag>
+          {r.buyer?.channel === 'B2C' && <Tag>B2C</Tag>}
+        </span>
+      ),
+    },
     { title: 'Delivery', dataIndex: 'deliveryDate', width: 110, render: (d) => (d ? dayjs(d).format('DD MMM YY') : '—') },
     {
       title: 'Production',
@@ -65,6 +82,20 @@ export default function OrdersPage() {
     },
     { title: 'Total', dataIndex: 'total', align: 'right', width: 130, render: (v, r) => money(v, r.currency?.symbol ?? '₹') },
     { title: 'Status', dataIndex: 'status', width: 110, render: (s) => <Tag color={ORDER_STATUS_COLOR[s] ?? 'default'}>{s}</Tag> },
+    {
+      title: 'Delivery',
+      key: 'delivery',
+      width: 130,
+      // Derived from the board, so it is always current.
+      render: (_, r) =>
+        r.delivery && r.delivery.status !== 'NO_DATE' ? (
+          <Tooltip title={r.delivery.reason}>
+            <Tag color={DELIVERY_COLOUR[r.delivery.status] ?? 'default'}>{DELIVERY_TEXT[r.delivery.status] ?? r.delivery.status}</Tag>
+          </Tooltip>
+        ) : (
+          <Text type="secondary">—</Text>
+        ),
+    },
     {
       title: '',
       key: 'a',
@@ -98,11 +129,14 @@ export default function OrdersPage() {
           </Title>
           <Text type="secondary">Open one to see and move every piece through its stages.</Text>
         </div>
-        {hasRole('Operator') && (
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/operations/orders/new')}>
-            New Order
-          </Button>
-        )}
+        <Space>
+          {hasRole('Manager') && <TrashButton endpoint="/orders" onClick={() => setTrashOpen(true)} />}
+          {hasRole('Operator') && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/operations/orders/new')}>
+              New Order
+            </Button>
+          )}
+        </Space>
       </div>
       <Card size="small">
         <Segmented style={{ marginBottom: 12 }} value={filter} onChange={(v) => setFilter(v as (typeof FILTERS)[number])} options={FILTERS as unknown as string[]} />
@@ -117,6 +151,19 @@ export default function OrdersPage() {
           locale={{ emptyText: filter === 'Live' ? 'No live orders. Accept a proforma to create one.' : 'No orders here.' }}
         />
       </Card>
+      <TrashDrawer
+        open={trashOpen}
+        onClose={() => setTrashOpen(false)}
+        title="Deleted orders"
+        endpoint="/orders"
+        label="Order"
+        queryKeys={[['orders'], ['ops-dashboard'], ['receivables'], ['finance-summary'], ['finance-receivables-summary'], ['delivery-status']]}
+        columns={[
+          { title: 'Order', width: 150, render: (r) => <b>{String(r.number)}</b> },
+          { title: 'Buyer', render: (r) => String((r.buyer as { name?: string } | undefined)?.name ?? '—') },
+          { title: 'Status', width: 110, render: (r) => <Tag>{String(r.status)}</Tag> },
+        ]}
+      />
     </div>
   );
 }

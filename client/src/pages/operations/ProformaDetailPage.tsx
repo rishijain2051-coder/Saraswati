@@ -20,6 +20,9 @@ import { api, apiError } from '../../api/client';
 import { fetchDocument, useMailDraft, useProforma, PROFORMA_STATUS_COLOR } from '../../api/ops';
 import { useAuth } from '../../auth/AuthContext';
 import { money } from '../../util/format';
+import DocumentTotalsPanel from '../../components/DocumentTotals';
+import { documentTitle } from '../../util/pricing';
+import { useCompany } from '../../api/hooks';
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -31,6 +34,9 @@ export default function ProformaDetailPage() {
   const { hasRole } = useAuth();
   const editable = hasRole('Operator');
   const { data: p, isLoading, isError } = useProforma(id);
+  // The letterhead comes from the Company record, so the printed page and the PDF that
+  // goes to the buyer cannot say different things.
+  const { data: company } = useCompany();
 
   const [sendOpen, setSendOpen] = useState(false);
   const [acceptOpen, setAcceptOpen] = useState(false);
@@ -226,12 +232,21 @@ export default function ProformaDetailPage() {
       <div className="print-area">
         <div className="doc-sheet">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-            <div>
-              <div style={{ fontSize: 22, fontWeight: 700, color: '#4e342e' }}>Saraswati Export</div>
-              <div style={{ color: '#777', fontSize: 12 }}>Furniture &amp; Hardware Exporter · Jodhpur, India</div>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+              {company?.logoFilename && <img src={`/uploads/${company.logoFilename}`} alt="" style={{ width: 54, height: 54, objectFit: 'contain' }} />}
+              <div>
+                {/* From the Company record, so this page and the PDF cannot disagree. */}
+                <div style={{ fontSize: 22, fontWeight: 700, color: '#4e342e' }}>{company?.legalName ?? 'Saraswati Export'}</div>
+                <div style={{ color: '#777', fontSize: 12 }}>
+                  {[company?.tradeName, [company?.city, company?.state].filter(Boolean).join(', '), company?.country].filter(Boolean).join(' · ')}
+                </div>
+                {company?.gstNo && <div style={{ color: '#777', fontSize: 12 }}>GSTIN: {company.gstNo}</div>}
+              </div>
             </div>
             <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: 18, fontWeight: 700 }}>PROFORMA INVOICE</div>
+              {/* A domestic document is a Quotation, not a Proforma Invoice — the same
+                  string the PDF and the e-mail use. */}
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{documentTitle(p.taxMarket ?? p.buyer.market)}</div>
               <div>{p.number}</div>
               <div style={{ color: '#777' }}>{dayjs(p.date).format('DD MMM YYYY')}</div>
             </div>
@@ -245,11 +260,19 @@ export default function ProformaDetailPage() {
               {p.buyer.address && <div style={{ fontSize: 12, whiteSpace: 'pre-line' }}>{p.buyer.address}</div>}
               {p.buyer.country && <div style={{ fontSize: 12 }}>{p.buyer.country}</div>}
               {p.buyer.email && <div style={{ fontSize: 12 }}>{p.buyer.email}</div>}
+              {/* A GST document has to state the buyer's registration. */}
+              {p.buyer.gstNo && <div style={{ fontSize: 12 }}>GSTIN: {p.buyer.gstNo}</div>}
             </div>
             <div style={{ textAlign: 'right', fontSize: 12 }}>
               {p.incoterms && (
                 <div>
                   <b>Incoterms:</b> {p.incoterms}
+                </div>
+              )}
+              {/* Place of supply is what justifies the CGST/SGST versus IGST choice. */}
+              {p.totals?.taxed && (
+                <div>
+                  <b>Place of supply:</b> {p.taxBuyerState ?? p.buyer.state ?? '—'}
                 </div>
               )}
               {p.validUntil && (
@@ -269,8 +292,10 @@ export default function ProformaDetailPage() {
                 <th style={{ width: 34 }}>#</th>
                 {showImages && <th style={{ width: 74 }} />}
                 <th>Description</th>
+                {p.totals?.taxed && <th style={{ width: 62 }}>HSN</th>}
                 <th style={{ width: 60, textAlign: 'right' }}>Qty</th>
                 <th style={{ width: 100, textAlign: 'right' }}>Unit Price</th>
+                {p.totals?.taxed && <th style={{ width: 54, textAlign: 'right' }}>GST</th>}
                 <th style={{ width: 110, textAlign: 'right' }}>Amount</th>
               </tr>
             </thead>
@@ -283,20 +308,27 @@ export default function ProformaDetailPage() {
                     <div>{l.description}</div>
                     {l.product && <div style={{ color: '#999', fontSize: 11 }}>{l.product.factoryCode}</div>}
                     {l.specs && <div style={{ color: '#999', fontSize: 11 }}>{l.specs}</div>}
+                    {/* A discount is stated on its own line, or the amount looks wrong. */}
+                    {((l.discountPct ?? 0) > 0 || (l.discountAmt ?? 0) > 0) && (
+                      <div style={{ color: '#c62828', fontSize: 11 }}>
+                        {[(l.discountPct ?? 0) > 0 ? `${l.discountPct}% off` : '', (l.discountAmt ?? 0) > 0 ? `less ${money(l.discountAmt!, symbol)}` : ''].filter(Boolean).join(', ')}
+                      </div>
+                    )}
                   </td>
+                  {p.totals?.taxed && <td style={{ fontSize: 11, color: '#666' }}>{l.hsnCode ?? '—'}</td>}
                   <td style={{ textAlign: 'right' }}>{l.qty}</td>
                   <td style={{ textAlign: 'right' }}>{money(l.unitPrice, symbol)}</td>
-                  <td style={{ textAlign: 'right' }}>{money(l.qty * l.unitPrice, symbol)}</td>
+                  {p.totals?.taxed && <td style={{ textAlign: 'right', fontSize: 11 }}>{l.gstRatePct ?? 0}%</td>}
+                  <td style={{ textAlign: 'right' }}>{money(l.amount ?? l.qty * l.unitPrice, symbol)}</td>
                 </tr>
               ))}
-              <tr>
-                <td colSpan={showImages ? 5 : 4} style={{ textAlign: 'right', fontWeight: 700 }}>
-                  Total
-                </td>
-                <td style={{ textAlign: 'right', fontWeight: 700 }}>{money(p.total, symbol)}</td>
-              </tr>
             </tbody>
           </table>
+
+          {/* Subtotal, charges and the tax split — all from the pricing engine. */}
+          <div style={{ marginTop: 12 }}>
+            <DocumentTotalsPanel totals={p.totals} symbol={symbol} />
+          </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 20, gap: 24, fontSize: 12 }}>
             <div style={{ maxWidth: '55%' }}>

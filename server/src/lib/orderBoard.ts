@@ -8,12 +8,19 @@ import { ApiError } from './http';
 import { round } from './costing';
 import { buildBoard, impliedOrderStatus, rollUp, type LineBoard, type MoveRow, type StageRow } from './production';
 import { buildFinanceContext, jobworkEvents, type FinanceContext } from './finance';
+import { documentTotalsOf, lineGross, lineNet } from './pricing';
+import { companyState } from './company';
+import { deliveryStatus, estimateCompletion } from './scheduling';
 
 type Tx = Prisma.TransactionClient | PrismaClient;
 
 export const orderInclude = {
   buyer: true,
   currency: true,
+  /** Part of what the order is worth, so the pricing engine must be able to see them. */
+  charges: { orderBy: { sortOrder: 'asc' as const } },
+  /** PO copies, shipping and customs paperwork hanging off this order. */
+  attachments: { orderBy: [{ createdAt: 'desc' as const }] },
   proforma: { select: { id: true, number: true, status: true } },
   ledger: {
     orderBy: [{ date: 'desc' as const }, { id: 'desc' as const }],
@@ -35,6 +42,8 @@ export const orderInclude = {
       stageLine: { select: { id: true, code: true, name: true } },
       sheet: { select: { id: true, number: true } },
       stages: { orderBy: { sortOrder: 'asc' as const }, include: { vendor: { select: { id: true, name: true } } } },
+      /** The scheduling overlay: when this line SHOULD be at each stage. */
+      schedule: { include: { stages: true } },
       moves: {
         orderBy: [{ date: 'desc' as const }, { id: 'desc' as const }],
         include: {
@@ -62,13 +71,40 @@ export function serializeOrder(o: OrderWithBoard, ctx: FinanceContext) {
     return {
       ...l,
       product: { ...l.product, primaryImage: l.product.images?.[0]?.url ?? null, images: undefined },
-      amount: round(l.qty * l.unitPrice),
+      /** Net of this line's own discount — what it actually contributes to the total. */
+      amount: lineNet(l as never),
+      grossAmount: lineGross(l as never),
       needsStageLine: l.stages.length === 0,
       /** Where the work happens: purely derived from who owns each stage. */
       outsourcedStages: vendors,
       vendors: distinctVendors,
       mode: distinctVendors.length === 0 ? 'INHOUSE' : vendors.length === board.stages.length ? 'OUTSOURCED' : 'MIXED',
       board,
+      /**
+       * Planned versus actual. Derived on every read from the board and today's date, so
+       * it can never be stale — and it produces no quantities, so the board's own
+       * invariant is untouched.
+       */
+      schedule: l.schedule
+        ? estimateCompletion(
+            l.qty,
+            board.stages.map((st) => {
+              const planned = l.schedule!.stages.find((x) => x.orderLineStageId === st.id);
+              return {
+                orderLineStageId: st.id,
+                name: st.name,
+                sortOrder: st.sortOrder,
+                estimatedStart: planned?.estimatedStart ?? null,
+                estimatedEnd: planned?.estimatedEnd ?? null,
+                at: st.at,
+                cleared: st.cleared,
+              };
+            }),
+            new Date(),
+            // The board's own finished count, so this and `delivery` cannot disagree.
+            board.done
+          )
+        : null,
       history: l.moves.map((m) => ({
         id: m.id,
         kind: m.kind,
@@ -104,11 +140,25 @@ export function serializeOrder(o: OrderWithBoard, ctx: FinanceContext) {
   }
   const jobworkList = Array.from(jobwork.values());
 
-  const total = round(lines.reduce((s, l) => s + l.amount, 0));
+  // The one pricing engine, so this agrees with the FIFO buckets behind receivables and
+  // with the dashboard. `total` stays the grand total — what the buyer owes — because
+  // every existing caller reads it as exactly that.
+  const totals = documentTotalsOf(o as never, ctx.companyState);
+  const total = totals.grandTotal;
   return {
     ...o,
     lines,
+    /** Will this make its date? Derived from the board's progress, never stored. */
+    delivery: deliveryStatus({
+      status: o.status,
+      deliveryDate: o.deliveryDate,
+      expectedDelivery: o.expectedDelivery,
+      qty: summary.ordered,
+      done: summary.done,
+    }),
     total,
+    /** Subtotal, charges, and the CGST/SGST/IGST breakdown behind `total`. */
+    totals,
     summary,
     jobwork: jobworkList,
     money: orderMoney(o, total, ctx),
@@ -122,9 +172,11 @@ export function serializeOrder(o: OrderWithBoard, ctx: FinanceContext) {
  */
 export async function financeContextFor(orders: { buyerId: number }[]): Promise<FinanceContext> {
   const buyerIds = [...new Set(orders.map((o) => o.buyerId))];
-  const [related, entries] = await Promise.all([
+  const [related, entries, ourState] = await Promise.all([
     prisma.order.findMany({
-      where: { OR: [{ buyerId: { in: buyerIds } }, { ledger: { some: {} } }] },
+      // Soft-deleted orders leave the money picture exactly as cancelled ones do, and
+      // for the same reason: the query excludes them, the pure functions stay ignorant.
+      where: { deletedAt: null, OR: [{ buyerId: { in: buyerIds } }, { ledger: { some: {} } }] },
       select: {
         id: true,
         number: true,
@@ -133,10 +185,37 @@ export async function financeContextFor(orders: { buyerId: number }[]): Promise<
         orderDate: true,
         exchangeRate: true,
         currency: { select: { code: true, symbol: true } },
-        lines: { select: { qty: true, unitPrice: true, stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' } }, moves: true, product: { select: { factoryCode: true, name: true } }, id: true } },
+        // What the order is WORTH needs the discounts, the tax rates, the charges and
+        // the buyer's market — a narrower select here would feed the pricing engine
+        // undefined and quietly under-bill every domestic order.
+        buyer: { select: { market: true, state: true } },
+        // The snapshot is what prices the document; the buyer is only the fallback.
+        taxMarket: true,
+        taxBuyerState: true,
+        taxCompanyState: true,
+        charges: { orderBy: { sortOrder: 'asc' as const } },
+        lines: {
+          select: {
+            id: true,
+            qty: true,
+            unitPrice: true,
+            discountPct: true,
+            discountAmt: true,
+            gstRatePct: true,
+            stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' } },
+            moves: true,
+            product: { select: { factoryCode: true, name: true } },
+          },
+        },
       },
     }),
-    prisma.ledgerEntry.findMany({ orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
+    // Receipts aimed at a trashed order leave with it, exactly as in `financeData` — or
+    // FIFO would re-spread that money onto the buyer's other orders.
+    prisma.ledgerEntry.findMany({
+      where: { deletedAt: null, OR: [{ orderId: null }, { order: { deletedAt: null } }] },
+      orderBy: [{ date: 'asc' }, { id: 'asc' }],
+    }),
+    companyState(),
   ]);
 
   // Jobwork accrued per vendor per order, straight off each board.
@@ -150,7 +229,7 @@ export async function financeContextFor(orders: { buyerId: number }[]): Promise<
       }
     }
   }
-  return buildFinanceContext(related as never, entries as never, jobwork);
+  return buildFinanceContext(related as never, entries as never, jobwork, ourState);
 }
 
 /**
@@ -203,6 +282,9 @@ export function orderMoney(
 export async function loadOrder(id: number) {
   const o = await prisma.order.findUnique({ where: { id }, include: orderInclude });
   if (!o) throw new ApiError(404, 'Order not found.');
+  // Everything that opens or acts on an order comes through here, so one check keeps a
+  // trashed order out of the detail page, the board, the schedule and the PDF alike.
+  if (o.deletedAt) throw new ApiError(410, `${o.number} is in the trash. Restore it to open it.`);
   return o;
 }
 

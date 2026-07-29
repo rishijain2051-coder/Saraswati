@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import TrashDrawer, { TrashButton } from '../../components/TrashDrawer';
 import { App, Breadcrumb, Button, Card, Form, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Typography } from 'antd';
 import { HomeOutlined, PlusOutlined, EyeOutlined, DeleteOutlined, ShopOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
@@ -25,6 +26,7 @@ export default function SheetsPage() {
   const { data: orders } = useOrders();
   const [form] = Form.useForm();
   const [open, setOpen] = useState(false);
+  const [trashOpen, setTrashOpen] = useState(false);
 
   const refresh = () => qc.invalidateQueries({ queryKey: ['op-sheets'] });
 
@@ -112,7 +114,9 @@ export default function SheetsPage() {
           </Title>
           <Text type="secondary">What a job needs — wood, hardware, polish, packing, labour — exploded from the product costing and printable per section.</Text>
         </div>
-        {hasRole('Operator') && (
+        <Space>
+          {hasRole('Manager') && <TrashButton endpoint="/operation-sheets" onClick={() => setTrashOpen(true)} />}
+          {hasRole('Operator') && (
           <Button
             type="primary"
             icon={<PlusOutlined />}
@@ -124,7 +128,8 @@ export default function SheetsPage() {
           >
             New Sheet
           </Button>
-        )}
+          )}
+        </Space>
       </div>
 
       {isLoading ? (
@@ -166,6 +171,19 @@ export default function SheetsPage() {
           </Form.Item>
         </Form>
       </Modal>
+      <TrashDrawer
+        open={trashOpen}
+        onClose={() => setTrashOpen(false)}
+        title="Deleted material sheets"
+        endpoint="/operation-sheets"
+        label="Material sheet"
+        queryKeys={[['sheets'], ['ops-dashboard']]}
+        columns={[
+          { title: 'Sheet', width: 130, render: (r) => <b>{String(r.number)}</b> },
+          { title: 'Product', render: (r) => String((r.product as { factoryCode?: string } | undefined)?.factoryCode ?? '—') },
+          { title: 'Qty', width: 70, render: (r) => String(r.qty) },
+        ]}
+      />
     </div>
   );
 }

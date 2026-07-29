@@ -39,8 +39,17 @@ export async function wipeOperational(prisma: PrismaClient): Promise<{ files: nu
   await prisma.orderLineStage.deleteMany();
   await prisma.operationSheet.deleteMany();
   await prisma.ledgerEntry.deleteMany();
+  // The scheduling overlay and the attachments hang off orders; clear them before the
+  // orders themselves so this list stays order-independent.
+  await prisma.stageSchedule.deleteMany();
+  await prisma.orderLineSchedule.deleteMany();
+  await prisma.orderAttachment.deleteMany();
+  // Charges before their documents: they cascade, but deleting children first keeps
+  // this list order-independent rather than relying on a referential action.
+  await prisma.orderCharge.deleteMany();
   await prisma.orderLine.deleteMany();
   await prisma.order.deleteMany();
+  await prisma.proformaCharge.deleteMany();
   await prisma.proformaLine.deleteMany();
   await prisma.proforma.deleteMany();
 
@@ -62,7 +71,23 @@ export async function wipeOperational(prisma: PrismaClient): Promise<{ files: nu
 }
 
 /**
- * Product images, hand-over photos and worker documents all share this directory.
+ * Files that survive a wipe because the record pointing at them survives too.
+ *
+ * The company logo is CONFIGURATION — `cleanSlate` deliberately keeps the Company row —
+ * so deleting the file would leave `logoFilename` pointing at nothing and every document
+ * would print a broken letterhead after `db:clean`. Anything whose owning row is wiped
+ * (product images, hand-over photos, worker documents, order attachments) must go.
+ */
+const KEEP = [/^\.gitkeep$/, /^company-logo-/i];
+
+/** True when a file in `uploads` must survive a wipe. Asserted in verify.ts. */
+export function survivesWipe(filename: string): boolean {
+  return KEEP.some((re) => re.test(filename));
+}
+
+/**
+ * Product images, hand-over photos, worker documents and order attachments all share this
+ * directory, and all of them belong to rows that a wipe removes.
  *
  * NOTE: this is a filesystem path, so it is wiped regardless of which database
  * DATABASE_URL points at. Returns the number of files removed so a caller can say so
@@ -72,7 +97,7 @@ export function wipeUploads(): number {
   if (!fs.existsSync(UPLOADS)) return 0;
   let n = 0;
   for (const f of fs.readdirSync(UPLOADS)) {
-    if (f === '.gitkeep') continue;
+    if (KEEP.some((re) => re.test(f))) continue;
     fs.unlinkSync(path.join(UPLOADS, f));
     n++;
   }

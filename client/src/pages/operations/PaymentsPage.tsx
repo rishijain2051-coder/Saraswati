@@ -6,6 +6,8 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import dayjs from 'dayjs';
 import type { ColumnsType } from 'antd/es/table';
 import { api, apiError } from '../../api/client';
+import ForexSummaryCard from '../../components/ForexSummaryCard';
+import TrashDrawer, { TrashButton } from '../../components/TrashDrawer';
 import { OPS_KEYS, useFinanceParties, useFinanceSummary, useOrders, usePayables, usePayments, useReceivables, useSuppliers, type AllocatedPayment, type LedgerEntry, type Payable, type PartyRow, type Receivable } from '../../api/ops';
 import { useBuyers } from '../../api/hooks';
 import { useContractors, useStatutoryComponents, useWorkers } from '../../api/manforce';
@@ -35,6 +37,7 @@ export default function PaymentsPage() {
   const navigate = useNavigate();
   const { message } = App.useApp();
   const { hasRole } = useAuth();
+  const [trashOpen, setTrashOpen] = useState(false);
   const { data: summary } = useFinanceSummary();
   const { data: receivableData, isLoading: loadingR } = useReceivables();
   const { data: payables, isLoading: loadingP } = usePayables();
@@ -308,11 +311,14 @@ export default function PaymentsPage() {
           </Title>
           <Text type="secondary">Every balance is worked out from the orders and the production board. You only record money that actually moved.</Text>
         </div>
-        {hasRole('Manager') && (
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => openForm('BUYER', 'PAYMENT')}>
-            Record money
-          </Button>
-        )}
+        <Space>
+          {hasRole('Manager') && <TrashButton endpoint="/payments" onClick={() => setTrashOpen(true)} />}
+          {hasRole('Manager') && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => openForm('BUYER', 'PAYMENT')}>
+              Record money
+            </Button>
+          )}
+        </Space>
       </div>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
@@ -370,6 +376,11 @@ export default function PaymentsPage() {
                     message="Receipts settle the oldest order first"
                     description="A buyer owes their order value less what has been received. A receipt clears the order it names, then any surplus rolls on to their next oldest unpaid order; anything still left over is held on account. Cancelled orders drop out."
                   />
+                  {/* What is outstanding per currency, and what the rupee value has done
+                      since each order was booked. */}
+                  <div style={{ marginBottom: 12 }}>
+                    <ForexSummaryCard />
+                  </div>
                   {(receivableData?.credits ?? []).length > 0 && (
                     <Alert
                       type="success"
@@ -656,6 +667,19 @@ export default function PaymentsPage() {
           </Form.Item>
         </Form>
       </Modal>
+      <TrashDrawer
+        open={trashOpen}
+        onClose={() => setTrashOpen(false)}
+        title="Deleted money entries"
+        endpoint="/payments"
+        label="Entry"
+        queryKeys={[['payments'], ['receivables'], ['payables'], ['finance-summary'], ['finance-parties'], ['statement'], ['ops-dashboard'], ['finance-receivables-summary']]}
+        columns={[
+          { title: 'Party', render: (r) => String(r.partyName) },
+          { title: 'Kind', width: 90, render: (r) => String(r.kind) },
+          { title: 'Amount', width: 130, render: (r) => `${String(r.currency ?? 'INR')} ${Number(r.amount).toLocaleString('en-IN')}` },
+        ]}
+      />
     </div>
   );
 }

@@ -7,6 +7,7 @@ import { ApiError, asyncHandler } from '../lib/http';
 import { authenticate, requireRole } from '../middleware/auth';
 import { computeCostSheet } from '../lib/productCosting';
 import { loadMethodMap } from '../lib/methods';
+import { live, notDeleted, restore, softDelete } from '../lib/softDelete';
 import { diffCostSheet, logChanges } from '../lib/changeLog';
 import type { MethodMap } from '../lib/costing';
 import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
@@ -91,6 +92,13 @@ const productSchema = z.object({
   piecesPerCarton: z.number().int().nullable().optional(),
   volumeBeforePackingCbm: num,
   volumeAfterPackingCbm: num,
+  /**
+   * Tax classification for domestic sales. Seeds the rate and HSN on a domestic
+   * proforma or order line; has no effect at all on the costing roll-up or on an export,
+   * which is zero-rated.
+   */
+  hsnCode: z.string().nullable().optional(),
+  gstRatePct: z.number().min(0).max(100).optional(),
   buyers: z
     .array(z.object({ buyerId: z.number().int(), buyerCode: z.string().nullable().optional() }))
     .default([]),
@@ -129,6 +137,8 @@ function scalarData(d: ProductInput) {
     piecesPerCarton: d.piecesPerCarton ?? null,
     volumeBeforePackingCbm: d.volumeBeforePackingCbm ?? null,
     volumeAfterPackingCbm: d.volumeAfterPackingCbm ?? null,
+    hsnCode: d.hsnCode?.trim() || null,
+    gstRatePct: d.gstRatePct ?? 18,
   };
 }
 
@@ -316,7 +326,7 @@ router.get(
 
     const [methods, products] = await Promise.all([
       loadMethodMap(),
-      prisma.product.findMany({ where, include: listInclude, orderBy: { updatedAt: 'desc' } }),
+      prisma.product.findMany({ where: live(where), include: listInclude, orderBy: { updatedAt: 'desc' } }),
     ]);
     res.json(products.map((p) => summarize(p, methods)));
   })
@@ -328,7 +338,7 @@ router.get(
   asyncHandler(async (_req, res) => {
     const [methods, products] = await Promise.all([
       loadMethodMap(),
-      prisma.product.findMany({ include: listInclude, orderBy: { factoryCode: 'asc' } }),
+      prisma.product.findMany({ where: notDeleted, include: listInclude, orderBy: { factoryCode: 'asc' } }),
     ]);
     res.json(products.map((p) => summarize(p, methods)));
   })
@@ -338,6 +348,21 @@ router.get(
 // Single product (full detail + computed costing)
 // ---------------------------------------------------------------------------
 
+/** What is in the trash. Declared before `/:id` so the literal path wins. */
+router.get(
+  '/trash',
+  requireRole('Manager'),
+  asyncHandler(async (_req, res) => {
+    res.json(
+      await prisma.product.findMany({
+        where: { deletedAt: { not: null } },
+        select: { id: true, factoryCode: true, name: true, status: true, deletedAt: true },
+        orderBy: { deletedAt: 'desc' },
+      })
+    );
+  })
+);
+
 router.get(
   '/:id',
   asyncHandler(async (req, res) => {
@@ -346,6 +371,9 @@ router.get(
       prisma.product.findUnique({ where: { id: Number(req.params.id) }, include: fullInclude }),
     ]);
     if (!product) throw new ApiError(404, 'Product not found.');
+    // Reachable from a bookmark or a stale tab. Say it is in the trash rather than
+    // rendering a page whose Save would silently resurrect it.
+    if (product.deletedAt) throw new ApiError(410, `${product.factoryCode} is in the trash. Restore it to open it.`);
     res.json(serializeFull(product, methods));
   })
 );
@@ -384,6 +412,12 @@ router.put(
   '/:id',
   canEdit,
   asyncHandler(async (req, res) => {
+    // A trashed product must not be edited back to life through a stale tab.
+    {
+      const existing = await prisma.product.findUnique({ where: { id: Number(req.params.id) }, select: { deletedAt: true, factoryCode: true } });
+      if (!existing) throw new ApiError(404, 'Product not found.');
+      if (existing.deletedAt) throw new ApiError(409, `${existing.factoryCode} is in the trash. Restore it before editing it.`);
+    }
     const id = Number(req.params.id);
     const data = productSchema.parse(req.body);
     await checkStageSteps(data);
@@ -425,32 +459,84 @@ router.put(
 // Delete
 // ---------------------------------------------------------------------------
 
-router.delete(
-  '/:id',
+/** What a product's references are, for the messages below. */
+async function productReferences(id: number) {
+  const [orderLines, proformaLines, sheets] = await Promise.all([
+    prisma.orderLine.count({ where: { productId: id } }),
+    prisma.proformaLine.count({ where: { productId: id } }),
+    prisma.operationSheet.count({ where: { productId: id } }),
+  ]);
+  const bits = [orderLines && `${orderLines} order line(s)`, proformaLines && `${proformaLines} proforma line(s)`, sheets && `${sheets} material sheet(s)`].filter(Boolean).join(', ');
+  return { count: orderLines + proformaLines + sheets, bits };
+}
+
+
+router.post(
+  '/:id/restore',
   requireRole('Manager'),
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const product = await prisma.product.findUnique({ where: { id }, select: { factoryCode: true, name: true } });
-    if (!product) throw new ApiError(404, 'Product not found.');
+    const existing = await prisma.product.findUnique({ where: { id }, select: { deletedAt: true, factoryCode: true } });
+    if (!existing) throw new ApiError(404, 'Product not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.factoryCode} is not in the trash.`);
+    await restore('product', id);
+    res.json({ restored: true, factoryCode: existing.factoryCode });
+  })
+);
 
-    // Say what is in the way instead of letting a foreign key surface as a 500.
-    const [orderLines, proformaLines, sheets] = await Promise.all([
-      prisma.orderLine.count({ where: { productId: id } }),
-      prisma.proformaLine.count({ where: { productId: id } }),
-      prisma.operationSheet.count({ where: { productId: id } }),
-    ]);
-    if (orderLines + proformaLines + sheets > 0) {
-      const bits = [orderLines && `${orderLines} order line(s)`, proformaLines && `${proformaLines} proforma line(s)`, sheets && `${sheets} material sheet(s)`].filter(Boolean).join(', ');
-      throw new ApiError(409, `${product.factoryCode} is used by ${bits}. Set it to Discontinued instead of deleting.`);
+/**
+ * Destroy for good. Admin only, and only from the trash. There is deliberately no
+ * waiting period and no automatic purge — nothing disappears because time passed.
+ */
+router.delete(
+  '/:id/permanent',
+  requireRole('Admin'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.product.findUnique({ where: { id }, select: { deletedAt: true, factoryCode: true } });
+    if (!existing) throw new ApiError(404, 'Product not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.factoryCode} is still live. Delete it first, then destroy it from the trash.`);
+
+    // Now the foreign keys really bite, so name them instead of letting one 500.
+    const refs = await productReferences(id);
+    if (refs.count > 0) {
+      throw new ApiError(409, `${existing.factoryCode} cannot be destroyed: ${refs.bits} still reference it. It can stay in the trash indefinitely.`);
     }
 
     const images = await prisma.productImage.findMany({ where: { productId: id } });
     await prisma.product.delete({ where: { id } });
     for (const img of images) {
-      const p = path.join(uploadDir, img.filename);
-      fs.promises.unlink(p).catch(() => undefined);
+      const file = path.join(uploadDir, img.filename);
+      fs.promises.unlink(file).catch(() => undefined);
     }
     res.status(204).end();
+  })
+);
+
+/**
+ * Move a product to the trash. Nothing is destroyed, so the "in use" check is now
+ * ADVISORY rather than blocking: the orders and sheets that reference it keep working
+ * untouched, the product simply stops appearing in the catalogue, and it can be
+ * restored with one click.
+ */
+router.delete(
+  '/:id',
+  requireRole('Manager'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const product = await prisma.product.findUnique({ where: { id }, select: { factoryCode: true, name: true, deletedAt: true } });
+    if (!product) throw new ApiError(404, 'Product not found.');
+    if (product.deletedAt) throw new ApiError(409, `${product.factoryCode} is already in the trash.`);
+
+    const refs = await productReferences(id);
+    const deletedAt = await softDelete('product', id);
+    res.json({
+      deleted: true,
+      deletedAt,
+      factoryCode: product.factoryCode,
+      inUse: refs.count > 0,
+      note: refs.count > 0 ? `Moved to the trash. ${refs.bits} still reference it — those records are unaffected.` : 'Moved to the trash.',
+    });
   })
 );
 

@@ -241,6 +241,27 @@ export default function StepDetails({
           Volumes auto-calculate from the dimensions above (CBM = L×W×H inches × {CBM_PER_CUBIC_INCH}; “after packing” is divided by pcs/carton). You can still type your own value.
         </Text>
       </Card>
+
+      {/*
+        Tax classification. Reference only for costing — it seeds the rate and HSN on a
+        DOMESTIC proforma or order line. An export is zero-rated, so neither field has
+        any effect there, and neither touches the FOB roll-up.
+      */}
+      <Card title="Tax (domestic sales)" size="small" style={{ marginTop: 16 }}>
+        <Row gutter={[16, 12]}>
+          <Col xs={12} md={6}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              HSN code
+            </Text>
+            <Input value={draft.hsnCode ?? ''} placeholder="9403" onChange={(e) => set({ hsnCode: e.target.value })} />
+          </Col>
+          <NumField label="GST rate (%)" value={draft.gstRatePct ?? 18} step={0.5} onChange={(v) => set({ gstRatePct: v })} />
+        </Row>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          Seeds the rate and HSN when this product goes on a domestic quote or order, where either can still be overridden on the line. Exports are zero-rated, so this never affects an
+          overseas document — and it never affects the costing roll-up.
+        </Text>
+      </Card>
     </div>
   );
 }

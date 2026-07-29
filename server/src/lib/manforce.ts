@@ -146,7 +146,9 @@ export async function buildWorkforceContext(opts: { to?: Date } = {}): Promise<W
     prisma.worker.findMany({ select: workerSelect, orderBy: [{ name: 'asc' }] }),
     prisma.attendance.findMany({ orderBy: { date: 'asc' } }),
     prisma.orderLine.findMany({
-      where: { order: { status: { not: 'Cancelled' } } },
+      // Cancelled AND trashed, for the same reason: `financeData` excludes both, and a
+      // worker cannot still be owed for an order that has left every other total.
+      where: { order: { status: { not: 'Cancelled' }, deletedAt: null } },
       include: {
         order: { select: { id: true, number: true } },
         product: { select: { factoryCode: true, name: true } },
@@ -154,7 +156,9 @@ export async function buildWorkforceContext(opts: { to?: Date } = {}): Promise<W
         moves: { include: { workers: true } },
       },
     }),
-    prisma.ledgerEntry.findMany({ where: { partyType: { in: ['WORKER', 'CONTRACTOR', 'STATUTORY'] } }, orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
+    // A wage payment moved to the trash must leave the worker's balance, so the filter
+    // belongs here in the loader — the workforce engine stays ignorant of deletion.
+    prisma.ledgerEntry.findMany({ where: { deletedAt: null, partyType: { in: ['WORKER', 'CONTRACTOR', 'STATUTORY'] } }, orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
     prisma.workerAdvance.findMany({ orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
     prisma.workerDeduction.findMany({ orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
     prisma.statutoryPostingLine.findMany({ include: { posting: { select: { number: true, postedOn: true, periodFrom: true, periodTo: true } }, component: { select: { code: true, name: true } } } }),

@@ -82,6 +82,7 @@ export default function AppLayout() {
         { key: '/operations', icon: <DashboardOutlined />, label: <Link to="/operations">Dashboard</Link> },
         { key: '/operations/proformas', icon: <FileTextOutlined />, label: <Link to="/operations/proformas">Proformas</Link> },
         { key: '/operations/orders', icon: <FileDoneOutlined />, label: <Link to="/operations/orders">Orders</Link> },
+        { key: '/operations/delivery', icon: <CalendarOutlined />, label: <Link to="/operations/delivery">Delivery</Link> },
         { key: '/operations/sheets', icon: <ProfileOutlined />, label: <Link to="/operations/sheets">Material Sheets</Link> },
         { key: '/operations/suppliers', icon: <ShopOutlined />, label: <Link to="/operations/suppliers">Suppliers</Link> },
         { key: '/operations/stock', icon: <InboxOutlined />, label: <Link to="/operations/stock">Stock</Link> },

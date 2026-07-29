@@ -11,7 +11,12 @@ import { loadMethodMap } from '../lib/methods';
 import { round } from '../lib/costing';
 import { buildBoard, expandHops, MOVE_KINDS, validateMove, type MoveRow } from '../lib/production';
 import { loadOrder, loadSerializedOrder, materializeStages, orderInclude, resolveStageLineId, serializeOrders, syncOrderStatus } from '../lib/orderBoard';
-import { proformaPdf } from '../lib/docPdf';
+import { orderPdf, proformaPdf } from '../lib/docPdf';
+import { CHARGE_KINDS, docKeys, documentTotalsOf, isDomestic, lineGross, lineNet } from '../lib/pricing';
+import { companyState, ensureCompany, type CompanyProfile } from '../lib/company';
+import { assertLive, notDeleted, restore, softDelete } from '../lib/softDelete';
+import { ATTACHMENT_LABELS, attachmentUploader, keepRealDocuments } from '../lib/documentUpload';
+import { DELIVERY_URGENCY, autoSchedule, deliveryStatus } from '../lib/scheduling';
 import { buildEml, mailtoUrl, proformaMail } from '../lib/mailDraft';
 import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
 import { validateMoveWorkers } from '../lib/workforce';
@@ -28,8 +33,14 @@ const uploadPhotos = imageUploader('move-');
 export const ORDER_STATUSES = ['Confirmed', 'Production', 'Ready', 'Shipped', 'Closed', 'Cancelled'] as const;
 export const PROFORMA_STATUSES = ['Draft', 'Sent', 'Accepted', 'Rejected'] as const;
 
-// FOB (INR) for a product's active cost sheet.
-async function productFobInr(productId: number): Promise<number> {
+/**
+ * The costed floor for a product, in rupees, on the right basis for the market.
+ *
+ * An export is quoted at FOB. A domestic sale has no CHA, no forwarder and no ICD, so it
+ * is quoted at Non-FOB — the same roll-up with the whole Forwarding head excluded. Both
+ * figures already come out of the costing engine; nothing is recalculated here.
+ */
+async function productFloorInr(productId: number, market: string | null | undefined): Promise<{ value: number; basis: 'FOB' | 'NON_FOB'; gstRatePct: number; hsnCode: string | null }> {
   const [methods, product] = await Promise.all([
     loadMethodMap(),
     prisma.product.findUnique({
@@ -38,19 +49,41 @@ async function productFobInr(productId: number): Promise<number> {
     }),
   ]);
   const computed = computeCostSheet(product?.costSheets?.[0], methods) as any;
-  return computed?.summary?.fob ?? 0;
+  const domestic = isDomestic(market);
+  return {
+    value: (domestic ? computed?.summary?.nonFob : computed?.summary?.fob) ?? 0,
+    basis: domestic ? 'NON_FOB' : 'FOB',
+    gstRatePct: product?.gstRatePct ?? 0,
+    hsnCode: product?.hsnCode ?? null,
+  };
 }
 
-// Suggested selling price = FOB(INR) converted to the target currency (INR per unit = rateToBase).
+/**
+ * Suggested selling price. Domestic buyers are quoted Non-FOB in rupees; overseas
+ * buyers FOB converted at the currency's rate. The response also carries the product's
+ * tax classification so a domestic line can seed its GST rate in the same round-trip.
+ */
 router.get(
   '/ops/price',
   asyncHandler(async (req, res) => {
     const productId = Number(req.query.productId);
     const currencyId = req.query.currencyId ? Number(req.query.currencyId) : undefined;
-    const fobInr = await productFobInr(productId);
+    const buyerId = req.query.buyerId ? Number(req.query.buyerId) : undefined;
+    const buyer = buyerId ? await prisma.buyer.findUnique({ where: { id: buyerId }, select: { market: true } }) : null;
+    const floor = await productFloorInr(productId, buyer?.market);
     const currency = currencyId ? await prisma.currency.findUnique({ where: { id: currencyId } }) : null;
     const rate = currency?.rateToBase ?? 1;
-    res.json({ fobInr: round(fobInr), rate, currencyCode: currency?.code ?? 'INR', suggested: round(fobInr / (rate || 1)) });
+    res.json({
+      // Kept as `fobInr` because that is the field the client already reads; `basis`
+      // says which roll-up it actually is.
+      fobInr: round(floor.value),
+      basis: floor.basis,
+      rate,
+      currencyCode: currency?.code ?? 'INR',
+      suggested: round(floor.value / (rate || 1)),
+      gstRatePct: floor.gstRatePct,
+      hsnCode: floor.hsnCode,
+    });
   })
 );
 
@@ -62,8 +95,85 @@ router.get(
   '/orders',
   asyncHandler(async (req, res) => {
     const status = req.query.status as string | undefined;
-    const orders = await prisma.order.findMany({ where: status ? { status } : undefined, include: orderInclude, orderBy: { orderDate: 'desc' } });
+    const orders = await prisma.order.findMany({ where: { ...notDeleted, ...(status ? { status } : {}) }, include: orderInclude, orderBy: { orderDate: 'desc' } });
     res.json(await serializeOrders(orders));
+  })
+);
+
+/** What is in the order trash. Declared before `/orders/:id` so the literal wins. */
+router.get(
+  '/orders/trash',
+  canManage,
+  asyncHandler(async (_req, res) => {
+    res.json(
+      await prisma.order.findMany({
+        where: { deletedAt: { not: null } },
+        select: { id: true, number: true, status: true, orderDate: true, deletedAt: true, buyer: { select: { name: true } } },
+        orderBy: { deletedAt: 'desc' },
+      })
+    );
+  })
+);
+
+/**
+ * Every live order with its delivery verdict, most urgent first.
+ *
+ * Registered before `/orders/:id` so the literal path is not swallowed by it.
+ */
+router.get(
+  '/orders/delivery-status',
+  asyncHandler(async (_req, res) => {
+    const orders = await prisma.order.findMany({
+      where: { ...notDeleted, status: { notIn: ['Cancelled'] } },
+      select: {
+        id: true,
+        number: true,
+        status: true,
+        orderDate: true,
+        deliveryDate: true,
+        expectedDelivery: true,
+        buyer: { select: { id: true, name: true, market: true } },
+        currency: { select: { code: true, symbol: true } },
+        lines: { select: { qty: true, stages: { orderBy: { sortOrder: 'asc' } }, moves: true } },
+      },
+      orderBy: [{ deliveryDate: 'asc' }],
+    });
+
+    const rows = orders.map((o) => {
+      // Progress from the board, exactly as the order page derives it.
+      const boards = o.lines.map((l) => buildBoard(l.qty, l.stages as never, l.moves as never));
+      const qty = boards.reduce((a, b) => a + b.qty, 0);
+      const done = boards.reduce((a, b) => a + b.done, 0);
+      const verdict = deliveryStatus({ status: o.status, deliveryDate: o.deliveryDate, expectedDelivery: o.expectedDelivery, qty, done });
+      return {
+        orderId: o.id,
+        number: o.number,
+        status: o.status,
+        buyerId: o.buyer.id,
+        buyerName: o.buyer.name,
+        market: o.buyer.market,
+        orderDate: o.orderDate,
+        deliveryDate: o.deliveryDate,
+        expectedDelivery: o.expectedDelivery,
+        qty,
+        done,
+        wip: boards.reduce((a, b) => a + b.wip, 0),
+        // Named apart from the order's own `status`, which means something different.
+        deliveryStatus: verdict.status,
+        percentComplete: verdict.percentComplete,
+        daysToDelivery: verdict.daysToDelivery,
+        daysLate: verdict.daysLate,
+        reason: verdict.reason,
+      };
+    });
+
+    rows.sort(
+      (a, b) => DELIVERY_URGENCY[a.deliveryStatus] - DELIVERY_URGENCY[b.deliveryStatus] || (a.daysToDelivery ?? 9e9) - (b.daysToDelivery ?? 9e9)
+    );
+
+    const counts = { LATE: 0, AT_RISK: 0, ON_TRACK: 0, NO_DATE: 0, DELIVERED: 0 } as Record<string, number>;
+    for (const r of rows) counts[r.deliveryStatus] = (counts[r.deliveryStatus] ?? 0) + 1;
+    res.json({ rows, counts });
   })
 );
 
@@ -74,11 +184,31 @@ router.get(
   })
 );
 
+/** A document-level extra cost or discount. Shared by proformas and orders. */
+const chargeSchema = z.object({
+  name: z.string().min(1),
+  kind: z.enum(CHARGE_KINDS).default('CHARGE'),
+  amount: z.number().min(0).default(0),
+  pct: z.number().min(0).max(100).default(0),
+  gstRatePct: z.number().min(0).max(100).default(0),
+  isTaxable: z.boolean().default(true),
+  note: z.string().nullable().optional(),
+});
+
+/** Tax and discount fields a product line may carry. Ignored on an export. */
+const lineTaxFields = {
+  discountPct: z.number().min(0).max(100).default(0),
+  discountAmt: z.number().min(0).default(0),
+  gstRatePct: z.number().min(0).max(100).default(0),
+  hsnCode: z.string().nullable().optional(),
+};
+
 const orderLineSchema = z.object({
   id: z.number().int().optional(),
   productId: z.number().int(),
   qty: z.number().int().positive(),
   unitPrice: z.number().min(0),
+  ...lineTaxFields,
 });
 
 const orderSchema = z.object({
@@ -90,6 +220,21 @@ const orderSchema = z.object({
   incoterms: z.string().nullable().optional(),
   notes: z.string().nullable().optional(),
   lines: z.array(orderLineSchema).default([]),
+  charges: z.array(chargeSchema).default([]),
+});
+
+/**
+ * The tax and discount columns of an order line, for a create or an update.
+ *
+ * An export stores ZERO rates rather than trusting the client to have cleared them. The
+ * engine already ignores rates on an untaxed document, but a stored 18% would start
+ * taxing real money the moment that buyer's market was switched to DOMESTIC.
+ */
+const orderLineTax = (l: z.output<typeof orderLineSchema>, domestic: boolean) => ({
+  discountPct: l.discountPct,
+  discountAmt: l.discountAmt,
+  gstRatePct: domestic ? l.gstRatePct : 0,
+  hsnCode: domestic ? l.hsnCode?.trim() || null : null,
 });
 
 router.post(
@@ -98,8 +243,19 @@ router.post(
   asyncHandler(async (req, res) => {
     const data = orderSchema.parse(req.body);
     if (data.lines.length === 0) throw new ApiError(400, 'An order needs at least one product line.');
-    const number = await nextDocNumber('ORD');
+    const buyer = await prisma.buyer.findUnique({ where: { id: data.buyerId }, select: { market: true, state: true } });
+    if (!buyer) throw new ApiError(404, 'Buyer not found.');
+    const domestic = isDomestic(buyer.market);
+    // A product in the trash is invisible everywhere; quoting one would create a live
+    // order line pointing at something nobody can see.
+    await assertLive('product', data.lines.map((l) => l.productId), 'an order');
+    const number = await nextDocNumber(docKeys(buyer.market).order);
+    const ourState = await companyState();
     const currency = data.currencyId ? await prisma.currency.findUnique({ where: { id: data.currencyId } }) : null;
+    // A domestic sale is priced off Non-FOB IN RUPEES. Left in a foreign currency the
+    // suggestion would be divided by that rate and the whole document, GST included,
+    // would be denominated in euro — and a rupee receipt could never settle it.
+    assertCurrencyForMarket(domestic, currency);
 
     const created = await prisma.$transaction(async (tx) => {
       const order = await tx.order.create({
@@ -114,12 +270,18 @@ router.post(
           notes: data.notes ?? null,
           exchangeRate: currency?.rateToBase ?? null,
           createdById: req.user!.sub,
+          // The tax basis, frozen now. Correcting the buyer's address later must not
+          // restate what this order is worth.
+          taxMarket: buyer.market,
+          taxBuyerState: buyer.state,
+          taxCompanyState: ourState,
+          charges: { create: chargeRows(data.charges, domestic) },
         },
       });
       for (let i = 0; i < data.lines.length; i++) {
         const l = data.lines[i];
         const stageLineId = await resolveStageLineId(tx, l.productId);
-        const line = await tx.orderLine.create({ data: { orderId: order.id, productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i, stageLineId } });
+        const line = await tx.orderLine.create({ data: { orderId: order.id, productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, ...orderLineTax(l, domestic), sortOrder: i, stageLineId } });
         await materializeStages(tx, line.id, stageLineId);
       }
       return order;
@@ -139,6 +301,15 @@ router.put(
 
     const existing = await prisma.order.findUnique({ where: { id }, include: { lines: { include: { stages: true, moves: true, product: { select: { factoryCode: true } } } } } });
     if (!existing) throw new ApiError(404, 'Order not found.');
+    if (existing.deletedAt) throw new ApiError(409, `${existing.number} is in the trash. Restore it before editing it.`);
+
+    const putBuyer = await prisma.buyer.findUnique({ where: { id: data.buyerId }, select: { market: true, state: true } });
+    if (!putBuyer) throw new ApiError(404, 'Buyer not found.');
+    const domestic = isDomestic(putBuyer.market);
+    await assertLive('product', data.lines.map((l) => l.productId), 'an order');
+    const putCurrency = data.currencyId ? await prisma.currency.findUnique({ where: { id: data.currencyId } }) : null;
+    assertCurrencyForMarket(domestic, putCurrency);
+    const putState = await companyState();
 
     // Lines are matched by id and PATCHED — never wiped and rebuilt — so stage
     // snapshots and movement history survive an edit.
@@ -175,8 +346,23 @@ router.put(
           deliveryDate: data.deliveryDate ? new Date(data.deliveryDate) : null,
           incoterms: data.incoterms ?? null,
           notes: data.notes ?? null,
+          // The snapshotted rate must move WITH the currency. Left behind, a rupee order
+          // edited to USD keeps rate 1 and the forex card books a phantom gain of the
+          // whole order value; a USD order edited to GBP keeps the dollar rate forever.
+          exchangeRate: putCurrency?.rateToBase ?? null,
+          // And the tax basis must follow the buyer, or moving a domestic order from a
+          // Rajasthan buyer to a Gujarat one keeps the intra-state snapshot and the PDF
+          // prints CGST + SGST on what is now an inter-state sale.
+          taxMarket: putBuyer.market,
+          taxBuyerState: putBuyer.state,
+          taxCompanyState: putState,
         },
       });
+
+      // Charges carry no history and nothing references one by id, so unlike lines they
+      // are replaced wholesale.
+      await tx.orderCharge.deleteMany({ where: { orderId: id } });
+      for (const c of chargeRows(data.charges, domestic)) await tx.orderCharge.create({ data: { orderId: id, ...c } });
 
       for (const line of existing.lines) {
         if (!keptIds.has(line.id)) await tx.orderLine.delete({ where: { id: line.id } });
@@ -186,14 +372,17 @@ router.put(
         const l = data.lines[i];
         if (l.id) {
           const prev = existing.lines.find((x) => x.id === l.id)!;
-          await tx.orderLine.update({ where: { id: l.id }, data: { productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i } });
+          await tx.orderLine.update({ where: { id: l.id }, data: { productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, ...orderLineTax(l, domestic), sortOrder: i } });
           await logChanges(
             tx,
             { type: 'Order', id },
             { id: req.user!.sub, name: req.user!.name },
-            diffFields('OrderLine', l.id, prev, { unitPrice: l.unitPrice, qty: l.qty }, [
+            diffFields('OrderLine', l.id, prev, { unitPrice: l.unitPrice, qty: l.qty, discountPct: l.discountPct, discountAmt: l.discountAmt, gstRatePct: l.gstRatePct }, [
               { field: 'unitPrice', label: 'unit price' },
               { field: 'qty', label: 'quantity' },
+              { field: 'discountPct', label: 'discount %' },
+              { field: 'discountAmt', label: 'discount amount' },
+              { field: 'gstRatePct', label: 'GST rate' },
             ], prev.product.factoryCode)
           );
           if (l.productId !== prev.productId) {
@@ -203,7 +392,7 @@ router.put(
           }
         } else {
           const stageLineId = await resolveStageLineId(tx, l.productId);
-          const line = await tx.orderLine.create({ data: { orderId: id, productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i, stageLineId } });
+          const line = await tx.orderLine.create({ data: { orderId: id, productId: l.productId, qty: l.qty, unitPrice: l.unitPrice, ...orderLineTax(l, domestic), sortOrder: i, stageLineId } });
           await materializeStages(tx, line.id, stageLineId);
         }
       }
@@ -224,12 +413,60 @@ router.patch(
   })
 );
 
+
+router.post(
+  '/orders/:id/restore',
+  canManage,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.order.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Order not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.number} is not in the trash.`);
+    await restore('order', id);
+    res.json({ restored: true, number: existing.number });
+  })
+);
+
+/** Destroy for good. Admin only, only from the trash, no waiting period. */
+router.delete(
+  '/orders/:id/permanent',
+  requireRole('Admin'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.order.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Order not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.number} is still live. Delete it first, then destroy it from the trash.`);
+
+    // Attachments and hand-over photos cascade as ROWS but not as FILES, so gather the
+    // names before the delete — otherwise 250 MB of paperwork is orphaned on disk with
+    // nothing left pointing at it.
+    const [attachments, photos] = await Promise.all([
+      prisma.orderAttachment.findMany({ where: { orderId: id }, select: { filename: true } }),
+      prisma.stageMovePhoto.findMany({ where: { move: { orderLine: { orderId: id } } }, select: { filename: true } }),
+    ]);
+    await prisma.order.delete({ where: { id } });
+    for (const f of [...attachments, ...photos]) {
+      await fs.promises.unlink(path.join(uploadDir, f.filename)).catch(() => undefined);
+    }
+    res.status(204).end();
+  })
+);
+
+/**
+ * Move an order to the trash. Its production history, charges and ledger rows all
+ * survive; it simply leaves every list and the money picture — the same way a cancelled
+ * order does — and can be restored intact.
+ */
 router.delete(
   '/orders/:id',
   canManage,
   asyncHandler(async (req, res) => {
-    await prisma.order.delete({ where: { id: Number(req.params.id) } });
-    res.status(204).end();
+    const id = Number(req.params.id);
+    const existing = await prisma.order.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Order not found.');
+    if (existing.deletedAt) throw new ApiError(409, `${existing.number} is already in the trash.`);
+    const deletedAt = await softDelete('order', id);
+    res.json({ deleted: true, deletedAt, number: existing.number, note: 'Moved to the trash. It has left the money totals and can be restored.' });
   })
 );
 
@@ -344,6 +581,336 @@ router.patch(
   })
 );
 
+
+
+// ---------------------------------------------------------------------------
+// Scheduling and delivery tracking — an overlay on the board
+// ---------------------------------------------------------------------------
+
+
+/** The schedule for one order, with the live board comparison attached per line. */
+router.get(
+  '/orders/:id/schedule',
+  asyncHandler(async (req, res) => {
+    const o = await loadSerializedOrder(Number(req.params.id));
+    res.json({
+      orderId: o.id,
+      number: o.number,
+      deliveryDate: o.deliveryDate,
+      expectedDelivery: o.expectedDelivery,
+      delivery: o.delivery,
+      lines: o.lines.map((l: any) => ({
+        orderLineId: l.id,
+        product: l.product,
+        qty: l.qty,
+        stages: l.board.stages.map((s: any) => ({ orderLineStageId: s.id, name: s.name, sortOrder: s.sortOrder, at: s.at, cleared: s.cleared })),
+        schedule: l.schedule,
+      })),
+    });
+  })
+);
+
+const scheduleSchema = z.object({
+  expectedDelivery: z.string().datetime().nullable().optional(),
+  lines: z
+    .array(
+      z.object({
+        orderLineId: z.number().int(),
+        estimatedDone: z.string().datetime().nullable().optional(),
+        stages: z
+          .array(
+            z.object({
+              orderLineStageId: z.number().int(),
+              estimatedStart: z.string().datetime().nullable().optional(),
+              estimatedEnd: z.string().datetime().nullable().optional(),
+            })
+          )
+          .default([]),
+      })
+    )
+    .default([]),
+});
+
+/** Create or replace the schedule for an order's lines. */
+router.put(
+  '/orders/:id/schedule',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const data = scheduleSchema.parse(req.body);
+    const order = await prisma.order.findUnique({ where: { id: orderId }, include: { lines: { select: { id: true, stages: { select: { id: true } } } } } });
+    if (!order) throw new ApiError(404, 'Order not found.');
+
+    for (const l of data.lines) {
+      const line = order.lines.find((x) => x.id === l.orderLineId);
+      if (!line) throw new ApiError(400, `Line ${l.orderLineId} does not belong to this order.`);
+      // A stage id from another line would silently schedule the wrong work.
+      for (const st of l.stages) {
+        if (!line.stages.some((x) => x.id === st.orderLineStageId)) {
+          throw new ApiError(400, 'A stage in the schedule does not belong to that order line.');
+        }
+      }
+    }
+
+    await prisma.$transaction(async (tx) => {
+      if (data.expectedDelivery !== undefined) {
+        await tx.order.update({ where: { id: orderId }, data: { expectedDelivery: data.expectedDelivery ? new Date(data.expectedDelivery) : null } });
+      }
+      for (const l of data.lines) {
+        const schedule = await tx.orderLineSchedule.upsert({
+          where: { orderLineId: l.orderLineId },
+          update: { estimatedDone: l.estimatedDone ? new Date(l.estimatedDone) : null },
+          create: { orderLineId: l.orderLineId, orderId, estimatedDone: l.estimatedDone ? new Date(l.estimatedDone) : null, createdById: req.user!.sub },
+        });
+        // Replaced wholesale: a schedule carries no history worth patching.
+        await tx.stageSchedule.deleteMany({ where: { scheduleId: schedule.id } });
+        for (const st of l.stages) {
+          if (!st.estimatedStart && !st.estimatedEnd) continue;
+          await tx.stageSchedule.create({
+            data: {
+              scheduleId: schedule.id,
+              orderLineStageId: st.orderLineStageId,
+              estimatedStart: st.estimatedStart ? new Date(st.estimatedStart) : null,
+              estimatedEnd: st.estimatedEnd ? new Date(st.estimatedEnd) : null,
+            },
+          });
+        }
+      }
+    });
+
+    res.json(await loadSerializedOrder(orderId));
+  })
+);
+
+/**
+ * Fill in a schedule automatically, working from today to the delivery date and using
+ * each step's `defaultDays` from its stage line. A starting point to adjust, not a
+ * commitment.
+ */
+router.post(
+  '/orders/:id/auto-schedule',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const body = z.object({ from: z.string().datetime().optional(), to: z.string().datetime().optional() }).parse(req.body ?? {});
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { lines: { include: { stages: { orderBy: { sortOrder: 'asc' } }, stageLine: { include: { steps: { orderBy: { sortOrder: 'asc' } } } } } } },
+    });
+    if (!order) throw new ApiError(404, 'Order not found.');
+
+    const to = body.to ? new Date(body.to) : order.deliveryDate ?? order.expectedDelivery;
+    if (!to) throw new ApiError(400, 'This order has no delivery date, so there is nothing to schedule backwards from. Set one first, or pass a target date.');
+    const from = body.from ? new Date(body.from) : new Date();
+
+    await prisma.$transaction(async (tx) => {
+      for (const line of order.lines) {
+        if (line.stages.length === 0) continue;
+        // Durations come from the master stage line, matched to the order's snapshot by
+        // position — the snapshot is a copy of those steps, in order.
+        // Matched on sortOrder, then name — never array position. The snapshot exists so
+        // that editing the master line cannot rewrite a live order, and inserting a step
+        // into that line would otherwise shift every duration by one.
+        const masterFor = (s: { name: string; sortOrder: number }) =>
+          line.stageLine?.steps.find((x) => x.sortOrder === s.sortOrder) ?? line.stageLine?.steps.find((x) => x.name === s.name) ?? null;
+        const plan = autoSchedule(
+          line.stages.map((s) => ({ orderLineStageId: s.id, name: s.name, sortOrder: s.sortOrder, defaultDays: masterFor(s)?.defaultDays ?? null })),
+          from,
+          to
+        );
+        const schedule = await tx.orderLineSchedule.upsert({
+          where: { orderLineId: line.id },
+          update: { estimatedDone: plan.length ? plan[plan.length - 1].estimatedEnd : null },
+          create: { orderLineId: line.id, orderId, estimatedDone: plan.length ? plan[plan.length - 1].estimatedEnd : null, createdById: req.user!.sub },
+        });
+        await tx.stageSchedule.deleteMany({ where: { scheduleId: schedule.id } });
+        for (const st of plan) {
+          await tx.stageSchedule.create({ data: { scheduleId: schedule.id, orderLineStageId: st.orderLineStageId, estimatedStart: st.estimatedStart, estimatedEnd: st.estimatedEnd } });
+        }
+      }
+      if (!order.expectedDelivery) await tx.order.update({ where: { id: orderId }, data: { expectedDelivery: to } });
+    });
+
+    res.json(await loadSerializedOrder(orderId));
+  })
+);
+
+/**
+ * The order as a printable confirmation / job card. Same letterhead and the same money
+ * engine as the proforma, so the two documents always agree.
+ */
+router.get(
+  '/orders/:id/pdf',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const [o, co] = await Promise.all([loadSerializedOrder(id), ensureCompany()]);
+    const pdf = await orderPdf({
+      number: o.number,
+      date: o.orderDate,
+      deliveryDate: o.deliveryDate,
+      currencyCode: o.currency?.code ?? 'INR',
+      exchangeRate: o.exchangeRate,
+      status: o.status,
+      buyer: o.buyer as never,
+      company: co,
+      incoterms: o.incoterms,
+      notes: o.notes,
+      proformaNumber: o.proforma?.number ?? null,
+      taxMarket: o.taxMarket,
+      taxBuyerState: o.taxBuyerState,
+      taxCompanyState: o.taxCompanyState,
+      charges: o.charges,
+      lines: o.lines.map((l: any) => ({
+        productCode: l.product.factoryCode,
+        description: l.product.name,
+        qty: l.qty,
+        unitPrice: l.unitPrice,
+        discountPct: l.discountPct,
+        discountAmt: l.discountAmt,
+        gstRatePct: l.gstRatePct,
+        hsnCode: l.hsnCode,
+        stageLine: l.stageLine ? `${l.stageLine.code} - ${l.stageLine.name}` : null,
+      })),
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${o.number}.pdf"`);
+    res.send(pdf);
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Order attachments — PO copies, shipping and customs paperwork
+// ---------------------------------------------------------------------------
+
+const uploadAttachments = attachmentUploader('order-');
+
+router.get(
+  '/orders/:id/attachments',
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const order = await prisma.order.findUnique({ where: { id: orderId }, select: { id: true } });
+    if (!order) throw new ApiError(404, 'Order not found.');
+    res.json(await prisma.orderAttachment.findMany({ where: { orderId }, orderBy: [{ createdAt: 'desc' }] }));
+  })
+);
+
+/**
+ * Attach one or more files. Validated by extension AND magic bytes — a declared
+ * mimetype proves nothing — and anything whose contents contradict its name is unlinked
+ * before a row can point at it.
+ */
+router.post(
+  '/orders/:id/attachments',
+  canEdit,
+  uploadAttachments.array('files', 10),
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+
+    // multer has ALREADY written every byte to disk by the time this handler runs, so any
+    // refusal from here on must unlink them — otherwise `POST /orders/99999/attachments`
+    // with ten 25 MB files leaves 250 MB orphaned, repeatably.
+    const discard = async () => {
+      for (const f of files) await fs.promises.unlink(f.path).catch(() => undefined);
+    };
+    const refuse = async (status: number, message: string) => {
+      await discard();
+      throw new ApiError(status, message);
+    };
+
+    const order = await prisma.order.findUnique({ where: { id: orderId }, select: { id: true, number: true, deletedAt: true } });
+    if (!order) await refuse(404, 'Order not found.');
+    if (order!.deletedAt) await refuse(409, `${order!.number} is in the trash. Restore it before attaching files.`);
+
+    const parsed = z
+      .object({ label: z.enum(ATTACHMENT_LABELS).optional(), note: z.string().nullable().optional() })
+      .safeParse({ label: req.body?.label || undefined, note: req.body?.note ?? null });
+    if (!parsed.success) await refuse(400, 'That attachment label is not one we recognise.');
+    const body = parsed.data!;
+
+    // Validated last, because it unlinks the files it rejects itself.
+    const kept = keepRealDocuments(files);
+    const dropped = files.length - kept.length;
+
+    await prisma.orderAttachment.createMany({
+      data: kept.map((f) => ({
+        orderId,
+        filename: f.filename,
+        originalName: f.originalname,
+        url: `/uploads/${f.filename}`,
+        label: body.label ?? 'OTHER',
+        note: body.note ?? null,
+        sizeBytes: f.size,
+        uploadedById: req.user!.sub,
+      })),
+    });
+
+    // #25: say what was dropped rather than silently returning only the survivors.
+    res.status(201).json({
+      attachments: await prisma.orderAttachment.findMany({ where: { orderId }, orderBy: [{ createdAt: 'desc' }] }),
+      added: kept.length,
+      skipped: dropped,
+    });
+  })
+);
+
+/**
+ * Stream one attachment back.
+ *
+ * Scoped to the order in the path, so one order's id cannot fetch another's file, and
+ * routed through the API rather than `/uploads` so the download carries the original
+ * filename and the bearer token the client already sends.
+ */
+router.get(
+  '/orders/:id/attachments/:attachmentId',
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const id = Number(req.params.attachmentId);
+    const att = await prisma.orderAttachment.findFirst({ where: { id, orderId } });
+    if (!att) throw new ApiError(404, 'Attachment not found on that order.');
+    const full = path.join(uploadDir, att.filename);
+    if (!fs.existsSync(full)) throw new ApiError(410, `${att.originalName ?? att.filename} is no longer on disk.`);
+    // Never inline: these are arbitrary documents, so they download rather than render.
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', `attachment; filename="${(att.originalName ?? att.filename).replace(/[^\w.\- ]/g, '_')}"`);
+    fs.createReadStream(full).pipe(res);
+  })
+);
+
+/** Rename or re-label an attachment without re-uploading it. */
+router.patch(
+  '/orders/:id/attachments/:attachmentId',
+  canEdit,
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const id = Number(req.params.attachmentId);
+    // Scoped to the order in the path, so one order's id cannot touch another's file.
+    const existing = await prisma.orderAttachment.findFirst({ where: { id, orderId } });
+    if (!existing) throw new ApiError(404, 'Attachment not found on that order.');
+    const data = z.object({ label: z.enum(ATTACHMENT_LABELS).optional(), note: z.string().nullable().optional() }).parse(req.body ?? {});
+    res.json(await prisma.orderAttachment.update({ where: { id }, data }));
+  })
+);
+
+/**
+ * Remove an attachment. A hard delete: a file is not operational data with a history,
+ * and leaving orphaned bytes in `uploads` would be worse than losing the row.
+ */
+router.delete(
+  '/orders/:id/attachments/:attachmentId',
+  canManage,
+  asyncHandler(async (req, res) => {
+    const orderId = Number(req.params.id);
+    const id = Number(req.params.attachmentId);
+    const existing = await prisma.orderAttachment.findFirst({ where: { id, orderId } });
+    if (!existing) throw new ApiError(404, 'Attachment not found on that order.');
+    await prisma.orderAttachment.delete({ where: { id } });
+    fs.promises.unlink(path.join(uploadDir, existing.filename)).catch(() => undefined);
+    res.status(204).end();
+  })
+);
+
 // ---------------------------------------------------------------------------
 // Stage movements (the board) — each hand-over carries a comment and photos
 // ---------------------------------------------------------------------------
@@ -397,6 +964,10 @@ router.post(
       if (!order) throw new ApiError(404, 'Order not found.');
       if (order.status === 'Cancelled') throw new ApiError(409, 'This order is cancelled — reopen it before moving pieces.');
 
+      const orderRow = await tx.order.findUnique({ where: { id: orderId }, select: { number: true, deletedAt: true } });
+      if (!orderRow) throw new ApiError(404, 'Order not found.');
+      // Pieces cannot move on an order that has left every list and every total.
+      if (orderRow.deletedAt) throw new ApiError(409, `${orderRow.number} is in the trash. Restore it before moving pieces.`);
       const lines = await tx.orderLine.findMany({
         where: { orderId },
         include: { stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' } }, moves: true, product: { select: { factoryCode: true } } },
@@ -564,6 +1135,7 @@ router.delete(
 const proformaInclude = {
   buyer: true,
   currency: true,
+  charges: { orderBy: { sortOrder: 'asc' as const } },
   lines: {
     orderBy: { sortOrder: 'asc' as const },
     include: {
@@ -590,9 +1162,12 @@ const proformaInclude = {
 
 type ProformaLoaded = Awaited<ReturnType<typeof loadProforma>>;
 
-async function loadProforma(id: number) {
+async function loadProforma(id: number, allowTrashed = false) {
   const p = await prisma.proforma.findUnique({ where: { id }, include: proformaInclude });
   if (!p) throw new ApiError(404, 'Proforma not found.');
+  // The mutating routes each need to say something specific about the trash, so they pass
+  // `allowTrashed` and check for themselves; a plain read refuses here.
+  if (p.deletedAt && !allowTrashed) throw new ApiError(410, `${p.number} is in the trash. Restore it to open it.`);
   return p;
 }
 
@@ -610,31 +1185,80 @@ function specsOf(p: any): string | null {
   return bits.length ? bits.join(' · ') : null;
 }
 
-function serializeProforma(p: ProformaLoaded) {
-  const lines = p.lines.map((l) => ({ ...l, image: lineImage(l), specs: specsOf(l.product), amount: round(l.qty * l.unitPrice) }));
+function serializeProforma(p: ProformaLoaded, ourState: string | null = null) {
+  const lines = p.lines.map((l) => ({ ...l, image: lineImage(l), specs: specsOf(l.product), amount: lineNet(l), grossAmount: lineGross(l) }));
+  // One call to the pricing engine, exactly as an order does it, so a quote and the
+  // order it becomes can never be worth different amounts.
+  const totals = documentTotalsOf(p as never, ourState);
   return {
     ...p,
     lines,
-    total: round(lines.reduce((s, l) => s + l.amount, 0)),
+    total: totals.grandTotal,
+    /** Subtotal, charges and the CGST/SGST/IGST breakdown behind `total`. */
+    totals,
     canEdit: !p.order && p.status !== 'Accepted',
   };
+}
+
+/**
+ * Load and serialize in one go. Every route goes through this so none of them can
+ * forget the company state the tax split depends on.
+ */
+async function serializedProforma(id: number) {
+  const [p, ourState] = await Promise.all([loadProforma(id), companyState()]);
+  return serializeProforma(p, ourState);
 }
 
 router.get(
   '/proformas',
   asyncHandler(async (req, res) => {
     const status = req.query.status as string | undefined;
-    const list = await prisma.proforma.findMany({ where: status ? { status } : undefined, include: proformaInclude, orderBy: [{ date: 'desc' }, { id: 'desc' }] });
-    res.json(list.map(serializeProforma));
+    const [list, ourState] = await Promise.all([
+      prisma.proforma.findMany({ where: { ...notDeleted, ...(status ? { status } : {}) }, include: proformaInclude, orderBy: [{ date: 'desc' }, { id: 'desc' }] }),
+      companyState(),
+    ]);
+    res.json(list.map((p) => serializeProforma(p, ourState)));
+  })
+);
+
+router.get(
+  '/proformas/trash',
+  canManage,
+  asyncHandler(async (_req, res) => {
+    res.json(
+      await prisma.proforma.findMany({
+        where: { deletedAt: { not: null } },
+        select: { id: true, number: true, status: true, date: true, deletedAt: true, buyer: { select: { name: true } } },
+        orderBy: { deletedAt: 'desc' },
+      })
+    );
   })
 );
 
 router.get(
   '/proformas/:id',
   asyncHandler(async (req, res) => {
-    res.json(serializeProforma(await loadProforma(Number(req.params.id))));
+    res.json(await serializedProforma(Number(req.params.id)));
   })
 );
+
+/**
+ * A domestic document must be in rupees, and an export must not be.
+ *
+ * Non-FOB is a rupee figure; `/ops/price` divides it by the currency rate, so a domestic
+ * quote left in euro would be priced at a ninetieth of its value AND have its GST
+ * denominated in euro. FIFO also partitions receipts by currency, so a rupee NEFT could
+ * never settle it.
+ */
+function assertCurrencyForMarket(domestic: boolean, currency: { code: string; isBase: boolean } | null) {
+  const code = currency?.code ?? 'INR';
+  if (domestic && code !== 'INR') {
+    throw new ApiError(400, `A domestic sale is priced in rupees — ${code} cannot be used. Switch the currency to INR.`);
+  }
+  if (!domestic && code === 'INR') {
+    throw new ApiError(400, 'An export is priced in the buyer\'s currency. Pick the currency this buyer is invoiced in.');
+  }
+}
 
 const proformaSchema = z.object({
   buyerId: z.number().int(),
@@ -655,10 +1279,48 @@ const proformaSchema = z.object({
         description: z.string().min(1),
         qty: z.number().int().positive(),
         unitPrice: z.number().min(0),
+        ...lineTaxFields,
       })
     )
     .default([]),
+  charges: z.array(chargeSchema).default([]),
 });
+
+/** Charge rows for a create/update. Magnitudes are stored positive; `kind` holds sign. */
+type ChargeInput = z.output<typeof chargeSchema>;
+function chargeRows(charges: ChargeInput[], domestic = true) {
+  return charges.map((c, i) => ({
+    name: c.name.trim(),
+    kind: c.kind,
+    amount: Math.abs(c.amount),
+    pct: Math.abs(c.pct),
+    // Zero on an export, and zero on an untaxable row, so a stored rate can never
+    // start taxing something later.
+    gstRatePct: domestic && c.isTaxable ? c.gstRatePct : 0,
+    isTaxable: c.isTaxable,
+    note: c.note ?? null,
+    sortOrder: i,
+  }));
+}
+
+/**
+ * Line rows for a create/update, tax fields included. An export stores zero rates for
+ * the same reason `orderLineTax` does.
+ */
+function proformaLineRows(lines: z.infer<typeof proformaSchema>['lines'], domestic: boolean) {
+  return lines.map((l, i) => ({
+    productId: l.productId ?? null,
+    imageId: l.imageId ?? null,
+    description: l.description,
+    qty: l.qty,
+    unitPrice: l.unitPrice,
+    discountPct: l.discountPct,
+    discountAmt: l.discountAmt,
+    gstRatePct: domestic ? l.gstRatePct : 0,
+    hsnCode: domestic ? l.hsnCode?.trim() || null : null,
+    sortOrder: i,
+  }));
+}
 
 function proformaData(d: z.infer<typeof proformaSchema>, currencyRate: number | null) {
   return {
@@ -682,20 +1344,31 @@ router.post(
   asyncHandler(async (req, res) => {
     const data = proformaSchema.parse(req.body);
     if (data.lines.length === 0) throw new ApiError(400, 'A proforma needs at least one line.');
-    const number = await nextDocNumber('PI');
+    // A domestic buyer gets its own series, so export and domestic paperwork are
+    // numbered independently.
+    const buyer = await prisma.buyer.findUnique({ where: { id: data.buyerId }, select: { market: true, state: true } });
+    if (!buyer) throw new ApiError(404, 'Buyer not found.');
+    const domestic = isDomestic(buyer.market);
+    await assertLive('product', data.lines.map((l) => l.productId).filter((v): v is number => v != null), 'a proforma');
+    const number = await nextDocNumber(docKeys(buyer.market).proforma);
+    const createState = await companyState();
     const currency = data.currencyId ? await prisma.currency.findUnique({ where: { id: data.currencyId } }) : null;
+    assertCurrencyForMarket(domestic, currency);
     const p = await prisma.proforma.create({
       data: {
         number,
         ...proformaData(data, currency?.rateToBase ?? null),
         status: 'Draft',
         createdById: req.user!.sub,
-        lines: {
-          create: data.lines.map((l, i) => ({ productId: l.productId ?? null, imageId: l.imageId ?? null, description: l.description, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i })),
-        },
+        // Frozen at creation, like the exchange rate.
+        taxMarket: buyer.market,
+        taxBuyerState: buyer.state,
+        taxCompanyState: createState,
+        lines: { create: proformaLineRows(data.lines, domestic) },
+        charges: { create: chargeRows(data.charges, domestic) },
       },
     });
-    res.status(201).json(serializeProforma(await loadProforma(p.id)));
+    res.status(201).json(await serializedProforma(p.id));
   })
 );
 
@@ -706,17 +1379,41 @@ router.put(
     const id = Number(req.params.id);
     const data = proformaSchema.parse(req.body);
     if (data.lines.length === 0) throw new ApiError(400, 'A proforma needs at least one line.');
-    const current = await loadProforma(id);
+    const current = await loadProforma(id, true);
+    if (current.deletedAt) throw new ApiError(409, `${current.number} is in the trash. Restore it before editing it.`);
     if (current.order) throw new ApiError(409, `${current.number} became order ${current.order.number} — it can no longer be edited.`);
     if (current.status === 'Accepted') throw new ApiError(409, 'An accepted proforma cannot be edited.');
 
+    const putBuyer = await prisma.buyer.findUnique({ where: { id: data.buyerId }, select: { market: true, state: true } });
+    if (!putBuyer) throw new ApiError(404, 'Buyer not found.');
+    const domestic = isDomestic(putBuyer.market);
+    await assertLive('product', data.lines.map((l) => l.productId).filter((v): v is number => v != null), 'a proforma');
     const currency = data.currencyId ? await prisma.currency.findUnique({ where: { id: data.currencyId } }) : null;
+    assertCurrencyForMarket(domestic, currency);
+    // Read BEFORE the transaction: `companyState()` upserts the singleton, and a nested
+    // write inside `$transaction` cannot start until the outer one commits — SQLite
+    // serialises writes, so it simply times out after 5 s.
+    const pfState = await companyState();
     await prisma.$transaction(async (tx) => {
-      await tx.proforma.update({ where: { id }, data: proformaData(data, currency?.rateToBase ?? null) });
+      await tx.proforma.update({
+        where: { id },
+        data: {
+          ...proformaData(data, currency?.rateToBase ?? null),
+          // Re-snapshotted for the same reason as an order: editing the buyer must not
+          // leave a stale tax basis behind.
+          taxMarket: putBuyer.market,
+          taxBuyerState: putBuyer.state,
+          taxCompanyState: pfState,
+        },
+      });
+      // Charges are replaced wholesale; nothing downstream references one by id.
+      await tx.proformaCharge.deleteMany({ where: { proformaId: id } });
+      for (const c of chargeRows(data.charges, domestic)) await tx.proformaCharge.create({ data: { proformaId: id, ...c } });
       await tx.proformaLine.deleteMany({ where: { proformaId: id } });
+      const rows = proformaLineRows(data.lines, domestic);
       for (let i = 0; i < data.lines.length; i++) {
         const l = data.lines[i];
-        await tx.proformaLine.create({ data: { proformaId: id, productId: l.productId ?? null, imageId: l.imageId ?? null, description: l.description, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i } });
+        await tx.proformaLine.create({ data: { proformaId: id, ...rows[i] } });
         // Lines are replaced wholesale, so match the old ones by description.
         const prev = current.lines.find((x) => x.description === l.description);
         if (prev) {
@@ -724,15 +1421,25 @@ router.put(
             tx,
             { type: 'Proforma', id },
             { id: req.user!.sub, name: req.user!.name },
-            diffFields('ProformaLine', prev.id, prev, { unitPrice: l.unitPrice, qty: l.qty }, [
-              { field: 'unitPrice', label: 'unit price' },
-              { field: 'qty', label: 'quantity' },
-            ], l.description)
+            diffFields(
+              'ProformaLine',
+              prev.id,
+              prev,
+              { unitPrice: l.unitPrice, qty: l.qty, discountPct: l.discountPct, discountAmt: l.discountAmt, gstRatePct: l.gstRatePct },
+              [
+                { field: 'unitPrice', label: 'unit price' },
+                { field: 'qty', label: 'quantity' },
+                { field: 'discountPct', label: 'discount %' },
+                { field: 'discountAmt', label: 'discount amount' },
+                { field: 'gstRatePct', label: 'GST rate' },
+              ],
+              l.description
+            )
           );
         }
       }
     });
-    res.json(serializeProforma(await loadProforma(id)));
+    res.json(await serializedProforma(id));
   })
 );
 
@@ -742,10 +1449,11 @@ router.post(
   canEdit,
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const p = await loadProforma(id);
+    const p = await loadProforma(id, true);
+    if (p.deletedAt) throw new ApiError(409, `${p.number} is in the trash. Restore it first.`);
     if (p.status === 'Accepted') throw new ApiError(409, 'This proforma is already accepted.');
     await prisma.proforma.update({ where: { id }, data: { status: 'Sent', sentAt: p.sentAt ?? new Date(), decidedAt: null, rejectReason: null } });
-    res.json(serializeProforma(await loadProforma(id)));
+    res.json(await serializedProforma(id));
   })
 );
 
@@ -755,10 +1463,11 @@ router.post(
   canEdit,
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const p = await loadProforma(id);
+    const p = await loadProforma(id, true);
+    if (p.deletedAt) throw new ApiError(409, `${p.number} is in the trash. Restore it first.`);
     if (p.order) throw new ApiError(409, `${p.number} already became order ${p.order.number}.`);
     await prisma.proforma.update({ where: { id }, data: { status: 'Draft', decidedAt: null, rejectReason: null } });
-    res.json(serializeProforma(await loadProforma(id)));
+    res.json(await serializedProforma(id));
   })
 );
 
@@ -769,10 +1478,11 @@ router.post(
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const reason = z.object({ reason: z.string().nullable().optional() }).parse(req.body ?? {}).reason ?? null;
-    const p = await loadProforma(id);
+    const p = await loadProforma(id, true);
+    if (p.deletedAt) throw new ApiError(409, `${p.number} is in the trash. Restore it first.`);
     if (p.order) throw new ApiError(409, `${p.number} already became order ${p.order.number} — it cannot be rejected.`);
     await prisma.proforma.update({ where: { id }, data: { status: 'Rejected', decidedAt: new Date(), rejectReason: reason } });
-    res.json(serializeProforma(await loadProforma(id)));
+    res.json(await serializedProforma(id));
   })
 );
 
@@ -786,14 +1496,33 @@ router.post(
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const body = z.object({ deliveryDate: z.string().datetime().nullable().optional() }).parse(req.body ?? {});
-    const p = await prisma.proforma.findUnique({ where: { id }, include: { lines: true, order: true } });
+    const p = await prisma.proforma.findUnique({
+      where: { id },
+      include: { lines: true, charges: true, order: true, buyer: { select: { market: true, state: true } } },
+    });
     if (!p) throw new ApiError(404, 'Proforma not found.');
+    // Accepting a trashed quote would mint a real order number pointing at an invisible
+    // PI, and the PI could then never be deleted ("became order …") — a dead end.
+    if (p.deletedAt) throw new ApiError(409, `${p.number} is in the trash. Restore it before accepting it.`);
     if (p.order) throw new ApiError(409, `Already accepted — order ${p.order.number} exists.`);
 
     const productLines = p.lines.filter((l) => l.productId != null);
     if (productLines.length === 0) throw new ApiError(400, 'None of the proforma lines is linked to a product, so no order can be created. Link products first.');
 
-    const number = await nextDocNumber('ORD');
+    // A charge belongs to the whole document, so it can only ride onto the order if
+    // every line came across. Dropping an unlinked line would otherwise leave freight
+    // being charged on goods that are no longer there.
+    if (p.charges.length > 0 && productLines.length !== p.lines.length) {
+      throw new ApiError(
+        400,
+        `${p.number} carries document charges but ${p.lines.length - productLines.length} of its line(s) are not linked to a product. Link every line first, or the order would be worth a different amount than was quoted.`
+      );
+    }
+
+    const number = await nextDocNumber(docKeys(p.taxMarket ?? p.buyer.market).order);
+    // Read outside the transaction below: companyState() upserts the singleton, and a
+    // nested write would deadlock until the 5 s timeout.
+    const acceptState = p.taxCompanyState ?? (await companyState());
     const order = await prisma.$transaction(async (tx) => {
       const created = await tx.order.create({
         data: {
@@ -807,12 +1536,46 @@ router.post(
           notes: p.notes,
           proformaId: p.id,
           createdById: req.user!.sub,
+          // Inherited from the quote, not re-derived: the order must be taxed exactly as
+          // the buyer was quoted, even if their address changed in between.
+          taxMarket: p.taxMarket ?? p.buyer.market,
+          taxBuyerState: p.taxBuyerState ?? p.buyer.state,
+          taxCompanyState: acceptState,
+          // Copied, not referenced: the order must stay worth what was quoted even if
+          // the proforma is later revised.
+          charges: {
+            create: p.charges.map((c, i) => ({
+              name: c.name,
+              kind: c.kind,
+              amount: c.amount,
+              pct: c.pct,
+              gstRatePct: c.gstRatePct,
+              isTaxable: c.isTaxable,
+              note: c.note,
+              sortOrder: i,
+            })),
+          },
         },
       });
       for (let i = 0; i < productLines.length; i++) {
         const l = productLines[i];
         const stageLineId = await resolveStageLineId(tx, l.productId!);
-        const line = await tx.orderLine.create({ data: { orderId: created.id, productId: l.productId!, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i, stageLineId } });
+        const line = await tx.orderLine.create({
+          data: {
+            orderId: created.id,
+            productId: l.productId!,
+            qty: l.qty,
+            unitPrice: l.unitPrice,
+            // The quoted discount and tax rate come across too, or the order would be
+            // worth more than the buyer agreed to.
+            discountPct: l.discountPct,
+            discountAmt: l.discountAmt,
+            gstRatePct: l.gstRatePct,
+            hsnCode: l.hsnCode,
+            sortOrder: i,
+            stageLineId,
+          },
+        });
         await materializeStages(tx, line.id, stageLineId);
       }
       await tx.proforma.update({ where: { id }, data: { status: 'Accepted', decidedAt: new Date(), rejectReason: null } });
@@ -824,21 +1587,63 @@ router.post(
   })
 );
 
+
+router.post(
+  '/proformas/:id/restore',
+  canManage,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.proforma.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Proforma not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.number} is not in the trash.`);
+    await restore('proforma', id);
+    res.json({ restored: true, number: existing.number });
+  })
+);
+
+router.delete(
+  '/proformas/:id/permanent',
+  requireRole('Admin'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const p = await prisma.proforma.findUnique({ where: { id }, include: { order: { select: { number: true } } } });
+    if (!p) throw new ApiError(404, 'Proforma not found.');
+    if (!p.deletedAt) throw new ApiError(409, `${p.number} is still live. Delete it first, then destroy it from the trash.`);
+    if (p.order) throw new ApiError(409, `${p.number} became order ${p.order.number}, which still points at it. Destroy the order first.`);
+    await prisma.proforma.delete({ where: { id } });
+    res.status(204).end();
+  })
+);
+
+/**
+ * Move a proforma to the trash. Refused once it has become an order, because the order
+ * references it — the order would be left pointing at something invisible.
+ */
 router.delete(
   '/proformas/:id',
   canManage,
   asyncHandler(async (req, res) => {
-    const p = await prisma.proforma.findUnique({ where: { id: Number(req.params.id) }, include: { order: { select: { number: true } } } });
+    const p = await prisma.proforma.findUnique({ where: { id: Number(req.params.id) }, include: { order: { select: { number: true, deletedAt: true } } } });
     if (!p) throw new ApiError(404, 'Proforma not found.');
-    if (p.order) throw new ApiError(409, `${p.number} became order ${p.order.number} — delete the order first.`);
-    await prisma.proforma.delete({ where: { id: p.id } });
-    res.status(204).end();
+    if (p.deletedAt) throw new ApiError(409, `${p.number} is already in the trash.`);
+    if (p.order) {
+      // The order may itself be in the trash, in which case "delete it first" is wrong
+      // advice — it has been deleted, and it still points here.
+      throw new ApiError(
+        409,
+        p.order.deletedAt
+          ? `${p.number} became order ${p.order.number}, which is in the trash and still points at it. Destroy that order for good first, or restore it.`
+          : `${p.number} became order ${p.order.number} — delete the order first.`
+      );
+    }
+    const deletedAt = await softDelete('proforma', p.id);
+    res.json({ deleted: true, deletedAt, number: p.number, note: 'Moved to the trash and can be restored.' });
   })
 );
 
 // --- PI document: PDF + e-mail draft ---------------------------------------
 
-function pdfInputFor(s: ReturnType<typeof serializeProforma>) {
+function pdfInputFor(s: ReturnType<typeof serializeProforma>, co: CompanyProfile) {
   return {
     number: s.number,
     date: s.date,
@@ -846,11 +1651,15 @@ function pdfInputFor(s: ReturnType<typeof serializeProforma>) {
     currencyCode: s.currency?.code ?? 'INR',
     showImages: s.showImages,
     buyer: s.buyer,
+    company: co,
     incoterms: s.incoterms,
     paymentTerms: s.paymentTerms,
+    // A domestic buyer remits in rupees to the same account, so the bank block is
+    // useful either way; fall back to the company's own if the document has none.
+    bankDetails: s.bankDetails || co.bankDetails,
     deliveryTerms: s.deliveryTerms,
-    bankDetails: s.bankDetails,
     notes: s.notes,
+    charges: s.charges,
     lines: s.lines.map((l: any) => ({
       description: l.description,
       qty: l.qty,
@@ -858,6 +1667,10 @@ function pdfInputFor(s: ReturnType<typeof serializeProforma>) {
       productCode: l.product?.factoryCode ?? null,
       specs: l.specs,
       imageFile: l.image?.filename ?? null,
+      discountPct: l.discountPct,
+      discountAmt: l.discountAmt,
+      gstRatePct: l.gstRatePct,
+      hsnCode: l.hsnCode,
     })),
   };
 }
@@ -865,16 +1678,17 @@ function pdfInputFor(s: ReturnType<typeof serializeProforma>) {
 router.get(
   '/proformas/:id/pdf',
   asyncHandler(async (req, res) => {
-    const s = serializeProforma(await loadProforma(Number(req.params.id)));
-    const pdf = await proformaPdf(pdfInputFor(s));
+    const s = await serializedProforma(Number(req.params.id));
+    const pdf = await proformaPdf(pdfInputFor(s, await ensureCompany()));
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${s.number}.pdf"`);
     res.send(pdf);
   })
 );
 
-function mailInputFor(s: ReturnType<typeof serializeProforma>, senderName?: string | null) {
+function mailInputFor(s: ReturnType<typeof serializeProforma>, co: CompanyProfile, senderName?: string | null) {
   return {
+    company: co,
     number: s.number,
     date: s.date,
     validUntil: s.validUntil,
@@ -884,7 +1698,9 @@ function mailInputFor(s: ReturnType<typeof serializeProforma>, senderName?: stri
     paymentTerms: s.paymentTerms,
     deliveryTerms: s.deliveryTerms,
     buyer: s.buyer,
-    lines: s.lines.map((l: any) => ({ description: l.description, qty: l.qty, unitPrice: l.unitPrice })),
+    // The NET amount, so the body cannot contradict the attached PDF.
+    lines: s.lines.map((l: any) => ({ description: l.description, qty: l.qty, unitPrice: l.unitPrice, amount: l.amount })),
+    totals: s.totals,
     senderName: senderName ?? null,
   };
 }
@@ -893,10 +1709,10 @@ function mailInputFor(s: ReturnType<typeof serializeProforma>, senderName?: stri
 router.get(
   '/proformas/:id/mail',
   asyncHandler(async (req, res) => {
-    const s = serializeProforma(await loadProforma(Number(req.params.id)));
+    const s = await serializedProforma(Number(req.params.id));
     const me = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true } });
     const to = s.buyer.email ? [s.buyer.email] : [];
-    const mail = proformaMail(mailInputFor(s, me?.name));
+    const mail = proformaMail(mailInputFor(s, await ensureCompany(), me?.name));
     res.json({
       to,
       hasEmail: to.length > 0,
@@ -917,11 +1733,12 @@ router.get(
 router.get(
   '/proformas/:id/email.eml',
   asyncHandler(async (req, res) => {
-    const s = serializeProforma(await loadProforma(Number(req.params.id)));
+    const s = await serializedProforma(Number(req.params.id));
     const me = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true } });
     if (!s.buyer.email) throw new ApiError(400, `${s.buyer.name} has no e-mail address. Add one in Master Data → Buyers.`);
-    const mail = proformaMail(mailInputFor(s, me?.name));
-    const pdf = await proformaPdf(pdfInputFor(s));
+    const co = await ensureCompany();
+    const mail = proformaMail(mailInputFor(s, co, me?.name));
+    const pdf = await proformaPdf(pdfInputFor(s, co));
     const eml = buildEml({
       to: [s.buyer.email],
       subject: mail.subject,

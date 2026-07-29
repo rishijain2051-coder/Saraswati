@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { App, Breadcrumb, Button, Card, Checkbox, Col, Drawer, InputNumber, Result, Row, Skeleton, Space, Tag, Typography } from 'antd';
-import { HomeOutlined, ArrowLeftOutlined, PrinterOutlined, EyeOutlined } from '@ant-design/icons';
+import { HomeOutlined, ArrowLeftOutlined, PrinterOutlined, EyeOutlined, FilePdfOutlined } from '@ant-design/icons';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, apiError } from '../../api/client';
-import { useSheet, type OpExplosion } from '../../api/ops';
+import { useSheet, fetchDocument, type OpExplosion } from '../../api/ops';
 import { useMeta } from '../../api/hooks';
 import { useAuth } from '../../auth/AuthContext';
 import { money, num, headColor } from '../../util/format';
@@ -128,6 +128,12 @@ export default function SheetDetailPage() {
             {s.order && (
               <Button onClick={() => navigate(`/operations/orders/${s.order!.id}`)}>Go to production board</Button>
             )}
+            <Button
+              icon={<FilePdfOutlined />}
+              onClick={() => fetchDocument(`/operation-sheets/${s.id}/pdf`, `${s.number}.pdf`, true).catch((e: unknown) => message.error(apiError(e)))}
+            >
+              Download PDF
+            </Button>
             <Button type="primary" icon={<PrinterOutlined />} onClick={() => doPrint(presentHeads)}>
               Print full sheet
             </Button>

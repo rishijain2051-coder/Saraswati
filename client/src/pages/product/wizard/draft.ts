@@ -27,6 +27,9 @@ export interface WizardDraft {
   piecesPerCarton?: number | null;
   volumeBeforePackingCbm?: number | null;
   volumeAfterPackingCbm?: number | null;
+  /** Tax classification, used only on domestic documents. */
+  hsnCode?: string | null;
+  gstRatePct?: number | null;
   buyers: { buyerId: number; buyerCode?: string | null }[];
   related: { relatedId: number; relation: string; note?: string | null }[];
   costSheet: {
@@ -76,6 +79,8 @@ export function fromProduct(p: ProductDetail): WizardDraft {
     piecesPerCarton: p.piecesPerCarton,
     volumeBeforePackingCbm: p.volumeBeforePackingCbm,
     volumeAfterPackingCbm: p.volumeAfterPackingCbm,
+    hsnCode: p.hsnCode,
+    gstRatePct: p.gstRatePct,
     buyers: p.buyers.map((b) => ({ buyerId: b.buyerId, buyerCode: b.buyerCode })),
     related: p.related.map((r) => ({ relatedId: r.relatedId, relation: r.relation, note: r.note })),
     costSheet: p.costSheet

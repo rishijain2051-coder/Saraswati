@@ -17,6 +17,13 @@ type Tx = Prisma.TransactionClient | PrismaClient;
  * deadlock, since SQLite serialises writes and the inner one cannot start until the
  * outer commits.
  */
+/**
+ * Document series that carry the year. The fallback below creates a missing sequence, and
+ * getting `useYear` wrong there would mint `DPI-0001` and then `DPI-2026-0002` once a
+ * seed corrected the row — one series in two formats.
+ */
+const YEAR_KEYS = new Set(['PI', 'ORD', 'DPI', 'DORD']);
+
 export async function nextDocNumber(key: string, tx?: Tx): Promise<string> {
   const client: Tx = tx ?? prisma;
   const year = new Date().getFullYear();
@@ -28,7 +35,7 @@ export async function nextDocNumber(key: string, tx?: Tx): Promise<string> {
     // First use of this key: create it already claiming number 1. If another caller
     // won that race, fall back to the atomic increment.
     try {
-      seq = await client.docSequence.create({ data: { key, prefix: key, useYear: false, lastNo: 1 } });
+      seq = await client.docSequence.create({ data: { key, prefix: key, useYear: YEAR_KEYS.has(key), lastNo: 1 } });
     } catch {
       seq = await client.docSequence.update({ where: { key }, data: { lastNo: { increment: 1 } } });
     }

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Breadcrumb, Card, Select, Space, Tabs, Typography, Result } from 'antd';
 import { HomeOutlined } from '@ant-design/icons';
 import { Link } from 'react-router-dom';
+import CompanyTab from './CompanyTab';
 import MasterCrud, { type FieldDef } from '../../components/MasterCrud';
 import FormulasTab from './FormulasTab';
 import StageLinesTab from './StageLinesTab';
@@ -30,13 +31,44 @@ const unitFields: FieldDef[] = [
   { name: 'isActive', label: 'Active', type: 'switch', defaultValue: true, width: 90 },
 ];
 
+/**
+ * Channel and market are INDEPENDENT, so all four combinations exist: an overseas
+ * importer, a domestic dealer, a domestic walk-in, a web order from abroad. Market
+ * decides the price basis (FOB vs Non-FOB), the document series and whether GST applies;
+ * state decides CGST + SGST versus IGST against our own.
+ */
 const buyerFields: FieldDef[] = [
   { name: 'code', label: 'Code', type: 'text', required: true, width: 90 },
   { name: 'name', label: 'Name', type: 'text', required: true },
+  {
+    name: 'market',
+    label: 'Market',
+    type: 'select',
+    defaultValue: 'OVERSEAS',
+    width: 120,
+    options: [
+      { label: 'Overseas', value: 'OVERSEAS' },
+      { label: 'Domestic', value: 'DOMESTIC' },
+    ],
+  },
+  {
+    name: 'channel',
+    label: 'Channel',
+    type: 'select',
+    defaultValue: 'B2B',
+    width: 100,
+    options: [
+      { label: 'B2B — trade', value: 'B2B' },
+      { label: 'B2C — end customer', value: 'B2C' },
+    ],
+  },
+  { name: 'state', label: 'State', type: 'text', width: 120 },
+  { name: 'gstNo', label: 'GSTIN', type: 'text' },
   { name: 'country', label: 'Country', type: 'text' },
-  { name: 'contactName', label: 'Contact', type: 'text' },
-  { name: 'email', label: 'Email', type: 'text' },
-  { name: 'phone', label: 'Phone', type: 'text' },
+  { name: 'contactName', label: 'Contact', type: 'text', hideInTable: true },
+  { name: 'email', label: 'Email', type: 'text', hideInTable: true },
+  { name: 'phone', label: 'Phone', type: 'text', hideInTable: true },
+  { name: 'address', label: 'Address', type: 'text', hideInTable: true },
   { name: 'isActive', label: 'Active', type: 'switch', defaultValue: true, width: 90 },
 ];
 
@@ -111,6 +143,7 @@ export default function MastersPage() {
       <Card style={{ marginTop: 16 }}>
         <Tabs
           items={[
+            { key: 'company', label: 'Company', children: <CompanyTab /> },
             { key: 'currencies', label: 'Currencies', children: <CurrenciesTab /> },
             { key: 'units', label: 'Units', children: <MasterCrud endpoint="/units" queryKey={['units']} fields={unitFields} /> },
             { key: 'buyers', label: 'Buyers', children: <MasterCrud endpoint="/buyers" queryKey={['buyers']} fields={buyerFields} /> },

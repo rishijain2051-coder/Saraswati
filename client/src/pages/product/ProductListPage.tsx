@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import TrashDrawer, { TrashButton } from '../../components/TrashDrawer';
 import { Breadcrumb, Button, Card, Input, Select, Space, Table, Tag, Popconfirm, Typography, App } from 'antd';
 import { PlusOutlined, HomeOutlined, EditOutlined, DeleteOutlined, EyeOutlined, ClearOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
@@ -16,6 +17,7 @@ const { Title, Text } = Typography;
 export default function ProductListPage() {
   const navigate = useNavigate();
   const { hasRole } = useAuth();
+  const [trashOpen, setTrashOpen] = useState(false);
   const { message } = App.useApp();
   const qc = useQueryClient();
 
@@ -119,11 +121,14 @@ export default function ProductListPage() {
         <Title level={3} style={{ margin: 0 }}>
           Product Details
         </Title>
-        {hasRole('Operator') && (
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/products/new')}>
-            Create Product
-          </Button>
-        )}
+        <Space>
+          {hasRole('Manager') && <TrashButton endpoint="/products" onClick={() => setTrashOpen(true)} />}
+          {hasRole('Operator') && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/products/new')}>
+              Create Product
+            </Button>
+          )}
+        </Space>
       </div>
 
       <Card size="small" style={{ marginBottom: 16 }}>
@@ -153,6 +158,18 @@ export default function ProductListPage() {
         dataSource={products ?? []}
         pagination={{ pageSize: 20, showSizeChanger: true, showTotal: (t) => `${t} products` }}
         scroll={{ x: 1000 }}
+      />
+      <TrashDrawer
+        open={trashOpen}
+        onClose={() => setTrashOpen(false)}
+        title="Deleted products"
+        endpoint="/products"
+        label="Product"
+        queryKeys={[['products'], ['catalogue']]}
+        columns={[
+          { title: 'Code', width: 130, render: (r) => <b>{String(r.factoryCode)}</b> },
+          { title: 'Name', render: (r) => String(r.name) },
+        ]}
       />
     </div>
   );

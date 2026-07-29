@@ -5,6 +5,11 @@ import { ApiError, asyncHandler } from '../lib/http';
 import { authenticate, requireRole } from '../middleware/auth';
 import { ALLOWED_VARS } from '../lib/costing';
 import { validateExpr } from '../lib/expr';
+import { CHANNELS, MARKETS } from '../lib/pricing';
+import { ensureCompany } from '../lib/company';
+import { imageUploader, keepRealImages, uploadDir } from '../lib/imageUpload';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const router = Router();
 router.use(authenticate);
@@ -166,6 +171,117 @@ router.delete(
 );
 
 // ---------------------------------------------------------------------------
+// Company — who WE are
+// ---------------------------------------------------------------------------
+
+/**
+ * Singleton (id = 1). `state` is the field with teeth: comparing it against the buyer's
+ * is what makes a domestic sale CGST+SGST or IGST, so the split is derived from the two
+ * addresses rather than typed on a document.
+ */
+router.get(
+  '/company',
+  asyncHandler(async (_req, res) => {
+    res.json(await ensureCompany());
+  })
+);
+
+const companySchema = z.object({
+  legalName: z.string().min(1),
+  tradeName: z.string().nullable().optional(),
+  addressL1: z.string().nullable().optional(),
+  addressL2: z.string().nullable().optional(),
+  city: z.string().nullable().optional(),
+  state: z.string().nullable().optional(),
+  pincode: z.string().nullable().optional(),
+  country: z.string().min(1).default('India'),
+  gstNo: z.string().nullable().optional(),
+  panNo: z.string().nullable().optional(),
+  iecNo: z.string().nullable().optional(),
+  // logoFilename is deliberately NOT here. It is written only by POST /company/logo,
+  // which produces the name itself. Accepting it from the client meant an Admin could
+  // point it at `../prisma/dev.db` and then DELETE /company/logo would unlink the
+  // database — and any path would be embedded into every PDF letterhead.
+  cinNo: z.string().nullable().optional(),
+  phone: z.string().nullable().optional(),
+  email: z.string().email().optional().or(z.literal('')).nullable(),
+  website: z.string().nullable().optional(),
+  bankDetails: z.string().nullable().optional(),
+});
+
+router.put(
+  '/company',
+  requireRole('Admin'),
+  asyncHandler(async (req, res) => {
+    const data = companySchema.parse(req.body);
+    await ensureCompany();
+    const saved = await prisma.company.update({ where: { id: 1 }, data });
+    // Clearing our own state would restate the tax split on every domestic document, so
+    // say so rather than letting it happen quietly.
+    if (!saved.state) {
+      const domestic = await prisma.buyer.count({ where: { market: 'DOMESTIC' } });
+      if (domestic > 0) {
+        res.json({ ...saved, warning: `Without a state, all ${domestic} domestic buyer(s) will be charged IGST rather than CGST + SGST.` });
+        return;
+      }
+    }
+    res.json(saved);
+  })
+);
+
+/**
+ * Letterhead logo. Goes through the same pipeline as product photos — extension
+ * allow-list, then the magic bytes are checked and anything that is not really an image
+ * is unlinked — because a declared mimetype proves nothing.
+ *
+ * Only one logo exists at a time, so the previous file is removed on replace rather than
+ * left orphaned in uploads.
+ */
+/**
+ * Remove a logo file, and ONLY ever a file directly inside `uploads`.
+ *
+ * The stored name is produced by the uploader so it is safe today, but an unlink built by
+ * joining a database string to a directory is one bad write away from deleting anything on
+ * the disk. Refuse anything that is not a bare filename.
+ */
+async function unlinkLogo(filename: string): Promise<void> {
+  const safeName = path.basename(filename);
+  if (safeName !== filename || !safeName.startsWith('company-logo-')) return;
+  await fs.promises.unlink(path.join(uploadDir, safeName)).catch(() => undefined);
+}
+
+const uploadLogo = imageUploader('company-logo-');
+
+router.post(
+  '/company/logo',
+  requireRole('Admin'),
+  uploadLogo.single('file'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw new ApiError(400, 'No file was uploaded.');
+    const [kept] = keepRealImages([req.file]);
+    const current = await ensureCompany();
+    const saved = await prisma.company.update({ where: { id: 1 }, data: { logoFilename: kept.filename } });
+    // Only after the new one is committed, so a failed write never leaves us with none.
+    if (current.logoFilename && current.logoFilename !== kept.filename) {
+      await unlinkLogo(current.logoFilename);
+    }
+    res.status(201).json(saved);
+  })
+);
+
+router.delete(
+  '/company/logo',
+  requireRole('Admin'),
+  asyncHandler(async (_req, res) => {
+    const current = await ensureCompany();
+    if (!current.logoFilename) throw new ApiError(404, 'There is no logo to remove.');
+    const saved = await prisma.company.update({ where: { id: 1 }, data: { logoFilename: null } });
+    await unlinkLogo(current.logoFilename);
+    res.json(saved);
+  })
+);
+
+// ---------------------------------------------------------------------------
 // Buyers
 // ---------------------------------------------------------------------------
 
@@ -191,13 +307,38 @@ const buyerSchema = z.object({
   phone: z.string().optional().nullable(),
   address: z.string().optional().nullable(),
   isActive: z.boolean().optional().default(true),
+  /**
+   * Who they are and where they are — two independent settings, so all four
+   * combinations work. They decide the price basis (FOB vs Non-FOB), the document
+   * series and whether GST applies.
+   */
+  channel: z.enum(CHANNELS).optional().default('B2B'),
+  market: z.enum(MARKETS).optional().default('OVERSEAS'),
+  gstNo: z.string().optional().nullable(),
+  /** Compared with the company's state to pick CGST+SGST versus IGST. */
+  state: z.string().optional().nullable(),
 });
+
+/**
+ * A domestic buyer with no state cannot be taxed correctly — `sameState` treats an
+ * unknown state as a non-match, so they would silently be charged IGST. Refuse rather
+ * than let a wrong tax split reach a document.
+ */
+function checkBuyerTax(data: Partial<z.output<typeof buyerSchema>>, existing?: { market: string; state: string | null }) {
+  const market = data.market ?? existing?.market ?? 'OVERSEAS';
+  if (market !== 'DOMESTIC') return;
+  const state = data.state !== undefined ? data.state : existing?.state;
+  if (!state || !state.trim()) {
+    throw new ApiError(400, 'A domestic buyer needs a state — it decides whether the sale is CGST + SGST or IGST.');
+  }
+}
 
 router.post(
   '/buyers',
   canEdit,
   asyncHandler(async (req, res) => {
     const data = buyerSchema.parse(req.body);
+    checkBuyerTax(data);
     res.status(201).json(await prisma.buyer.create({ data: { ...data, code: data.code.toUpperCase() } }));
   })
 );
@@ -207,9 +348,13 @@ router.patch(
   canEdit,
   asyncHandler(async (req, res) => {
     const data = buyerSchema.partial().parse(req.body);
+    const id = Number(req.params.id);
+    const existing = await prisma.buyer.findUnique({ where: { id }, select: { market: true, state: true } });
+    if (!existing) throw new ApiError(404, 'Buyer not found.');
+    checkBuyerTax(data, existing);
     res.json(
       await prisma.buyer.update({
-        where: { id: Number(req.params.id) },
+        where: { id },
         data: { ...data, ...(data.code ? { code: data.code.toUpperCase() } : {}) },
       })
     );
@@ -310,13 +455,24 @@ router.get(
   })
 );
 
+/** Normalise a step, whichever form it arrived in. */
+function stepRow(step: string | { name: string; defaultDays?: number | null }) {
+  return typeof step === 'string' ? { name: step.trim(), defaultDays: null } : { name: step.name.trim(), defaultDays: step.defaultDays ?? null };
+}
+
 const stageLineSchema = z.object({
   code: z.string().min(1).max(16),
   name: z.string().min(1),
   isDefault: z.boolean().optional().default(false),
   isActive: z.boolean().optional().default(true),
   notes: z.string().nullable().optional(),
-  steps: z.array(z.string().min(1)).min(1, 'A stage line needs at least one stage.'),
+  /**
+   * Accepts either a bare name or `{ name, defaultDays }`. The plain-string form is kept
+   * so existing callers and the seeds keep working unchanged.
+   */
+  steps: z
+    .array(z.union([z.string().min(1), z.object({ name: z.string().min(1), defaultDays: z.number().int().min(0).nullable().optional() })]))
+    .min(1, 'A stage line needs at least one stage.'),
 });
 
 router.post(
@@ -333,7 +489,7 @@ router.post(
           isDefault: data.isDefault,
           isActive: data.isActive,
           notes: data.notes ?? null,
-          steps: { create: data.steps.map((name, i) => ({ name, sortOrder: i })) },
+          steps: { create: data.steps.map((st, i) => ({ ...stepRow(st), sortOrder: i })) },
         },
         include: stageLineInclude,
       });
@@ -367,7 +523,7 @@ router.patch(
       });
       if (data.steps) {
         await tx.stageLineStep.deleteMany({ where: { stageLineId: id } });
-        for (let i = 0; i < data.steps.length; i++) await tx.stageLineStep.create({ data: { stageLineId: id, name: data.steps[i], sortOrder: i } });
+        for (let i = 0; i < data.steps.length; i++) await tx.stageLineStep.create({ data: { stageLineId: id, ...stepRow(data.steps[i]), sortOrder: i } });
       }
       return tx.stageLine.findUnique({ where: { id }, include: stageLineInclude });
     });

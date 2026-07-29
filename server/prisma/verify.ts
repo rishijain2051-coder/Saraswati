@@ -11,11 +11,13 @@
  * The board and allocation invariants are checked the same way: pure functions, fixed
  * inputs, expected outputs.
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { BUILTIN_METHODS, round, suggestCostDim, type MethodMap } from '../src/lib/costing';
 import { computeCostSheet } from '../src/lib/productCosting';
 import { rowToMethodDef } from '../src/lib/methods';
 import { buildBoard, expandHops, validateMove, type MoveRow, type StageRow } from '../src/lib/production';
-import { allocateFifo, buildStatement, jobworkEvents, type Bucket } from '../src/lib/finance';
+import { allocateFifo, buildFinanceContext, buildStatement, jobworkEvents, receivablesByCurrency, type Bucket } from '../src/lib/finance';
 import {
   DEFAULT_RULES,
   accrualStart,
@@ -37,6 +39,9 @@ import {
   type WorkforceRules,
 } from '../src/lib/workforce';
 import { assemble, normalizeKey, outlier, summarize, windowStart, type Occurrence } from '../src/lib/suggest';
+import { chargeValue, docKeys, documentTotals, documentValue, lineNet, sameState } from '../src/lib/pricing';
+import { DELIVERY_URGENCY, autoSchedule, daysBetween, deliveryStatus, estimateCompletion } from '../src/lib/scheduling';
+import { survivesWipe } from './wipe';
 
 let failed = 0;
 function check(label: string, actual: unknown, expected: unknown) {
@@ -451,6 +456,426 @@ localMidnight.setHours(0, 0, 0, 0);
 check('365 days back is 365 days back', Math.round((localMidnight.getTime() - windowStart(365)!.getTime()) / 86400000), 365);
 check('the cut-off is a local midnight, so the whole day counts', [windowStart(365)!.getHours(), windowStart(365)!.getMinutes()], [0, 0]);
 check('zero days means no limit', windowStart(0), null);
+
+// ---------------------------------------------------------------------------
+// Document pricing — what a proforma or order is worth
+// ---------------------------------------------------------------------------
+
+console.log('\n--- line discounts ---');
+check('a plain line is qty x price', lineNet({ qty: 10, unitPrice: 250 }), 2500);
+check('a percentage comes off the gross', lineNet({ qty: 10, unitPrice: 250, discountPct: 10 }), 2250);
+check('a flat amount comes off after the percentage', lineNet({ qty: 10, unitPrice: 250, discountPct: 10, discountAmt: 250 }), 2000);
+// A discount bigger than the line would otherwise make the document owe the buyer.
+check('a line can never go negative', lineNet({ qty: 1, unitPrice: 100, discountAmt: 500 }), 0);
+check('paise are kept, not truncated', lineNet({ qty: 3, unitPrice: 33.33 }), 99.99);
+
+console.log('\n--- document charges ---');
+const sub = 10000;
+check('a flat charge is itself', chargeValue({ kind: 'CHARGE', amount: 1800 }, sub), 1800);
+check('a discount is the same magnitude, negative', chargeValue({ kind: 'DISCOUNT', amount: 1800 }, sub), -1800);
+check('a percentage charge is of the line subtotal', chargeValue({ kind: 'CHARGE', pct: 5 }, sub), 500);
+check('a percentage discount too', chargeValue({ kind: 'DISCOUNT', pct: 5 }, sub), -500);
+check('a charge with both adds them', chargeValue({ kind: 'CHARGE', pct: 5, amount: 100 }, sub), 600);
+// Stored magnitudes are always positive; only `kind` decides the sign, so a negative
+// amount typed against a discount must not flip it back into a charge.
+check('a negative amount cannot invert a discount', chargeValue({ kind: 'DISCOUNT', amount: -500 }, sub), -500);
+
+console.log('\n--- overseas is zero-rated ---');
+const exportLines = [{ qty: 20, unitPrice: 100, gstRatePct: 18 }];
+const exportDoc = documentTotals(exportLines, [{ kind: 'CHARGE', name: 'Freight', amount: 500, gstRatePct: 18 }], { market: 'OVERSEAS', buyerState: 'Rajasthan', companyState: 'Rajasthan' });
+check('an export subtotal is the lines', exportDoc.subtotal, 2000);
+check('a stray GST rate on an export is ignored', exportDoc.taxTotal, 0);
+check('and no split is claimed', [exportDoc.cgst, exportDoc.sgst, exportDoc.igst], [0, 0, 0]);
+check('an export total is lines plus charges only', exportDoc.grandTotal, 2500);
+check('an export says it was not taxed', exportDoc.taxed, false);
+
+console.log('\n--- domestic, same state: CGST + SGST ---');
+const intra = documentTotals(
+  [{ qty: 10, unitPrice: 1000, gstRatePct: 18 }],
+  [{ kind: 'CHARGE', name: 'Freight', amount: 1000, gstRatePct: 18 }],
+  { market: 'DOMESTIC', buyerState: 'Rajasthan', companyState: 'Rajasthan' }
+);
+check('the taxable value includes the taxable charge', intra.taxableValue, 11000);
+check('tax is charged on it at the rate', intra.taxTotal, 1980);
+check('and splits half and half', [intra.cgst, intra.sgst], [990, 990]);
+check('with no IGST', intra.igst, 0);
+check('the total is value plus tax', intra.grandTotal, 12980);
+check('it reports the split it used', intra.intraState, true);
+
+console.log('\n--- domestic, other state: IGST ---');
+const inter = documentTotals(
+  [{ qty: 10, unitPrice: 1000, gstRatePct: 18 }],
+  [{ kind: 'CHARGE', name: 'Freight', amount: 1000, gstRatePct: 18 }],
+  { market: 'DOMESTIC', buyerState: 'Gujarat', companyState: 'Rajasthan' }
+);
+check('the same money is taxed the same', inter.taxTotal, 1980);
+check('but all of it is IGST', [inter.cgst, inter.sgst, inter.igst], [0, 0, 1980]);
+check('the grand total is identical either way', inter.grandTotal, intra.grandTotal);
+
+console.log('\n--- more than one GST slab ---');
+const slabs = documentTotals(
+  [
+    { qty: 1, unitPrice: 10000, gstRatePct: 18 },
+    { qty: 1, unitPrice: 10000, gstRatePct: 12 },
+  ],
+  [],
+  { market: 'DOMESTIC', buyerState: 'Rajasthan', companyState: 'Rajasthan' }
+);
+check('one row per slab, lowest first', slabs.taxRows.map((t) => t.ratePct), [12, 18]);
+check('each slab taxes only its own goods', slabs.taxRows.map((t) => t.taxable), [10000, 10000]);
+check('and the tax adds up', slabs.taxTotal, 3000);
+check('a zero-rated line is not a slab', documentTotals([{ qty: 1, unitPrice: 100, gstRatePct: 0 }], [], { market: 'DOMESTIC', buyerState: 'X', companyState: 'X' }).taxRows.length, 0);
+
+console.log('\n--- a discount reduces the tax with it ---');
+const discounted = documentTotals(
+  [{ qty: 10, unitPrice: 1000, discountPct: 10, gstRatePct: 18 }],
+  [{ kind: 'DISCOUNT', name: 'Dealer', pct: 5, gstRatePct: 18 }],
+  { market: 'DOMESTIC', buyerState: 'Rajasthan', companyState: 'Rajasthan' }
+);
+check('the line discount lands in the subtotal', discounted.subtotal, 9000);
+check('and is reported for the document to show', discounted.lineDiscount, 1000);
+check('the document discount is a percentage of that subtotal', discounted.chargeTotal, -450);
+check('tax is on what is actually payable', discounted.taxableValue, 8550);
+check('so the buyer is not taxed on money they did not pay', discounted.taxTotal, 1539);
+check('the total holds together', discounted.grandTotal, 10089);
+
+console.log('\n--- a charge added after tax ---');
+const afterTax = documentTotals(
+  [{ qty: 1, unitPrice: 1000, gstRatePct: 18 }],
+  [{ kind: 'CHARGE', name: 'Round off', amount: 0.4, isTaxable: false }],
+  { market: 'DOMESTIC', buyerState: 'Rajasthan', companyState: 'Rajasthan' }
+);
+check('an untaxed charge stays out of the taxable value', afterTax.taxableValue, 1000);
+check('but is still in the total', afterTax.grandTotal, 1180.4);
+check('and is reported separately', afterTax.untaxedCharges, 0.4);
+
+console.log('\n--- CGST and SGST always reconcile ---');
+// Splitting an odd number of paise must not lose or invent one: the halves are derived
+// from the rounded slab total, so they add back to it exactly.
+for (const price of [333.33, 1010.1, 7777.77, 99999.99, 1, 0.01]) {
+  const d = documentTotals([{ qty: 1, unitPrice: price, gstRatePct: 18 }], [], { market: 'DOMESTIC', buyerState: 'R', companyState: 'R' });
+  check(`CGST + SGST equals the tax on Rs ${price}`, round(d.cgst + d.sgst), round(d.taxTotal));
+  check(`and the total is value + tax at Rs ${price}`, round(d.grandTotal), round(d.taxableValue + d.taxTotal));
+}
+
+console.log('\n--- a discount bigger than the goods ---');
+// An unclamped document total goes negative, and a negative order value lands in
+// receivables where it silently offsets other buyers' real debts.
+const overshot = documentTotals([{ qty: 1, unitPrice: 100, gstRatePct: 18 }], [{ kind: 'DISCOUNT', name: 'Fat finger', amount: 10000, gstRatePct: 18 }], {
+  market: 'DOMESTIC',
+  buyerState: 'R',
+  companyState: 'R',
+});
+check('the taxable value is clamped at zero, not negative', overshot.taxableValue, 0);
+check('so is the total', overshot.grandTotal, 0);
+check('and it says the discount overshot', overshot.overDiscounted, true);
+check('no tax is charged on nothing', overshot.taxTotal, 0);
+check('an ordinary document does not claim it overshot', intra.overDiscounted, false);
+// Same on an export, where there is no tax to hide behind.
+check('an export total is clamped too', documentTotals([{ qty: 1, unitPrice: 100 }], [{ kind: 'DISCOUNT', name: 'x', amount: 500 }], { market: 'OVERSEAS' }).grandTotal, 0);
+
+console.log('\n--- a charge taxed at a rate no line uses ---');
+// 18% off 12% goods relieves more tax than the goods ever carried, and prints a negative
+// slab. The maths is reported rather than silently accepted.
+const mismatch = documentTotals([{ qty: 1, unitPrice: 10000, gstRatePct: 12 }], [{ kind: 'DISCOUNT', name: 'Dealer', amount: 1000, gstRatePct: 18 }], {
+  market: 'DOMESTIC',
+  buyerState: 'R',
+  companyState: 'R',
+});
+check('the mismatched rate is named', mismatch.mismatchedChargeRates, [18]);
+check('a matching rate is not flagged', documentTotals([{ qty: 1, unitPrice: 10000, gstRatePct: 12 }], [{ kind: 'DISCOUNT', name: 'Dealer', amount: 1000, gstRatePct: 12 }], { market: 'DOMESTIC', buyerState: 'R', companyState: 'R' }).mismatchedChargeRates, []);
+check('nothing is flagged on a plain document', intra.mismatchedChargeRates, []);
+
+console.log('\n--- what the rest of the app reads ---');
+check('documentValue is the grand total', documentValue([{ qty: 2, unitPrice: 500, gstRatePct: 18 }], [], { market: 'DOMESTIC', buyerState: 'R', companyState: 'R' }), 1180);
+check('an empty document is worth nothing, not NaN', documentValue([], [], { market: 'DOMESTIC', buyerState: 'R', companyState: 'R' }), 0);
+check('overseas keeps the numbering it always had', docKeys('OVERSEAS'), { proforma: 'PI', order: 'ORD' });
+check('domestic gets its own series', docKeys('DOMESTIC'), { proforma: 'DPI', order: 'DORD' });
+check('an unset market is treated as overseas', docKeys(null), { proforma: 'PI', order: 'ORD' });
+
+console.log('\n--- the state comparison behind the split ---');
+check('spacing and case do not make a new state', sameState('  rajasthan ', 'Rajasthan'), true);
+check('two different states are different', sameState('Gujarat', 'Rajasthan'), false);
+// Unknown against unknown must NOT count as intra-state, or a buyer with no address on
+// file would silently be charged CGST+SGST on an inter-state sale.
+check('an unknown state never counts as a match', sameState(null, null), false);
+check('nor does an empty one', sameState('', 'Rajasthan'), false);
+
+// ---------------------------------------------------------------------------
+// The pricing engine is mirrored on the client — prove it, don't hope
+// ---------------------------------------------------------------------------
+//
+// costing.ts and expr.ts are mirrored by hand and read differently on each side, so they
+// cannot be compared mechanically. pricing.ts WAS written as a byte-exact copy below its
+// header, which makes drift checkable — and drift there would mean the live total shown
+// while editing a quote disagrees with the one the API goes on to store.
+// ---------------------------------------------------------------------------
+// Soft delete is a QUERY-layer concern
+// ---------------------------------------------------------------------------
+//
+// The pure engines must stay ignorant of it. These checks pin that down: pass a
+// soft-deleted order to the finance engine and it is still priced — because excluding it
+// is the CALLER's job, exactly as excluding a cancelled one is. If someone ever "helpfully"
+// teaches buildFinanceContext about deletedAt, these fail and say why.
+console.log('\n--- soft delete stays out of the pure functions ---');
+{
+  const mkOrder = (id: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    number: `ORD-${id}`,
+    buyerId: 1,
+    status: 'Confirmed',
+    orderDate: new Date(2026, 0, 10),
+    exchangeRate: 1,
+    currency: { code: 'INR', symbol: '₹' },
+    lines: [{ qty: 1, unitPrice: 1000 }],
+    ...extra,
+  });
+  const noJobwork = new Map<number, Map<number, number>>();
+
+  const live = buildFinanceContext([mkOrder(1)] as never, [], noJobwork);
+  check('an ordinary order is priced', live.received.get(1) ?? 0, 0);
+
+  // A cancelled order drops out inside the engine (a documented behaviour)…
+  const cancelled = buildFinanceContext([mkOrder(2, { status: 'Cancelled' })] as never, [{ id: 1, partyType: 'BUYER', kind: 'PAYMENT', amount: 400, currency: 'INR', date: new Date(2026, 0, 11), buyerId: 1, partyName: 'B' }] as never, noJobwork);
+  check('a cancelled order takes no receipt', cancelled.received.get(2) ?? 0, 0);
+
+  // …but a soft-deleted one does NOT: the engine has no idea, and must not.
+  const deleted = buildFinanceContext(
+    [mkOrder(3, { deletedAt: new Date() })] as never,
+    [{ id: 1, partyType: 'BUYER', kind: 'PAYMENT', amount: 400, currency: 'INR', date: new Date(2026, 0, 11), buyerId: 1, partyName: 'B' }] as never,
+    noJobwork
+  );
+  check('the engine does NOT special-case a deleted order — the query must exclude it', deleted.received.get(3), 400);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling — an overlay on the board, never a replacement
+// ---------------------------------------------------------------------------
+
+console.log('\n--- auto-scheduling from stage durations ---');
+{
+  const steps = [
+    { orderLineStageId: 1, name: 'Raw joining', sortOrder: 0, defaultDays: 4 },
+    { orderLineStageId: 2, name: 'Raw sanding', sortOrder: 1, defaultDays: 2 },
+    { orderLineStageId: 3, name: 'Polishing', sortOrder: 2, defaultDays: 3 },
+    { orderLineStageId: 4, name: 'QC', sortOrder: 3, defaultDays: 1 },
+  ];
+  const start = new Date(2026, 7, 3); // 3 Aug
+  const plan = autoSchedule(steps, start, new Date(2026, 7, 13)); // 10-day window, 10 stated
+  check('every stage is scheduled', plan.length, 4);
+  check('the first starts on the start date', dayKey(plan[0].estimatedStart), '2026-08-03');
+  // A 4-day stage starting on the 3rd ends on the 6th: inclusive of both days.
+  check('a 4-day stage is 4 calendar days, inclusive', dayKey(plan[0].estimatedEnd), '2026-08-06');
+  check('the next starts the day after', dayKey(plan[1].estimatedStart), '2026-08-07');
+  check('stages never overlap', plan.every((s, i) => i === 0 || daysBetween(plan[i - 1].estimatedEnd, s.estimatedStart) === 1), true);
+  check('the stated durations are honoured', plan.map((s) => daysBetween(s.estimatedStart, s.estimatedEnd) + 1), [4, 2, 3, 1]);
+
+  // Steps with no duration share what is left.
+  const mixed = autoSchedule(
+    [
+      { orderLineStageId: 1, name: 'A', sortOrder: 0, defaultDays: 6 },
+      { orderLineStageId: 2, name: 'B', sortOrder: 1, defaultDays: null },
+      { orderLineStageId: 3, name: 'C', sortOrder: 2, defaultDays: null },
+    ],
+    start,
+    new Date(2026, 7, 15) // 12 days, 6 stated, 6 to share
+  );
+  check('an unstated step takes an equal share of what is left', mixed.slice(1).map((s) => daysBetween(s.estimatedStart, s.estimatedEnd) + 1), [3, 3]);
+
+  // Durations that do not fit are scaled, not allowed to overrun the deadline.
+  const tight = autoSchedule(steps, start, new Date(2026, 7, 7)); // 4 days for 10 days of work
+  check('a window too short scales the stages down', tight.length, 4);
+  check('and every stage still gets at least a day', tight.every((s) => daysBetween(s.estimatedStart, s.estimatedEnd) >= 0), true);
+  check('nothing is scheduled before the start', dayKey(tight[0].estimatedStart), '2026-08-03');
+  check('no stages, no schedule', autoSchedule([], start, new Date(2026, 7, 13)), []);
+}
+
+console.log('\n--- schedule versus what the board shows ---');
+{
+  const at = (id: number, name: string, sortOrder: number, end: Date | null, atNow: number, cleared: number) => ({
+    orderLineStageId: id,
+    name,
+    sortOrder,
+    estimatedStart: null,
+    estimatedEnd: end,
+    at: atNow,
+    cleared,
+  });
+  const today = new Date(2026, 7, 10);
+  const est = estimateCompletion(
+    10,
+    [
+      at(1, 'Joining', 0, new Date(2026, 7, 5), 0, 10), // finished, was due the 5th
+      at(2, 'Polishing', 1, new Date(2026, 7, 8), 4, 0), // pieces sitting here, overdue
+      at(3, 'QC', 2, new Date(2026, 7, 14), 0, 0), // not started, not due yet
+    ],
+    today
+  );
+  check('a finished stage reads DONE', est.stages[0].status, 'DONE');
+  check('a stage past its date with pieces still on it is OVERDUE', est.stages[1].status, 'OVERDUE');
+  check('and says by how many days', est.stages[1].daysOverdue, 2);
+  check('a future stage with nothing on it is NOT_STARTED', est.stages[2].status, 'NOT_STARTED');
+  check('the overall verdict is behind', est.isBehind, true);
+  check('and reports the worst slippage', est.daysLate, 2);
+  check('the estimated finish is the last stage end', dayKey(est.estimatedCompletion!), '2026-08-14');
+  // Progress comes from the BOARD, not the schedule — nothing has cleared the last stage.
+  check('progress is what the board says, not what was planned', est.percentComplete, 0);
+
+  const early = estimateCompletion(10, [at(1, 'Joining', 0, new Date(2026, 7, 20), 0, 10)], today);
+  check('finishing before the date reads AHEAD', early.stages[0].status, 'AHEAD');
+  check('and is not behind', early.isBehind, false);
+  check('an unscheduled stage has no remaining days', estimateCompletion(10, [at(1, 'X', 0, null, 0, 0)], today).stages[0].daysRemaining, null);
+}
+
+console.log('\n--- a plan must never end after its deadline ---');
+{
+  // Five stages rounding to zero each get clamped to one day, which used to push the plan
+  // past the date it was generated from — and `deliveryStatus` then called the same order
+  // LATE in the very same response.
+  const steps = [30, 1, 1, 1, 1, 1].map((d, i) => ({ orderLineStageId: i + 1, name: 'S' + i, sortOrder: i, defaultDays: d }));
+  const from = new Date(2026, 6, 1);
+  const to = new Date(2026, 6, 20);
+  const plan = autoSchedule(steps, from, to);
+  check('the plan ends on or before the deadline', daysBetween(plan[plan.length - 1].estimatedEnd, to) >= 0, true);
+  check('and still schedules every stage', plan.length, 6);
+  check('each stage keeps at least a day', plan.every((p) => daysBetween(p.estimatedStart, p.estimatedEnd) >= 0), true);
+
+  // A window genuinely too small for one day per stage cannot fit, and must not pretend to.
+  const impossible = autoSchedule(steps, from, new Date(2026, 6, 3));
+  check('an impossible window still yields one day per stage', impossible.length, 6);
+  check('and starts where it was told to', dayKey(impossible[0].estimatedStart), '2026-07-01');
+}
+
+console.log('\n--- pieces still on a stage mean it is not done ---');
+{
+  // Rework makes `cleared` exceed `qty` legitimately, so testing cleared alone called a
+  // stage finished while two pieces sat on it nineteen days past its date.
+  const st = (at: number, cleared: number) => [{ orderLineStageId: 1, name: 'Polishing', sortOrder: 0, estimatedStart: null, estimatedEnd: new Date(2026, 6, 10), at, cleared }];
+  const stuck = estimateCompletion(10, st(2, 12), new Date(2026, 6, 29));
+  check('a stage with pieces on it past its date is OVERDUE, not DONE', stuck.stages[0].status, 'OVERDUE');
+  check('and the line reports it is behind', stuck.isBehind, true);
+  check('with the days counted', stuck.stages[0].daysOverdue, 19);
+  check('an empty stage everything has passed is DONE', estimateCompletion(10, st(0, 12), new Date(2026, 6, 29)).stages[0].status, 'DONE');
+  // Progress is the board's `done`, so it agrees with the delivery verdict beside it.
+  check('progress comes from the board, not the last stage', estimateCompletion(10, st(0, 12), new Date(2026, 6, 29), 5).percentComplete, 50);
+}
+
+console.log('\n--- delivery status ---');
+{
+  const today = new Date(2026, 7, 10);
+  const d = (o: Parameters<typeof deliveryStatus>[0]) => deliveryStatus(o, today);
+  check('a shipped order is delivered', d({ status: 'Shipped', deliveryDate: new Date(2026, 7, 1), qty: 10, done: 10 }).status, 'DELIVERED');
+  check('even if it shipped before everything was done', d({ status: 'Closed', deliveryDate: new Date(2026, 7, 1), qty: 10, done: 4 }).percentComplete, 100);
+  check('past the date and unfinished is LATE', d({ status: 'Production', deliveryDate: new Date(2026, 7, 5), qty: 10, done: 6 }).status, 'LATE');
+  check('and counts the days', d({ status: 'Production', deliveryDate: new Date(2026, 7, 5), qty: 10, done: 6 }).daysLate, 5);
+  check('all pieces done is on track whatever the date', d({ status: 'Production', deliveryDate: new Date(2026, 7, 12), qty: 10, done: 10 }).status, 'ON_TRACK');
+  check('a week out and barely started is AT_RISK', d({ status: 'Production', deliveryDate: new Date(2026, 7, 15), qty: 10, done: 2 }).status, 'AT_RISK');
+  check('a week out and nearly done is fine', d({ status: 'Production', deliveryDate: new Date(2026, 7, 15), qty: 10, done: 9 }).status, 'ON_TRACK');
+  // Far out, a slow start is normal and must not cry wolf.
+  check('a month out and barely started is not yet a problem', d({ status: 'Confirmed', deliveryDate: new Date(2026, 8, 20), qty: 10, done: 0 }).status, 'ON_TRACK');
+  check('due today and unfinished is AT_RISK', d({ status: 'Production', deliveryDate: today, qty: 10, done: 5 }).status, 'AT_RISK');
+  check('no date means no verdict', d({ status: 'Confirmed', qty: 10, done: 0 }).status, 'NO_DATE');
+  check('a cancelled order is not chased', d({ status: 'Cancelled', deliveryDate: new Date(2026, 7, 1), qty: 10, done: 0 }).status, 'NO_DATE');
+  check('the urgent sort puts late first', (['ON_TRACK', 'LATE', 'DELIVERED', 'AT_RISK'] as const).slice().sort((a, b) => DELIVERY_URGENCY[a] - DELIVERY_URGENCY[b]), ['LATE', 'AT_RISK', 'ON_TRACK', 'DELIVERED']);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-currency receivables and the forex position
+// ---------------------------------------------------------------------------
+
+console.log('\n--- receivables grouped by currency ---');
+{
+  const sym = (c: string) => (({ USD: '$', GBP: '£', INR: '₹' }) as Record<string, string>)[c] ?? '';
+  const row = (orderId: number, currency: string, receivableFcy: number, snapshotRate: number, currentRate: number) => ({
+    orderId,
+    currency,
+    invoicedFcy: receivableFcy,
+    receivedFcy: 0,
+    receivableFcy,
+    snapshotRate,
+    currentRate,
+    receivableInr: round(receivableFcy * snapshotRate),
+    receivableAtCurrentRate: round(receivableFcy * currentRate),
+    forexGainLoss: round(receivableFcy * currentRate - receivableFcy * snapshotRate),
+  });
+
+  // Two USD orders booked at different rates, plus a rupee one.
+  const fx = receivablesByCurrency([row(1, 'USD', 10000, 83, 84.5), row(2, 'USD', 5000, 82, 84.5), row(3, 'INR', 50000, 1, 1)], sym);
+  check('one row per currency, biggest exposure first', fx.byCurrency.map((c) => c.currency), ['USD', 'INR']);
+  const usd = fx.byCurrency[0];
+  check('the foreign totals add up', usd.totalFcy, 15000);
+  check('valued at the rates the orders were booked at', usd.totalInrAtSnapshot, 10000 * 83 + 5000 * 82);
+  check('and at the live rate', usd.totalInrAtCurrent, 15000 * 84.5);
+  check('the gain is the difference', usd.forexGainLoss, round(15000 * 84.5 - (10000 * 83 + 5000 * 82)));
+  // Weighted by exposure, so the large order pulls the average toward its own rate.
+  check('the average booked rate is weighted by what is outstanding', usd.averageSnapshotRate, round((10000 * 83 + 5000 * 82) / 15000, 4));
+  check('and it sits between the two rates', usd.averageSnapshotRate > 82 && usd.averageSnapshotRate < 83, true);
+  check('both orders are counted', usd.orderCount, 2);
+
+  check('rupees can never show a gain or a loss', fx.byCurrency[1].forexGainLoss, 0);
+  check('the net is the sum across currencies', fx.netForexGainLoss, round(usd.forexGainLoss));
+  check('and foreign exposure is flagged', fx.hasForeignExposure, true);
+
+  // A weakening foreign currency is a loss, and must read negative.
+  check('a weaker currency is a loss', receivablesByCurrency([row(1, 'GBP', 1000, 106, 104)], sym).byCurrency[0].forexGainLoss, -2000);
+
+  // A settled order is not exposure.
+  check('a settled order is not outstanding', receivablesByCurrency([row(1, 'USD', 0, 83, 90)], sym).byCurrency.length, 0);
+  check('nothing outstanding means no exposure', receivablesByCurrency([], sym).hasForeignExposure, false);
+  check('rupees alone is not foreign exposure', receivablesByCurrency([row(1, 'INR', 5000, 1, 1)], sym).hasForeignExposure, false);
+
+  // One nonsense rate must not take every other currency with it. Rates come from a
+  // human pasting the ICEGATE table, and `round()` passes NaN straight through, so a
+  // single bad parse would otherwise turn the entire net position into NaN.
+  const poisoned = receivablesByCurrency([{ ...row(1, 'USD', 100, 83, 84.5), snapshotRate: NaN, receivableInr: NaN }, row(2, 'GBP', 1000, 105, 106)], sym);
+  check('a broken rate does not poison the net figure', Number.isFinite(poisoned.netForexGainLoss), true);
+  check('the healthy currency still reports correctly', poisoned.byCurrency.find((c) => c.currency === 'GBP')!.forexGainLoss, 1000);
+  check('and every total stays a real number', poisoned.byCurrency.every((c) => Number.isFinite(c.totalInrAtSnapshot) && Number.isFinite(c.averageSnapshotRate)), true);
+  check('an infinite rate is handled the same way', Number.isFinite(receivablesByCurrency([{ ...row(1, 'USD', 100, 83, 84.5), currentRate: Infinity, receivableAtCurrentRate: Infinity }], sym).netForexGainLoss), true);
+}
+
+console.log('\n--- what survives a wipe ---');
+{
+  // `db:clean` keeps the Company row as configuration, so deleting its logo file would
+  // leave `logoFilename` pointing at nothing and every document would print a broken
+  // letterhead. Everything whose owning row IS wiped must go with it.
+  check('the company logo survives, because its record does', survivesWipe('company-logo-1753800000-abc12345.png'), true);
+  check('and whatever case it was saved in', survivesWipe('Company-Logo-1.PNG'), true);
+  check('.gitkeep survives so the folder does', survivesWipe('.gitkeep'), true);
+  check('a product image does not', survivesWipe('demo-ab-2101-aurora-two-tone-sideboard.jpg'), false);
+  check('nor a hand-over photo', survivesWipe('move-demo-1-jaipur-tiled-sideboard.jpg'), false);
+  check('nor a worker document', survivesWipe('worker-1753800000-abc12345.jpg'), false);
+  check('nor an order attachment', survivesWipe('order-1753800000-abc12345.pdf'), false);
+  // A file merely mentioning the word must not slip through on a partial match.
+  check('a name that only contains the prefix later is not kept', survivesWipe('order-company-logo-sneaky.pdf'), false);
+}
+
+console.log('\n--- the client pricing mirror ---');
+{
+  const body = (file: string): string | null => {
+    const full = path.join(__dirname, '..', '..', file);
+    if (!fs.existsSync(full)) return null;
+    const text = fs.readFileSync(full, 'utf8').replace(/\r\n/g, '\n');
+    const from = text.indexOf('export const MARKETS');
+    return from < 0 ? null : text.slice(from);
+  };
+  const server = body('server/src/lib/pricing.ts');
+  const client = body('client/src/util/pricing.ts');
+  check('both pricing files were found', [server != null, client != null], [true, true]);
+  check('the client mirror is identical to the server engine', server === client, true);
+  if (server && client && server !== client) {
+    const a = server.split('\n');
+    const b = client.split('\n');
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      if (a[i] !== b[i]) {
+        console.log(`        first difference at line ${i + 1} of the shared body:`);
+        console.log(`          server: ${a[i] ?? '(missing)'}`);
+        console.log(`          client: ${b[i] ?? '(missing)'}`);
+        break;
+      }
+    }
+  }
+}
 
 console.log(failed === 0 ? '\nALL SELF-CHECKS PASSED' : `\n${failed} SELF-CHECK(S) FAILED`);
 if (failed) process.exitCode = 1;

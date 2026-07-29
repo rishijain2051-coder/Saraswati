@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from './client';
-import type { AttributeValue, Buyer, Currency, Meta, ProductDetail, ProductSummary, Unit } from './types';
+import type { AttributeValue, Buyer, Company, Currency, Meta, ProductDetail, ProductSummary, Unit } from './types';
 
 export const useMeta = () =>
   useQuery({ queryKey: ['meta'], queryFn: async () => (await api.get<Meta>('/meta')).data, staleTime: Infinity });
@@ -13,6 +13,13 @@ export const useUnits = () =>
 
 export const useBuyers = () =>
   useQuery({ queryKey: ['buyers'], queryFn: async () => (await api.get<Buyer[]>('/buyers')).data });
+
+/**
+ * Who WE are. Needed wherever tax is worked out, because comparing our state with the
+ * buyer's is what decides CGST+SGST versus IGST.
+ */
+export const useCompany = () =>
+  useQuery({ queryKey: ['company'], queryFn: async () => (await api.get<Company>('/company')).data, staleTime: 5 * 60 * 1000 });
 
 export const useAttributes = (type?: string) =>
   useQuery({

@@ -2,6 +2,7 @@ import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { BUILTIN_METHODS } from '../src/lib/costing';
 import { migrateTypedWorkers, seedManforceDefaults } from './manforceSeed';
+import { ensureCompany } from '../src/lib/company';
 
 const prisma = new PrismaClient();
 
@@ -75,9 +76,16 @@ async function main() {
   }
 
   // --- Buyers --------------------------------------------------------------
+  // Every existing buyer is an overseas trade buyer — that is all the app supported
+  // before — so the defaults are explicit rather than relying on the column default.
   const buyerDefs = [
-    { code: 'AB', name: 'Ashford & Barnes Ltd.', country: 'United Kingdom', contactName: 'James Ashford', email: 'buying@ashfordbarnes.co.uk' },
-    { code: 'HG', name: 'Heritage Home Goods', country: 'USA', contactName: 'Laura Chen', email: 'purchasing@heritagehome.com' },
+    { code: 'AB', name: 'Ashford & Barnes Ltd.', country: 'United Kingdom', contactName: 'James Ashford', email: 'buying@ashfordbarnes.co.uk', market: 'OVERSEAS', channel: 'B2B' },
+    { code: 'HG', name: 'Heritage Home Goods', country: 'USA', contactName: 'Laura Chen', email: 'purchasing@heritagehome.com', market: 'OVERSEAS', channel: 'B2B' },
+    // A domestic trade buyer in our own state (CGST + SGST) and one outside it (IGST).
+    { code: 'JF', name: 'Jodhpur Furnishings', country: 'India', contactName: 'Mahendra Singh', email: 'orders@jodhpurfurnishings.in', market: 'DOMESTIC', channel: 'B2B', state: 'Rajasthan', gstNo: '08AAFCJ4567K1Z9' },
+    { code: 'UD', name: 'Urban Decor Mumbai', country: 'India', contactName: 'Priya Nair', email: 'buying@urbandecor.in', market: 'DOMESTIC', channel: 'B2B', state: 'Maharashtra', gstNo: '27AAGCU7788L1ZB' },
+    // A walk-in retail customer: domestic B2C, no GSTIN.
+    { code: 'WLK', name: 'Walk-in Customer', country: 'India', market: 'DOMESTIC', channel: 'B2C', state: 'Rajasthan' },
   ];
   const buyerId: Record<string, number> = {};
   for (const b of buyerDefs) {
@@ -240,6 +248,9 @@ async function main() {
   const sequences = [
     { key: 'PI', prefix: 'PI', useYear: true },
     { key: 'ORD', prefix: 'ORD', useYear: true },
+    // Domestic paperwork is numbered independently of the export series.
+    { key: 'DPI', prefix: 'DPI', useYear: true },
+    { key: 'DORD', prefix: 'DORD', useYear: true },
     { key: 'OP', prefix: 'OP', useYear: false },
   ];
   for (const s of sequences) {
@@ -259,6 +270,8 @@ async function main() {
 
   // --- Stage lines (production routes) ------------------------------------
   // A product is assigned one stage line; each order line snapshots its steps.
+  /** How long each stage usually takes, so a generated schedule is believable. */
+  const STAGE_DAYS: Record<string, number> = { 'Raw joining': 4, 'Raw sanding': 2, 'Polishing': 3, 'Accessory fitting': 2, 'QC': 1, 'Packaging': 1, 'Powder coating': 3, 'Fitting': 2, 'Packing': 1};
   const stageLines = [
     { code: 'X', name: 'Wood line', isDefault: true, steps: ['Raw joining', 'Raw sanding', 'Polishing', 'Accessory fitting', 'QC', 'Packaging'] },
     { code: 'Y', name: 'Metal line', isDefault: false, steps: ['Raw joining', 'Powder coating', 'Fitting', 'QC', 'Packing'] },
@@ -272,7 +285,7 @@ async function main() {
     // Keep the step list in step with the seed definition.
     await prisma.stageLineStep.deleteMany({ where: { stageLineId: rec.id } });
     for (let i = 0; i < sl.steps.length; i++) {
-      await prisma.stageLineStep.create({ data: { stageLineId: rec.id, name: sl.steps[i], sortOrder: i } });
+      await prisma.stageLineStep.create({ data: { stageLineId: rec.id, name: sl.steps[i], sortOrder: i, defaultDays: STAGE_DAYS[sl.steps[i]] ?? null } });
     }
     stageLineId[sl.code] = rec.id;
   }
@@ -289,6 +302,29 @@ async function main() {
   for (const r of rawItems) {
     await prisma.rawItem.upsert({ where: { code: r.code }, update: r, create: r });
   }
+
+  // --- Company: who we are, and the state the tax split depends on --------
+  await ensureCompany();
+  await prisma.company.update({
+    where: { id: 1 },
+    data: {
+      legalName: 'Saraswati Export',
+      tradeName: 'Furniture & Hardware Exporter',
+      addressL1: 'Plot 44, Boranada Industrial Area',
+      city: 'Jodhpur',
+      state: 'Rajasthan',
+      pincode: '342012',
+      country: 'India',
+      gstNo: '08ABCDE1234F1Z5',
+      panNo: 'ABCDE1234F',
+      iecNo: '0812345678',
+      phone: '+91 291 2740 155',
+      email: 'exports@saraswatiexport.in',
+    },
+  });
+
+  // Existing products predate GST classification; furniture is 9403 at 18%.
+  await prisma.product.updateMany({ where: { hsnCode: null }, data: { hsnCode: '9403', gstRatePct: 18 } });
 
   // --- Manforce: settings, trades, statutory components -------------------
   await seedManforceDefaults(prisma);

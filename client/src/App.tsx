@@ -21,6 +21,7 @@ import ProformaEditPage from './pages/operations/ProformaEditPage';
 import ProformaDetailPage from './pages/operations/ProformaDetailPage';
 import SuppliersPage from './pages/operations/SuppliersPage';
 import StockPage from './pages/operations/StockPage';
+import DeliveryTracker from './pages/operations/DeliveryTracker';
 import SheetsPage from './pages/operations/SheetsPage';
 import SheetDetailPage from './pages/operations/SheetDetailPage';
 import PaymentsPage from './pages/operations/PaymentsPage';
@@ -84,6 +85,7 @@ export default function AppRoutes() {
         <Route path="operations/proformas/:id/edit" element={<ProformaEditPage />} />
         <Route path="operations/suppliers" element={<SuppliersPage />} />
         <Route path="operations/stock" element={<StockPage />} />
+        <Route path="operations/delivery" element={<DeliveryTracker />} />
         <Route path="operations/sheets" element={<SheetsPage />} />
         <Route path="operations/sheets/:id" element={<SheetDetailPage />} />
         <Route path="operations/payments" element={<PaymentsPage />} />

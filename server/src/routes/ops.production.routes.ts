@@ -8,9 +8,13 @@ import { computeCostSheet } from '../lib/productCosting';
 import { loadMethodMap } from '../lib/methods';
 import { round } from '../lib/costing';
 import { buildBoard } from '../lib/production';
-import { allocateFifo, buildStatement, jobworkEventsForOrder, type AllocationResult, type Bucket, type PaymentRow } from '../lib/finance';
+import { allocateFifo, buildStatement, jobworkEventsForOrder, receivablesByCurrency, type AllocationResult, type Bucket, type ForexOrderRow, type PaymentRow } from '../lib/finance';
 import { buildWorkforceContext, contractorStatement, workerStatement, workforceTotals, type WorkforceContext } from '../lib/manforce';
 import { dayKey } from '../lib/workforce';
+import { documentValueOf } from '../lib/pricing';
+import { companyState, ensureCompany } from '../lib/company';
+import { sheetPdf } from '../lib/docPdf';
+import { assertLive, notDeleted, restore, softDelete } from '../lib/softDelete';
 
 const router = Router();
 router.use(authenticate);
@@ -78,8 +82,22 @@ async function explosionFor(productId: number, qty: number) {
 router.get(
   '/operation-sheets',
   asyncHandler(async (req, res) => {
-    const where = req.query.orderId ? { orderId: Number(req.query.orderId) } : undefined;
+    const where = { ...notDeleted, ...(req.query.orderId ? { orderId: Number(req.query.orderId) } : {}) };
     res.json(await prisma.operationSheet.findMany({ where, include: sheetInclude, orderBy: { createdAt: 'desc' } }));
+  })
+);
+
+router.get(
+  '/operation-sheets/trash',
+  canManage,
+  asyncHandler(async (_req, res) => {
+    res.json(
+      await prisma.operationSheet.findMany({
+        where: { deletedAt: { not: null } },
+        select: { id: true, number: true, qty: true, deletedAt: true, product: { select: { factoryCode: true, name: true } } },
+        orderBy: { deletedAt: 'desc' },
+      })
+    );
   })
 );
 
@@ -88,7 +106,39 @@ router.get(
   asyncHandler(async (req, res) => {
     const sheet = await prisma.operationSheet.findUnique({ where: { id: Number(req.params.id) }, include: sheetInclude });
     if (!sheet) throw new ApiError(404, 'Material sheet not found.');
+    if (sheet.deletedAt) throw new ApiError(410, `${sheet.number} is in the trash. Restore it to open it.`);
     res.json({ ...sheet, explosion: await explosionFor(sheet.productId, sheet.qty) });
+  })
+);
+
+/** The material sheet as a printable working document. */
+router.get(
+  '/operation-sheets/:id/pdf',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const [sheet, co] = await Promise.all([
+      prisma.operationSheet.findUnique({ where: { id }, include: sheetInclude }),
+      ensureCompany(),
+    ]);
+    if (!sheet) throw new ApiError(404, 'Material sheet not found.');
+    if (sheet.deletedAt) throw new ApiError(410, `${sheet.number} is in the trash. Restore it to print it.`);
+    const explosion = await explosionFor(sheet.productId, sheet.qty);
+    if (!explosion) throw new ApiError(400, `${sheet.product.factoryCode} has no active cost sheet, so there is nothing to explode.`);
+
+    const pdf = await sheetPdf({
+      number: sheet.number,
+      date: sheet.createdAt,
+      company: co,
+      product: { factoryCode: sheet.product.factoryCode, name: sheet.product.name, unit: sheet.product.unit?.code ?? null },
+      orderNumber: sheet.order?.number ?? null,
+      buyerName: sheet.order?.buyer?.name ?? null,
+      qty: sheet.qty,
+      currencyCode: explosion.currency?.code ?? 'INR',
+      explosion: explosion as never,
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${sheet.number}.pdf"`);
+    res.send(pdf);
   })
 );
 
@@ -109,10 +159,18 @@ router.post(
   canEdit,
   asyncHandler(async (req, res) => {
     const data = sheetSchema.parse(req.body);
+    // A material sheet for a hidden product would explode a costing nobody can open.
+    if (data.productId) await assertLive('product', [data.productId], 'a material sheet');
 
     if (data.orderLineId) {
       const line = await prisma.orderLine.findUnique({ where: { id: data.orderLineId }, include: { sheet: true } });
       if (!line) throw new ApiError(404, 'Order line not found.');
+      // A TRASHED sheet must not be handed back as "existing": the page would open a
+      // sheet that no list shows, and the line could never get another one because
+      // `orderLineId` is unique. Restore it explicitly, or make a fresh one.
+      if (line.sheet?.deletedAt) {
+        throw new ApiError(409, `${line.sheet.number} for this line is in the trash. Restore it from the material sheets trash, or destroy it first.`);
+      }
       if (line.sheet) {
         const full = await prisma.operationSheet.findUnique({ where: { id: line.sheet.id }, include: sheetInclude });
         return res.status(200).json({ ...full!, explosion: await explosionFor(full!.productId, full!.qty), existing: true });
@@ -154,12 +212,43 @@ router.put(
   })
 );
 
+
+router.post(
+  '/operation-sheets/:id/restore',
+  canManage,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.operationSheet.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Material sheet not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.number} is not in the trash.`);
+    await restore('operationSheet', id);
+    res.json({ restored: true, number: existing.number });
+  })
+);
+
+router.delete(
+  '/operation-sheets/:id/permanent',
+  requireRole('Admin'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.operationSheet.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Material sheet not found.');
+    if (!existing.deletedAt) throw new ApiError(409, `${existing.number} is still live. Delete it first.`);
+    await prisma.operationSheet.delete({ where: { id } });
+    res.status(204).end();
+  })
+);
+
 router.delete(
   '/operation-sheets/:id',
   canManage,
   asyncHandler(async (req, res) => {
-    await prisma.operationSheet.delete({ where: { id: Number(req.params.id) } });
-    res.status(204).end();
+    const id = Number(req.params.id);
+    const existing = await prisma.operationSheet.findUnique({ where: { id }, select: { deletedAt: true, number: true } });
+    if (!existing) throw new ApiError(404, 'Material sheet not found.');
+    if (existing.deletedAt) throw new ApiError(409, `${existing.number} is already in the trash.`);
+    const deletedAt = await softDelete('operationSheet', id);
+    res.json({ deleted: true, deletedAt, number: existing.number });
   })
 );
 
@@ -176,11 +265,18 @@ router.delete(
 // on to the next oldest debt; a surplus with nothing left to settle sits as credit.
 // ---------------------------------------------------------------------------
 
-const LIVE_ORDER = { status: { not: 'Cancelled' } } as const;
+/**
+ * What counts as a live order for the money: not cancelled, and not in the trash. Both
+ * exclusions happen HERE at the query layer — the pure finance functions know about
+ * neither, which is what keeps them simple.
+ */
+const LIVE_ORDER = { status: { not: 'Cancelled' }, deletedAt: null } as const;
 
 const financeOrderInclude = {
-  buyer: { select: { id: true, name: true, code: true, email: true, phone: true, country: true } },
+  // market + state are what decide whether this order carries GST and how it splits.
+  buyer: { select: { id: true, name: true, code: true, email: true, phone: true, country: true, market: true, channel: true, state: true, gstNo: true } },
   currency: { select: { code: true, symbol: true } },
+  charges: { orderBy: { sortOrder: 'asc' as const } },
   lines: {
     include: {
       stages: { include: { vendor: { select: { id: true, name: true } } }, orderBy: { sortOrder: 'asc' as const } },
@@ -199,10 +295,19 @@ const financeEntryInclude = {
 
 /** Everything needed to compute the money position, in one read. */
 async function financeData() {
-  const [orders, entries, currencies] = await Promise.all([
+  const [orders, entries, currencies, ourState] = await Promise.all([
     prisma.order.findMany({ where: LIVE_ORDER, include: financeOrderInclude, orderBy: [{ orderDate: 'asc' }, { id: 'asc' }] }),
-    prisma.ledgerEntry.findMany({ include: financeEntryInclude, orderBy: [{ date: 'asc' }, { id: 'asc' }] }),
+    // A receipt booked against a trashed order leaves with it. Otherwise that order's
+    // bucket vanishes from the FIFO run while the money stays behind, and `allocateFifo`
+    // silently re-spreads it across the buyer's OTHER orders — marking an unpaid one
+    // settled and dropping the receivable.
+    prisma.ledgerEntry.findMany({
+      where: { ...notDeleted, OR: [{ orderId: null }, { order: { deletedAt: null } }] },
+      include: financeEntryInclude,
+      orderBy: [{ date: 'asc' }, { id: 'asc' }],
+    }),
     prisma.currency.findMany({ select: { code: true, symbol: true, rateToBase: true } }),
+    companyState(),
   ]);
   /**
    * Rupee rate for a currency code. Taken from the currency master rather than from
@@ -211,13 +316,21 @@ async function financeData() {
    */
   const rateOf = (code: string) => currencies.find((c) => c.code === code)?.rateToBase ?? 1;
   const symbolOf = (code: string) => currencies.find((c) => c.code === code)?.symbol ?? '';
-  return { orders, entries, rateOf, symbolOf };
+  return { orders, entries, rateOf, symbolOf, ourState };
 }
 
 type FinanceOrder = Awaited<ReturnType<typeof financeData>>['orders'][number];
 type FinanceEntry = Awaited<ReturnType<typeof financeData>>['entries'][number];
 
-const orderValue = (o: FinanceOrder) => round(o.lines.reduce((a, l) => a + l.qty * l.unitPrice, 0));
+/**
+ * What an order is worth, through the one pricing engine — line discounts, document
+ * charges and GST included. This is the same call `serializeOrder` and the FIFO buckets
+ * make, which is what stops the Payments page and the order page disagreeing.
+ */
+const orderValue = (o: FinanceOrder, ourState: string | null) => documentValueOf(o as never, ourState);
+
+/** Never let a credit or a mistyped discount offset somebody else's real debt. */
+const clamp = (v: number) => round(Math.max(v, 0));
 
 const entriesFor = (entries: FinanceEntry[], partyType: string, kind: 'BILL' | 'PAYMENT', partyId?: number | null, partyName?: string) =>
   entries.filter(
@@ -257,7 +370,14 @@ function describePayments(entries: FinanceEntry[], result: AllocationResult) {
  * settle them oldest-first. Receipts only ever apply to orders in the same currency,
  * so no hidden conversion can creep into a balance.
  */
-function buyerPositions(orders: FinanceOrder[], entries: FinanceEntry[], buyerId: number, rateOf: (code: string) => number, symbolOf: (code: string) => string) {
+function buyerPositions(
+  orders: FinanceOrder[],
+  entries: FinanceEntry[],
+  buyerId: number,
+  rateOf: (code: string) => number,
+  symbolOf: (code: string) => string,
+  ourState: string | null
+) {
   const mine = orders.filter((o) => o.buyerId === buyerId);
   const receipts = entriesFor(entries, 'BUYER', 'PAYMENT', buyerId);
   const currencies = [...new Set([...mine.map((o) => o.currency?.code ?? 'INR'), ...receipts.map((r) => r.currency ?? 'INR')])];
@@ -265,7 +385,7 @@ function buyerPositions(orders: FinanceOrder[], entries: FinanceEntry[], buyerId
   return currencies.map((code) => {
     const ordersInCcy = mine.filter((o) => (o.currency?.code ?? 'INR') === code);
     const receiptsInCcy = receipts.filter((r) => (r.currency ?? 'INR') === code);
-    const buckets: Bucket[] = ordersInCcy.map((o) => ({ key: `order-${o.id}`, orderId: o.id, label: o.number, date: o.orderDate, gross: orderValue(o) }));
+    const buckets: Bucket[] = ordersInCcy.map((o) => ({ key: `order-${o.id}`, orderId: o.id, label: o.number, date: o.orderDate, gross: orderValue(o, ourState) }));
     const result = allocateFifo(buckets, toPaymentRows(receiptsInCcy));
     const rate = rateOf(code);
     return {
@@ -328,13 +448,13 @@ function billedPosition(entries: FinanceEntry[], partyType: 'SUPPLIER' | 'WORKER
 router.get(
   '/finance/receivables',
   asyncHandler(async (_req, res) => {
-    const { orders, entries, rateOf, symbolOf } = await financeData();
+    const { orders, entries, rateOf, symbolOf, ourState } = await financeData();
     const buyerIds = [...new Set(orders.map((o) => o.buyerId))];
 
     const rows: any[] = [];
     const credits: any[] = [];
     for (const buyerId of buyerIds) {
-      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf)) {
+      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf, ourState)) {
         const buyer = pos.orders[0]?.buyer;
         for (const b of pos.buckets) {
           const order = pos.orders.find((o) => o.id === b.orderId)!;
@@ -354,6 +474,18 @@ router.get(
             received: b.paid,
             balance: b.balance,
             balanceInr: round(b.balance * (order.exchangeRate ?? 1)),
+            // The same money three ways: the buyer's currency, rupees at the rate the
+            // order was booked at, and rupees at today's rate. The gap between the last
+            // two is unrealised forex — nothing is booked until the money arrives.
+            invoicedFcy: b.gross,
+            receivedFcy: b.paid,
+            receivableFcy: b.balance,
+            snapshotRate: order.exchangeRate ?? 1,
+            currentRate: rateOf(pos.currency),
+            invoicedInr: round(b.gross * (order.exchangeRate ?? 1)),
+            receivableInr: round(b.balance * (order.exchangeRate ?? 1)),
+            receivableAtCurrentRate: round(b.balance * rateOf(pos.currency)),
+            forexGainLoss: round(b.balance * rateOf(pos.currency) - b.balance * (order.exchangeRate ?? 1)),
             receiptCount: settled.length,
             receipts: settled.map((r) => ({
               id: r.id,
@@ -373,16 +505,52 @@ router.get(
     }
 
     rows.sort((a, b) => new Date(b.orderDate).getTime() - new Date(a.orderDate).getTime());
-    res.json({ rows, credits });
+    // Built from the very rows above, so the summary bar and the table cannot disagree.
+    const forex = receivablesByCurrency(rows as ForexOrderRow[], symbolOf);
+    res.json({ rows, credits, forex });
   })
 );
 
 // --- payables ---------------------------------------------------------------
 
+/**
+ * What is outstanding, grouped by currency and valued at both the booked and the live
+ * rate. Powers the summary bar on Payments and the dashboard widget.
+ */
+router.get(
+  '/finance/receivables/summary',
+  asyncHandler(async (_req, res) => {
+    const { orders, entries, rateOf, symbolOf, ourState } = await financeData();
+    const rows: ForexOrderRow[] = [];
+    for (const buyerId of [...new Set(orders.map((o) => o.buyerId))]) {
+      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf, ourState)) {
+        for (const b of pos.buckets) {
+          const order = pos.orders.find((o) => o.id === b.orderId)!;
+          const snapshotRate = order.exchangeRate ?? 1;
+          const currentRate = rateOf(pos.currency);
+          rows.push({
+            orderId: order.id,
+            currency: pos.currency,
+            invoicedFcy: b.gross,
+            receivedFcy: b.paid,
+            receivableFcy: b.balance,
+            snapshotRate,
+            currentRate,
+            receivableInr: round(b.balance * snapshotRate),
+            receivableAtCurrentRate: round(b.balance * currentRate),
+            forexGainLoss: round(b.balance * currentRate - b.balance * snapshotRate),
+          });
+        }
+      }
+    }
+    res.json(receivablesByCurrency(rows, symbolOf));
+  })
+);
+
 router.get(
   '/finance/payables',
   asyncHandler(async (_req, res) => {
-    const { orders, entries, rateOf, symbolOf } = await financeData();
+    const { orders, entries, rateOf, symbolOf, ourState } = await financeData();
 
     const rows: any[] = [];
 
@@ -730,17 +898,27 @@ async function workforceStatementResponse(partyType: 'WORKER' | 'CONTRACTOR' | '
 /** Headline money totals, shared by the summary endpoint and the dashboard. */
 async function financeTotals() {
   {
-    const [{ orders, entries, rateOf, symbolOf }, workforce] = await Promise.all([financeData(), buildWorkforceContext()]);
+    const [{ orders, entries, rateOf, symbolOf, ourState }, workforce] = await Promise.all([financeData(), buildWorkforceContext()]);
 
     let invoicedInr = 0;
     let receivableInr = 0;
     let buyerCreditInr = 0;
     for (const buyerId of [...new Set(orders.map((o) => o.buyerId))]) {
-      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf)) {
-        const rate = pos.orders[0]?.exchangeRate ?? 1;
-        invoicedInr += pos.invoiced * rate;
-        receivableInr += pos.balance * rate;
-        buyerCreditInr += pos.credit * rate;
+      for (const pos of buyerPositions(orders, entries, buyerId, rateOf, symbolOf, ourState)) {
+        // Per ORDER, at the rate that order was booked at — not the first order's rate
+        // applied to the whole currency. Two USD orders booked at 82 and 84 were being
+        // valued as if both were 82, so the dashboard disagreed with /finance/receivables
+        // and with the exposure card, which both convert bucket by bucket.
+        for (const b of pos.buckets) {
+          const orderRate = pos.orders.find((o) => o.id === b.orderId)?.exchangeRate ?? rateOf(pos.currency);
+          invoicedInr += b.gross * orderRate;
+          // Clamped exactly as payables are below: one buyer's credit — or a mistyped
+          // discount that drove an order negative — must not offset another buyer's
+          // genuine debt in the company-wide figure.
+          receivableInr += clamp(b.balance) * orderRate;
+        }
+        // Credit has no order behind it, so it can only be valued at the live rate.
+        buyerCreditInr += pos.credit * rateOf(pos.currency);
       }
     }
 
@@ -759,7 +937,6 @@ async function financeTotals() {
     const wagesPaid = round(wf.wagesPaid + unlinkedPaid);
 
     // Overpayment to a party is money on account, not a negative debt.
-    const clamp = (v: number) => round(Math.max(v, 0));
     const jobworkDue = clamp(jobworkAccrued - jobworkPaid);
     const materialDue = clamp(materialBilled - materialPaid);
     // Clamped per worker inside workforceTotals, so one worker's advance cannot
@@ -804,11 +981,11 @@ router.get(
 router.get(
   '/finance/parties',
   asyncHandler(async (_req, res) => {
-    const { orders, entries, rateOf, symbolOf } = await financeData();
+    const { orders, entries, rateOf, symbolOf, ourState } = await financeData();
     const out: any[] = [];
 
     for (const buyerId of [...new Set(orders.map((o) => o.buyerId))]) {
-      const positions = buyerPositions(orders, entries, buyerId, rateOf, symbolOf);
+      const positions = buyerPositions(orders, entries, buyerId, rateOf, symbolOf, ourState);
       const buyer = positions.find((p) => p.orders.length)?.orders[0].buyer;
       if (!buyer) continue;
       out.push({
@@ -816,9 +993,12 @@ router.get(
         partyId: buyerId,
         name: buyer.name,
         code: buyer.code,
-        owesUs: round(positions.reduce((a, p) => a + p.balance * (p.orders[0]?.exchangeRate ?? 1), 0)),
+        // Bucket by bucket, at each order's own rate — see financeTotals().
+        owesUs: round(
+          positions.reduce((a, p) => a + p.buckets.reduce((b, k) => b + Math.max(k.balance, 0) * (p.orders.find((o) => o.id === k.orderId)?.exchangeRate ?? rateOf(p.currency)), 0), 0)
+        ),
         weOwe: 0,
-        credit: round(positions.reduce((a, p) => a + p.credit * (p.orders[0]?.exchangeRate ?? 1), 0)),
+        credit: round(positions.reduce((a, p) => a + p.credit * rateOf(p.currency), 0)),
         orders: positions.reduce((a, p) => a + p.orders.length, 0),
       });
     }
@@ -894,7 +1074,7 @@ router.get(
         partyName: z.string().optional(),
       })
       .parse(req.query);
-    const { orders, entries, rateOf, symbolOf } = await financeData();
+    const { orders, entries, rateOf, symbolOf, ourState } = await financeData();
 
     // A worker named by id is derived from attendance and the board. One named only
     // by a typed name is pre-Manforce history and still reads from the ledger below.
@@ -904,7 +1084,7 @@ router.get(
 
     if (q.partyType === 'BUYER') {
       if (!q.partyId) throw new ApiError(400, 'Which buyer?');
-      const positions = buyerPositions(orders, entries, q.partyId, rateOf, symbolOf);
+      const positions = buyerPositions(orders, entries, q.partyId, rateOf, symbolOf, ourState);
       const buyer = positions.find((p) => p.orders.length)?.orders[0].buyer ?? (await prisma.buyer.findUnique({ where: { id: q.partyId } }));
       if (!buyer) throw new ApiError(404, 'Buyer not found.');
 
@@ -1093,6 +1273,8 @@ router.get(
     if (req.query.workerId) where.workerId = Number(req.query.workerId);
     if (req.query.contractorId) where.contractorId = Number(req.query.contractorId);
     if (req.query.orderId) where.orderId = Number(req.query.orderId);
+    // Trash rows are read through /payments/trash, never the live list.
+    where.deletedAt = null;
     res.json(
       await prisma.ledgerEntry.findMany({
         where,
@@ -1134,6 +1316,10 @@ router.post(
   canManage,
   asyncHandler(async (req, res) => {
     const data = ledgerSchema.parse(req.body);
+
+    // Money aimed at an order in the trash would be excluded from that order's FIFO
+    // buckets and quietly become credit on account — so refuse it instead.
+    if (data.orderId) await assertLive('order', [data.orderId], 'a payment');
 
     // Amounts the system already derives must not also be typed in, or they double up.
     if (data.partyType === 'BUYER' && data.kind === 'BILL') {
@@ -1236,6 +1422,20 @@ router.post(
   })
 );
 
+router.get(
+  '/payments/trash',
+  canManage,
+  asyncHandler(async (_req, res) => {
+    res.json(
+      await prisma.ledgerEntry.findMany({
+        where: { deletedAt: { not: null } },
+        select: { id: true, partyType: true, partyName: true, kind: true, amount: true, currency: true, date: true, ref: true, deletedAt: true },
+        orderBy: { deletedAt: 'desc' },
+      })
+    );
+  })
+);
+
 router.delete(
   '/payments/:id',
   canManage,
@@ -1246,6 +1446,36 @@ router.delete(
     // The cash and the recovery terms are two halves of one advance; removing only
     // the cash would leave an advance being recovered that was never handed over.
     if (entry.advance) throw new ApiError(409, 'This payment is an advance — delete the advance itself in Manforce and the payment goes with it.');
+    if (entry.deletedAt) throw new ApiError(409, 'That entry is already in the trash.');
+    // Soft: the row survives so a mis-keyed receipt can be brought back, and it leaves
+    // every allocation the moment it is hidden because the query excludes it.
+    const deletedAt = await softDelete('ledgerEntry', id);
+    res.json({ deleted: true, deletedAt, note: 'Moved to the trash. It has left every balance and can be restored.' });
+  })
+);
+
+
+router.post(
+  '/payments/:id/restore',
+  canManage,
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.ledgerEntry.findUnique({ where: { id }, select: { deletedAt: true } });
+    if (!existing) throw new ApiError(404, 'Entry not found.');
+    if (!existing.deletedAt) throw new ApiError(409, 'That entry is not in the trash.');
+    await restore('ledgerEntry', id);
+    res.json({ restored: true });
+  })
+);
+
+router.delete(
+  '/payments/:id/permanent',
+  requireRole('Admin'),
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await prisma.ledgerEntry.findUnique({ where: { id }, select: { deletedAt: true } });
+    if (!existing) throw new ApiError(404, 'Entry not found.');
+    if (!existing.deletedAt) throw new ApiError(409, 'That entry is still live. Delete it first.');
     await prisma.ledgerEntry.delete({ where: { id } });
     res.status(204).end();
   })
@@ -1259,9 +1489,9 @@ router.get(
   '/ops/dashboard',
   asyncHandler(async (_req, res) => {
     const [openOrders, awaitingDecision, recentProformas, rawItems, stockGrouped, liveLines, financials] = await Promise.all([
-      prisma.order.findMany({ where: { status: { notIn: ['Shipped', 'Closed', 'Cancelled'] } }, select: { id: true } }),
-      prisma.proforma.count({ where: { status: 'Sent' } }),
-      prisma.proforma.findMany({ include: { buyer: { select: { name: true } } }, orderBy: [{ date: 'desc' }, { id: 'desc' }], take: 6 }),
+      prisma.order.findMany({ where: { ...notDeleted, status: { notIn: ['Shipped', 'Closed', 'Cancelled'] } }, select: { id: true } }),
+      prisma.proforma.count({ where: { ...notDeleted, status: 'Sent' } }),
+      prisma.proforma.findMany({ where: notDeleted, include: { buyer: { select: { name: true } } }, orderBy: [{ date: 'desc' }, { id: 'desc' }], take: 6 }),
       prisma.rawItem.findMany(),
       prisma.stockTxn.groupBy({ by: ['rawItemId', 'type'], _sum: { qty: true } }),
       prisma.orderLine.findMany({

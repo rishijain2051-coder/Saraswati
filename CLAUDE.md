@@ -267,6 +267,138 @@ History tab on the product, order and worker.
 - `wipeOperational()` in the demo seed clears the log FIRST: rows point at records by
   id, and left behind they would resurface on whichever new record reuses that id.
 
+## Markets and channels — four workflows, two axes
+
+A buyer carries TWO independent settings, so all four combinations exist and none of them
+is a special case: `Buyer.channel` (B2B | B2C) and `Buyer.market` (OVERSEAS | DOMESTIC).
+An overseas importer, a domestic dealer, a domestic walk-in and a web order from abroad
+are the same machinery with different data. Existing buyers are OVERSEAS + B2B, which is
+all the app supported before.
+
+`market` is the one that changes behaviour:
+
+| | Overseas | Domestic |
+|---|---|---|
+| Price basis | **FOB** in the buyer's currency | **Non-FOB** in rupees (no CHA / forwarder / ICD) |
+| Tax | zero-rated, every rate on the document ignored | GST, split CGST+SGST or IGST |
+| Numbering | `PI-` / `ORD-` | `DPI-` / `DORD-` |
+| Document | Proforma Invoice | Quotation |
+| Incoterms | yes | hidden — an export concept |
+
+`channel` records who they are; it drives no arithmetic. B2C simply has no GSTIN, which
+the buyer form allows and the document handles.
+
+## Document money — one engine, three readers
+
+`server/src/lib/pricing.ts` is the **single authority for what a proforma or an order is
+worth**, mirrored exactly in `client/src/util/pricing.ts` (keep them identical, like
+costing.ts and expr.ts). It exists because three separate places used to add up
+`qty × unitPrice` independently — `serializeOrder`, the FIFO buckets in
+`buildFinanceContext`, and `orderValue()` on the dashboard. Once a line can carry a
+discount and a document can carry freight and GST, three copies of that sum would
+disagree the moment one was missed, and the order page and the Payments page would tell
+the buyer two different things. **Everything goes through `documentValueOf()`.**
+
+The rules, in the order they apply:
+
+1. A **line** is `qty × unitPrice`, less its discount percentage, then its flat amount, and
+   never below zero. Percentage first, because "10% off and another ₹500 off" is how it is
+   said out loud.
+2. A **charge** belongs to the whole document and carries its OWN gst rate rather than
+   being apportioned across the lines — that is how an invoice really bills freight, and
+   apportioning would make the tax on one line depend on unrelated lines. A percentage
+   charge is a percentage of the **line subtotal only**, so charges never compound and the
+   order they were entered in cannot change the total. Amounts are stored positive;
+   `kind` (CHARGE | DISCOUNT) carries the sign, so a negative number typed against a
+   discount cannot flip it back into a charge.
+3. **Tax** applies per rate, one row per slab, so a document with 12% and 18% goods
+   summarises correctly. `isTaxable` false is for something added after tax (a round-off).
+4. **CGST+SGST versus IGST is DERIVED** by comparing the buyer's state with the company's
+   (`Company.state`, Master Data → Company) — never typed, so it cannot contradict the
+   addresses on the document. `sameState()` treats an unknown state as **not** a match, so
+   an unconfigured company charges IGST rather than silently under-collecting. The halves
+   are split off the *rounded* slab total, which is what keeps `CGST + SGST === taxTotal`.
+5. An **overseas document is zero-rated end to end**: every rate on it is ignored rather
+   than trusted, so a stray 18% left on a line can never tax an export.
+
+A domestic buyer is refused without a state, because the split would otherwise be wrong
+silently. Accepting a proforma **copies** its charges and line discounts onto the order
+(not references them), so the order stays worth what was quoted even if the PI is later
+revised — and a PI carrying charges refuses to become an order if any line is unlinked,
+since freight would then be billed on goods that did not come across.
+
+## Nothing is destroyed — soft delete
+
+`Product`, `Order`, `Proforma`, `LedgerEntry` and `OperationSheet` carry `deletedAt`.
+`DELETE` sets it; the row survives and can be restored from the Trash drawer on the list
+page. Two rules keep it safe:
+
+- **Filtering happens at the QUERY layer, never in the pure functions**
+  (`server/src/lib/softDelete.ts`). The costing, board, workforce and pricing engines know
+  nothing about deletion — a deleted order leaves the money picture the way a *cancelled*
+  one does, because the query excludes it. `verify.ts` asserts this by passing a
+  soft-deleted order to `buildFinanceContext` and checking it is still priced: if someone
+  ever "helpfully" teaches the engine about `deletedAt`, that check fails and says why.
+  `LIVE_ORDER` is now `{ status: not Cancelled, deletedAt: null }` — one place, both rules.
+- **Master data is NOT soft-deletable.** Currencies, units, buyers, suppliers and the rest
+  already have `isActive`, which does the same job. A second mechanism would mean two ways
+  to hide one row.
+
+A permanent delete exists, is **Admin-only**, works only from the trash, and has **no
+waiting period and no automatic purge** — nothing disappears because time passed. The
+product "in use" check is now ADVISORY on soft delete (the orders referencing it are
+unaffected) and BLOCKING on permanent delete, where the foreign keys really bite.
+
+**Express matches routes in registration order**, so every literal path — `/trash`,
+`/orders/delivery-status` — must be registered BEFORE the `/:id` route that would
+otherwise swallow it and hand the handler `Number('trash')`.
+
+## Attachments — paperwork on an order
+
+`OrderAttachment` holds the buyer's PO, bills of lading, customs forms, packing lists,
+inspection certificates and drawings. `server/src/lib/documentUpload.ts` mirrors the
+discipline of `imageUpload.ts`: an extension allow-list, then the **magic bytes** are
+checked and anything whose contents contradict its name is unlinked before a row can point
+at it. Two limits are documented rather than pretended away — `.docx`/`.xlsx`/`.zip` share
+the `PK` signature so only the extension distinguishes them, and `.txt`/`.csv`/`.eml` have
+no signature at all, so they are only checked for being NUL-free text. 25 MB per file.
+
+Downloads go through `GET /orders/:id/attachments/:attachmentId`, **scoped to the order in
+the path** so one order's id cannot fetch another's file, and always
+`Content-Disposition: attachment` with `nosniff` — an arbitrary document must download,
+never render. Removing an attachment is a hard delete: a file has no history worth keeping,
+and orphaned bytes in `uploads` would be worse.
+
+## Scheduling — an overlay, never a replacement
+
+`server/src/lib/scheduling.ts` is pure and produces **no quantities whatsoever**. The
+board's invariant is untouched: `StageMove` still says where pieces ARE.
+
+- `OrderLineSchedule` + `StageSchedule` hold estimated start/end per stage.
+  `StageLineStep.defaultDays` (Master Data → Stage Lines) is what makes `autoSchedule()`
+  believable — stated once, it lays an order out backwards from its delivery date and
+  gives every stage at least a day, scaling the durations rather than overrunning the
+  deadline.
+- `estimateCompletion()` compares the plan with the board: DONE / AHEAD / IN_PROGRESS /
+  OVERDUE / NOT_STARTED per stage. **Progress always comes from the board**, never from the
+  schedule.
+- `deliveryStatus()` is derived on every read, so it can never be stale. AT_RISK is the
+  only judgement call: inside the last `AT_RISK_DAYS` (7) with less than `AT_RISK_PCT`
+  (80%) finished. Far out, a slow start is normal and is deliberately not flagged.
+- `Order.expectedDelivery` is the factory's own estimate, distinct from `deliveryDate`
+  which is what the buyer asked for. Comparing the two is the point.
+
+## Multi-currency receivables
+
+`receivablesByCurrency()` in `finance.ts` groups what is outstanding by currency and values
+it twice — at the rate each order was booked at (`Order.exchangeRate`) and at today's from
+the currency master. The gap is **unrealised** forex: nothing is booked until the money
+arrives, which is why it is presented as a movement rather than folded into a total. The
+average booked rate is **weighted by what is outstanding**, so it is comparable with the
+live rate. `/finance/receivables` carries the block and
+`/finance/receivables/summary` returns it alone; both are built from the same allocated
+rows, so the summary bar and the table cannot disagree.
+
 ## Proforma → order
 
 Accepting a PI is the only thing that creates an order (`POST /proformas/:id/accept`,
@@ -276,7 +408,12 @@ the reason and stops. `POST .../reopen` puts it back to Draft to revise and re-s
 ## Documents & e-mail
 
 - The proforma PDF is generated server-side with **pdfkit**
-  (`server/src/lib/docPdf.ts`), product photos included. `collect()` must be called
+  (`server/src/lib/docPdf.ts`), product photos included. It draws its letterhead from the
+  **Company** record and its money from `documentTotals()` — it never adds anything up
+  itself, so it cannot print a figure the rest of the app disagrees with. A domestic
+  document gains HSN and GST columns, a place of supply, the charge rows and the
+  CGST/SGST/IGST breakdown, and is titled *Quotation*; an export is byte-for-byte what it
+  always was. `collect()` must be called
   *before* drawing and `finish()` after — calling `doc.end()` early truncates the file.
   Standard PDF fonts are WinAnsi-only, so all text goes through `safe()` and money is
   printed as a currency **code** (`USD 1,200.00`), never a symbol.
@@ -309,6 +446,13 @@ Undoing any of these reopens a hole that was closed deliberately:
   surface as a 500 — products, buyers, suppliers, raw items, currencies, units,
   attributes, stage lines, stock receipts, users, trades, contractors, workers,
   statutory components and postings.
+- Order attachments are validated by **magic bytes**, not the declared mimetype, and are
+  served `Content-Disposition: attachment` with `nosniff` so a document can never render
+  in the browser. A download is scoped to the order in its path.
+- The company logo goes through the same image pipeline as product photos, and the
+  previous file is unlinked on replace rather than orphaned.
+- **Permanent delete is Admin-only** and only reachable from the trash. Soft delete is
+  Manager+.
 - **Worker identity and bank details are withheld below Manager** (`redact()` in
   `manforce.routes.ts`). Filtering them in the client only would still ship them over
   the wire to anyone with an Operator login.
@@ -321,6 +465,14 @@ Undoing any of these reopens a hole that was closed deliberately:
 - `nextDocNumber(key, tx?)` — **pass the caller's `tx` when already inside
   `$transaction`.** A nested transaction deadlocks: SQLite serialises writes, so the
   inner one can never start until the outer commits (it times out after 5 s).
+- **`companyState()` upserts, so it is a WRITE.** Read it before opening a transaction,
+  never inside one — the same deadlock, and it cost a 5-second timeout on the proforma
+  save before every call site was hoisted.
+- **A currency change must restate `exchangeRate`, and a buyer change the tax snapshot.**
+  `PUT /orders/:id` and `PUT /proformas/:id` rewrite both. Left behind, a rupee order
+  edited to USD stayed at rate 1 — booking a phantom forex gain of the whole order value —
+  and a domestic order moved to another state still printed CGST + SGST on what had become
+  an inter-state sale.
 - Uploads (product images, hand-over photos and worker documents) share
   `server/uploads`, served at `/uploads`. Hand-over photos are named `move-*` and worker
   photos/IDs `worker-*` so they are distinguishable on disk; deleting a movement or a
@@ -352,10 +504,15 @@ the example.xlsx FOB (₹19,180.60), board conservation, the move rules, hop exp
 jobwork reconciliation, FIFO allocation, and the whole workforce engine — the
 working-day calendar, exceptions-only accrual, pro-rata salary, piece attribution,
 statutory maths and the `dueNow − advanceOutstanding === balance` identity, plus the
-suggestion maths (name normalisation, which source leads, the outlier threshold). It
-needs no database, so it survives any wipe — **this is now the authority for the costing
-formulas**, not a seeded product. Add a case here whenever you touch `costing.ts`,
-`production.ts`, `finance.ts`, `workforce.ts` or `suggest.ts`.
+suggestion maths (name normalisation, which source leads, the outlier threshold), and the
+document pricing (line discounts, charge signs, the GST slabs, the CGST/SGST split
+reconciling to the paisa, and an export staying untaxed), the scheduling engine
+(auto-scheduling from stage durations, plan-versus-board status, the delivery verdict), the
+currency grouping behind the forex position, and the rule that soft delete stays OUT of the
+pure functions. It needs no database, so it survives any wipe — **this is now the authority
+for the costing formulas**, not a seeded product. Add a case here whenever you touch
+`costing.ts`, `production.ts`, `finance.ts`, `workforce.ts`, `suggest.ts`, `pricing.ts` or
+`scheduling.ts`.
 
 `prisma/cleanSlate.ts` (`db:clean`) is the opposite of the demo seed and shares its wipe
 list: every operational table to zero, uploads unlinked, and all six DocSequence

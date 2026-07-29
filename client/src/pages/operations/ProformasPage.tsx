@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import TrashDrawer, { TrashButton } from '../../components/TrashDrawer';
 import { App, Breadcrumb, Button, Card, Popconfirm, Segmented, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { HomeOutlined, PlusOutlined, EyeOutlined, EditOutlined, DeleteOutlined, FilePdfOutlined, MailOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
@@ -20,6 +21,7 @@ const FILTERS = ['All', 'Draft', 'Sent', 'Accepted', 'Rejected'] as const;
 export default function ProformasPage() {
   const navigate = useNavigate();
   const { hasRole } = useAuth();
+  const [trashOpen, setTrashOpen] = useState(false);
   const { message } = App.useApp();
   const qc = useQueryClient();
   const { data, isLoading } = useProformas();
@@ -44,8 +46,13 @@ export default function ProformasPage() {
       title: 'Buyer',
       dataIndex: ['buyer', 'name'],
       render: (v, r) => (
-        <Space size={4}>
+        <Space size={4} wrap>
           {v}
+          {/* The market explains the currency, and why some quotes carry GST. */}
+          <Tag color={r.buyer.market === 'DOMESTIC' ? 'geekblue' : 'gold'} style={{ marginInlineEnd: 0 }}>
+            {r.buyer.market === 'DOMESTIC' ? 'Domestic' : 'Overseas'}
+          </Tag>
+          {r.buyer.channel === 'B2C' && <Tag style={{ marginInlineEnd: 0 }}>B2C</Tag>}
           {!r.buyer.email && (
             <Tooltip title="No e-mail on this buyer — add one to send by mail">
               <Tag color="orange" style={{ marginInlineEnd: 0 }}>
@@ -115,16 +122,32 @@ export default function ProformasPage() {
             {waiting > 0 ? ` ${waiting} waiting on a reply.` : ''}
           </Text>
         </div>
-        {hasRole('Operator') && (
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/operations/proformas/new')}>
-            New Proforma
-          </Button>
-        )}
+        <Space>
+          {hasRole('Manager') && <TrashButton endpoint="/proformas" onClick={() => setTrashOpen(true)} />}
+          {hasRole('Operator') && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/operations/proformas/new')}>
+              New Proforma
+            </Button>
+          )}
+        </Space>
       </div>
       <Card size="small">
         <Segmented style={{ marginBottom: 12 }} value={filter} onChange={(v) => setFilter(v as (typeof FILTERS)[number])} options={FILTERS as unknown as string[]} />
         <Table<Proforma> rowKey="id" size="small" loading={isLoading} columns={columns} dataSource={rows} pagination={{ pageSize: 20, hideOnSinglePage: true }} scroll={{ x: 1000 }} />
       </Card>
+      <TrashDrawer
+        open={trashOpen}
+        onClose={() => setTrashOpen(false)}
+        title="Deleted proformas"
+        endpoint="/proformas"
+        label="Proforma"
+        queryKeys={[['proformas'], ['ops-dashboard']]}
+        columns={[
+          { title: 'Number', width: 150, render: (r) => <b>{String(r.number)}</b> },
+          { title: 'Buyer', render: (r) => String((r.buyer as { name?: string } | undefined)?.name ?? '—') },
+          { title: 'Status', width: 110, render: (r) => <Tag>{String(r.status)}</Tag> },
+        ]}
+      />
     </div>
   );
 }

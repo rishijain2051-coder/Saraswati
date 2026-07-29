@@ -20,6 +20,8 @@ import { BUILTIN_METHODS, round } from '../src/lib/costing';
 import { computeCostSheet } from '../src/lib/productCosting';
 import { loadMethodMap } from '../src/lib/methods';
 import { seedManforceDefaults } from './manforceSeed';
+import { documentValueOf } from '../src/lib/pricing';
+import { ensureCompany } from '../src/lib/company';
 import { wipeOperational as wipe } from './wipe';
 
 const prisma = new PrismaClient();
@@ -575,6 +577,28 @@ async function ensureConfig() {
   }
   for (const m of BUILTIN_METHODS) await prisma.costMethod.upsert({ where: { code: m.code }, update: { ...m, isBuiltIn: true }, create: { ...m, isBuiltIn: true } });
 
+  // Who we are. `state` is not decoration: it is what makes a Rajasthan buyer CGST+SGST
+  // and a Maharashtra buyer IGST, so the demo sets it explicitly rather than defaulting.
+  await ensureCompany();
+  await prisma.company.update({
+    where: { id: 1 },
+    data: {
+      legalName: 'Saraswati Export',
+      tradeName: 'Furniture & Hardware Exporter',
+      addressL1: 'Plot 44, Boranada Industrial Area',
+      city: 'Jodhpur',
+      state: 'Rajasthan',
+      pincode: '342012',
+      country: 'India',
+      gstNo: '08ABCDE1234F1Z5',
+      panNo: 'ABCDE1234F',
+      iecNo: '0812345678',
+      phone: '+91 291 2740 155',
+      email: 'exports@saraswatiexport.in',
+      bankDetails: 'Bank: State Bank of India, Sardarpura, Jodhpur\nA/C: 3812 4457 9910\nIFSC: SBIN0031234\nSWIFT: SBININBB245',
+    },
+  });
+
   const units = [['PCS', 'Pieces'], ['SET', 'Set'], ['KGS', 'Kilograms'], ['CFT', 'Cubic Feet'], ['SQFT', 'Square Feet'], ['SQM', 'Square Metre'], ['MTR', 'Metre'], ['LTR', 'Litre'], ['LOT', 'Lot']];
   for (let i = 0; i < units.length; i++) await prisma.unit.upsert({ where: { code: units[i][0] }, update: { name: units[i][1], sortOrder: i }, create: { code: units[i][0], name: units[i][1], sortOrder: i } });
 
@@ -595,6 +619,8 @@ async function ensureConfig() {
     }
   }
 
+  /** How long each stage usually takes, so a generated schedule is believable. */
+  const STAGE_DAYS: Record<string, number> = { 'Raw joining': 4, 'Raw sanding': 2, 'Polishing': 3, 'Accessory fitting': 2, 'QC': 1, 'Packaging': 1, 'Powder coating': 3, 'Fitting': 2, 'Packing': 1};
   const stageLines = [
     { code: 'X', name: 'Wood line', isDefault: true, steps: ['Raw joining', 'Raw sanding', 'Polishing', 'Accessory fitting', 'QC', 'Packaging'] },
     { code: 'Y', name: 'Metal line', isDefault: false, steps: ['Raw joining', 'Powder coating', 'Fitting', 'QC', 'Packing'] },
@@ -606,13 +632,16 @@ async function ensureConfig() {
       ? await prisma.stageLine.update({ where: { code: sl.code }, data: { name: sl.name, isDefault: sl.isDefault, isActive: true } })
       : await prisma.stageLine.create({ data: { code: sl.code, name: sl.name, isDefault: sl.isDefault } });
     await prisma.stageLineStep.deleteMany({ where: { stageLineId: rec.id } });
-    for (let i = 0; i < sl.steps.length; i++) await prisma.stageLineStep.create({ data: { stageLineId: rec.id, name: sl.steps[i], sortOrder: i } });
+    for (let i = 0; i < sl.steps.length; i++) await prisma.stageLineStep.create({ data: { stageLineId: rec.id, name: sl.steps[i], sortOrder: i, defaultDays: STAGE_DAYS[sl.steps[i]] ?? null } });
     lineId[sl.code] = rec.id;
   }
 
   for (const s of [
     { key: 'PI', prefix: 'PI', useYear: true },
     { key: 'ORD', prefix: 'ORD', useYear: true },
+    // Domestic paperwork is numbered independently of the export series.
+    { key: 'DPI', prefix: 'DPI', useYear: true },
+    { key: 'DORD', prefix: 'DORD', useYear: true },
     { key: 'OP', prefix: 'OP', useYear: false },
   ]) {
     await prisma.docSequence.upsert({ where: { key: s.key }, update: { prefix: s.prefix, useYear: s.useYear }, create: s });
@@ -633,17 +662,49 @@ async function main() {
   const pcs = (await prisma.unit.findUnique({ where: { code: 'PCS' } }))!;
 
   // --- buyers -------------------------------------------------------------
+  /** The optional fields only some demo buyers carry. */
+  type DemoBuyer = { contactName?: string; email?: string; market?: string; channel?: string; state?: string; gstNo?: string };
   const buyerDefs = [
     { code: 'AB', name: 'Ashford & Barnes Ltd.', country: 'United Kingdom', contactName: 'James Ashford', email: 'buying@ashfordbarnes.co.uk', phone: '+44 20 7946 0112', address: 'Unit 14, Kingsland Trade Park\nLondon E8 4QN', currency: gbp },
     { code: 'HG', name: 'Heritage Home Goods', country: 'United States', contactName: 'Laura Chen', email: 'purchasing@heritagehome.com', phone: '+1 415 555 0184', address: '2200 Bayshore Blvd\nSan Francisco, CA 94134', currency: usd },
     { code: 'MW', name: 'Möbelwerk Hansa GmbH', country: 'Germany', contactName: 'Anke Brandt', email: 'einkauf@moebelwerk-hansa.de', phone: '+49 40 3199 2255', address: 'Speicherstadt 8\n20457 Hamburg', currency: eur },
+    // --- domestic ---------------------------------------------------------
+    // Trade, in our own state: the tax splits CGST + SGST.
+    {
+      code: 'JF', name: 'Jodhpur Furnishings', country: 'India', contactName: 'Mahendra Singh', email: 'orders@jodhpurfurnishings.in', phone: '+91 291 2510 880',
+      address: '112 Sardarpura C Road\nJodhpur 342003', currency: inr, market: 'DOMESTIC', channel: 'B2B', state: 'Rajasthan', gstNo: '08AAFCJ4567K1Z9',
+    },
+    // Trade, another state: the identical money becomes IGST.
+    {
+      code: 'UD', name: 'Urban Decor Mumbai', country: 'India', contactName: 'Priya Nair', email: 'buying@urbandecor.in', phone: '+91 22 2673 4410',
+      address: 'Unit 6, Kamala Mills\nLower Parel, Mumbai 400013', currency: inr, market: 'DOMESTIC', channel: 'B2B', state: 'Maharashtra', gstNo: '27AAGCU7788L1ZB',
+    },
+    // Retail: domestic B2C, no GSTIN.
+    {
+      code: 'WLK', name: 'Rekha Bhandari', country: 'India', phone: '+91 94140 33221',
+      address: 'B-24 Shastri Nagar\nJodhpur 342003', currency: inr, market: 'DOMESTIC', channel: 'B2C', state: 'Rajasthan',
+    },
   ];
-  const buyers: Record<string, { id: number; name: string; currencyId: number; rate: number }> = {};
+  const buyers: Record<string, { id: number; name: string; currencyId: number; rate: number; market: string }> = {};
   for (const b of buyerDefs) {
-    const rec = await prisma.buyer.create({ data: { code: b.code, name: b.name, country: b.country, contactName: b.contactName, email: b.email, phone: b.phone, address: b.address } });
-    buyers[b.code] = { id: rec.id, name: rec.name, currencyId: b.currency.id, rate: b.currency.rateToBase };
+    const rec = await prisma.buyer.create({
+      data: {
+        code: b.code,
+        name: b.name,
+        country: b.country,
+        contactName: (b as DemoBuyer).contactName ?? null,
+        email: (b as DemoBuyer).email ?? null,
+        phone: b.phone,
+        address: b.address,
+        market: (b as DemoBuyer).market ?? 'OVERSEAS',
+        channel: (b as DemoBuyer).channel ?? 'B2B',
+        state: (b as DemoBuyer).state ?? null,
+        gstNo: (b as DemoBuyer).gstNo ?? null,
+      },
+    });
+    buyers[b.code] = { id: rec.id, name: rec.name, currencyId: b.currency.id, rate: b.currency.rateToBase, market: rec.market };
   }
-  console.log(`  ${buyerDefs.length} buyers`);
+  console.log(`  ${buyerDefs.length} buyers (${buyerDefs.filter((b) => (b as DemoBuyer).market === 'DOMESTIC').length} domestic)`);
 
   // --- suppliers ----------------------------------------------------------
   const supplierDefs = [
@@ -710,6 +771,10 @@ async function main() {
         alias: p.alias,
         status: 'Active',
         description: p.description,
+        // Wooden furniture is HSN 9403 at 18%. Only used on domestic documents; an
+        // export is zero-rated regardless.
+        hsnCode: '9403',
+        gstRatePct: 18,
         itemTypeId: attrId.ITEM_TYPE[p.itemType],
         productTypeId: attrId.PRODUCT_TYPE[p.type],
         sizeId: attrId.SIZE[p.size],
@@ -781,41 +846,75 @@ async function main() {
   // --- selling prices from the real costing engine -------------------------
   const methods = await loadMethodMap();
   const fobInr: Record<string, number> = {};
+  const nonFobInr: Record<string, number> = {};
   for (const code of Object.keys(productIds)) {
     const full = await prisma.product.findUnique({ where: { id: productIds[code] }, include: { costSheets: { where: { isActive: true }, include: { groups: { include: { lines: true } } } } } });
     const computed = computeCostSheet(full?.costSheets?.[0], methods) as any;
     fobInr[code] = computed?.summary?.fob ?? 0;
+    nonFobInr[code] = computed?.summary?.nonFob ?? 0;
   }
   /** Quoted price = FOB converted to the buyer's currency, nudged to a round number. */
   const priceIn = (code: string, rate: number, uplift = 1.06) => {
     const raw = (fobInr[code] / rate) * uplift;
     return Math.round(raw / 5) * 5;
   };
+  /**
+   * Domestic list price, in rupees, off Non-FOB — the same roll-up with the Forwarding
+   * head (CHA, forwarder, ICD) excluded, because none of that applies to a lorry to
+   * Mumbai. Uplifted a little more than export: retail carries more margin.
+   */
+  const domesticPrice = (code: string, uplift = 1.12) => Math.round((nonFobInr[code] * uplift) / 10) * 10;
 
   // --- proformas + orders -------------------------------------------------
+  const ourStateSeed = (await prisma.company.findUnique({ where: { id: 1 } }))?.state ?? null;
   let piNo = 0;
   let ordNo = 0;
+  let dpiNo = 0;
+  let dordNo = 0;
   const nextPi = () => `PI-${YEAR}-${String(++piNo).padStart(4, '0')}`;
   const nextOrd = () => `ORD-${YEAR}-${String(++ordNo).padStart(4, '0')}`;
+  // Domestic paperwork is numbered independently of the export series.
+  const nextDpi = () => `DPI-${YEAR}-${String(++dpiNo).padStart(4, '0')}`;
+  const nextDord = () => `DORD-${YEAR}-${String(++dordNo).padStart(4, '0')}`;
 
-  interface PfLine { code: string; qty: number }
-  async function makeProforma(opts: { buyer: 'AB' | 'HG' | 'MW'; days: number; lines: PfLine[]; status: string; sentDays?: number; decidedDays?: number; rejectReason?: string; incoterms?: string; validDays?: number }) {
+  interface PfLine { code: string; qty: number; discountPct?: number }
+  type BuyerCode = 'AB' | 'HG' | 'MW' | 'JF' | 'UD' | 'WLK';
+  interface ChargeDef { name: string; kind?: 'CHARGE' | 'DISCOUNT'; amount?: number; pct?: number; gstRatePct?: number; isTaxable?: boolean }
+  async function makeProforma(opts: {
+    buyer: BuyerCode;
+    days: number;
+    lines: PfLine[];
+    status: string;
+    sentDays?: number;
+    decidedDays?: number;
+    rejectReason?: string;
+    incoterms?: string;
+    validDays?: number;
+    charges?: ChargeDef[];
+  }) {
     const b = buyers[opts.buyer];
+    const domestic = b.market === 'DOMESTIC';
     const pf = await prisma.proforma.create({
       data: {
-        number: nextPi(),
+        number: domestic ? nextDpi() : nextPi(),
         buyerId: b.id,
         currencyId: b.currencyId,
         status: opts.status,
         date: ago(opts.days),
         validUntil: ago(opts.days - (opts.validDays ?? 30)),
-        paymentTerms: '30% advance against PI, balance against B/L copy',
-        deliveryTerms: `${opts.lines.reduce((a, l) => a + l.qty, 0) > 60 ? '75' : '55'} days from advance receipt`,
-        incoterms: opts.incoterms ?? 'FOB Mundra',
+        paymentTerms: domestic ? '50% advance, balance on delivery' : '30% advance against PI, balance against B/L copy',
+        deliveryTerms: domestic ? '21 days from confirmation' : `${opts.lines.reduce((a, l) => a + l.qty, 0) > 60 ? '75' : '55'} days from advance receipt`,
+        // Incoterms are an export concept; a domestic sale has delivery terms instead.
+        incoterms: domestic ? null : opts.incoterms ?? 'FOB Mundra',
         bankDetails: 'Bank: State Bank of India, Sardarpura, Jodhpur\nA/C: 3812 4457 9910\nIFSC: SBIN0031234\nSWIFT: SBININBB245',
         notes: 'Prices valid 30 days. Packing: 7-ply export carton, 1 pc per carton. Photographs indicative of finish.',
         showImages: true,
         exchangeRate: b.rate,
+        // The tax basis, frozen as the app freezes it — so a later address correction
+        // cannot restate a document the buyer already holds.
+        taxMarket: b.market,
+        taxBuyerState: (buyerDefs.find((x) => x.code === opts.buyer) as DemoBuyer | undefined)?.state ?? null,
+        taxCompanyState: ourStateSeed,
         sentAt: opts.sentDays != null ? ago(opts.sentDays) : null,
         decidedAt: opts.decidedDays != null ? ago(opts.decidedDays) : null,
         rejectReason: opts.rejectReason ?? null,
@@ -823,34 +922,84 @@ async function main() {
         lines: {
           create: opts.lines.map((l, i) => {
             const def = PRODUCTS.find((p) => p.code === l.code)!;
-            return { productId: productIds[l.code], description: `${def.name} — ${def.alias}`, qty: l.qty, unitPrice: priceIn(l.code, b.rate), sortOrder: i };
+            return {
+              productId: productIds[l.code],
+              description: `${def.name} — ${def.alias}`,
+              qty: l.qty,
+              // Domestic is quoted off Non-FOB: no CHA, no forwarder, no ICD.
+              unitPrice: domestic ? domesticPrice(l.code) : priceIn(l.code, b.rate),
+              discountPct: l.discountPct ?? 0,
+              gstRatePct: domestic ? 18 : 0,
+              hsnCode: domestic ? '9403' : null,
+              sortOrder: i,
+            };
           }),
         },
+        charges: {
+          create: (opts.charges ?? []).map((c, i) => ({
+            name: c.name,
+            kind: c.kind ?? 'CHARGE',
+            amount: c.amount ?? 0,
+            pct: c.pct ?? 0,
+            gstRatePct: c.gstRatePct ?? 0,
+            isTaxable: c.isTaxable ?? true,
+            sortOrder: i,
+          })),
+        },
       },
-      include: { lines: true },
+      include: { lines: true, charges: true },
     });
     return pf;
   }
 
-  async function makeOrder(pf: { id: number; buyerId: number; currencyId: number | null; exchangeRate: number | null; lines: { productId: number | null; qty: number; unitPrice: number }[] }, opts: { days: number; deliveryDays: number; status: string }) {
+  async function makeOrder(
+    pf: {
+      id: number;
+      buyerId: number;
+      currencyId: number | null;
+      exchangeRate: number | null;
+      taxMarket?: string | null;
+      taxBuyerState?: string | null;
+      taxCompanyState?: string | null;
+      lines: { productId: number | null; qty: number; unitPrice: number; discountPct?: number; gstRatePct?: number; hsnCode?: string | null }[];
+      charges?: { name: string; kind: string; amount: number; pct: number; gstRatePct: number; isTaxable: boolean }[];
+    },
+    opts: { days: number; deliveryDays: number; status: string }
+  ) {
+    const domestic = Object.values(buyers).find((b) => b.id === pf.buyerId)?.market === 'DOMESTIC';
     const order = await prisma.order.create({
       data: {
-        number: nextOrd(),
+        number: domestic ? nextDord() : nextOrd(),
         buyerId: pf.buyerId,
         currencyId: pf.currencyId,
         status: opts.status,
         orderDate: ago(opts.days),
         deliveryDate: ago(-opts.deliveryDays),
-        incoterms: 'FOB Mundra',
+        incoterms: domestic ? null : 'FOB Mundra',
         exchangeRate: pf.exchangeRate,
         proformaId: pf.id,
         createdById: admin.id,
+        taxMarket: pf.taxMarket ?? null,
+        taxBuyerState: pf.taxBuyerState ?? null,
+        taxCompanyState: pf.taxCompanyState ?? null,
+        // Copied off the quote, exactly as accepting a PI does it.
+        charges: {
+          create: (pf.charges ?? []).map((c, i) => ({
+            name: c.name, kind: c.kind, amount: c.amount, pct: c.pct, gstRatePct: c.gstRatePct, isTaxable: c.isTaxable, sortOrder: i,
+          })),
+        },
       },
     });
     for (let i = 0; i < pf.lines.length; i++) {
       const l = pf.lines[i];
       const product = await prisma.product.findUnique({ where: { id: l.productId! }, select: { stageLineId: true } });
-      const line = await prisma.orderLine.create({ data: { orderId: order.id, productId: l.productId!, qty: l.qty, unitPrice: l.unitPrice, sortOrder: i, stageLineId: product?.stageLineId ?? null } });
+      const line = await prisma.orderLine.create({
+        data: {
+          orderId: order.id, productId: l.productId!, qty: l.qty, unitPrice: l.unitPrice,
+          discountPct: l.discountPct ?? 0, gstRatePct: l.gstRatePct ?? 0, hsnCode: l.hsnCode ?? null,
+          sortOrder: i, stageLineId: product?.stageLineId ?? null,
+        },
+      });
       const steps = await prisma.stageLineStep.findMany({ where: { stageLineId: product!.stageLineId! }, orderBy: { sortOrder: 'asc' } });
       for (let s = 0; s < steps.length; s++) await prisma.orderLineStage.create({ data: { orderLineId: line.id, name: steps[s].name, sortOrder: s } });
     }
@@ -954,7 +1103,49 @@ async function main() {
   const pf5 = await makeProforma({ buyer: 'MW', days: 9, sentDays: 8, status: 'Sent', lines: [{ code: 'MW-2701', qty: 22 }, { code: 'MW-2301', qty: 14 }] });
   const pf6 = await makeProforma({ buyer: 'HG', days: 21, sentDays: 20, decidedDays: 13, status: 'Rejected', rejectReason: 'Landed cost above their retail ladder — asked us to re-quote at 500+ pcs', lines: [{ code: 'HG-2601', qty: 120 }] });
   const pf7 = await makeProforma({ buyer: 'AB', days: 2, status: 'Draft', lines: [{ code: 'AB-2101', qty: 60 }, { code: 'AB-2401', qty: 20 }, { code: 'AB-2801', qty: 40 }] });
-  console.log(`  7 proformas (2 open, 1 rejected, 4 accepted), 4 orders`);
+
+  // --- domestic: rupees, GST, and charges on the document -------------------
+  //
+  // Three shapes worth seeing side by side. Jodhpur Furnishings is in our own state, so
+  // the tax splits CGST + SGST; Urban Decor is in Maharashtra, so the identical money
+  // becomes IGST; the walk-in is B2C with no GSTIN at all. All three carry freight and a
+  // discount at document level, which is what the buyer asked for.
+  const pf8 = await makeProforma({
+    buyer: 'JF', days: 26, sentDays: 25, decidedDays: 22, status: 'Accepted',
+    lines: [{ code: 'MW-2701', qty: 12 }, { code: 'AB-2102', qty: 8, discountPct: 5 }],
+    charges: [
+      { name: 'Freight to Sardarpura', amount: 4500, gstRatePct: 18 },
+      { name: 'Dealer discount', kind: 'DISCOUNT', pct: 4, gstRatePct: 18 },
+    ],
+  });
+  const dord1 = (await makeOrder(pf8, { days: 22, deliveryDays: 9, status: 'Production' }))!;
+  for (const line of dord1.lines) {
+    const st = line.stages;
+    await move(line.id, st, null, 0, line.qty, 20, 'Domestic batch released');
+    await move(line.id, st, 0, 2, Math.round(line.qty * 0.6), 12, 'Through joining and sanding');
+  }
+
+  const pf9 = await makeProforma({
+    buyer: 'UD', days: 15, sentDays: 14, decidedDays: 11, status: 'Accepted',
+    lines: [{ code: 'HG-2601', qty: 18 }],
+    charges: [
+      { name: 'Transport to Mumbai', amount: 16500, gstRatePct: 18 },
+      { name: 'Packing', amount: 3200, gstRatePct: 18 },
+    ],
+  });
+  const dord2 = (await makeOrder(pf9, { days: 11, deliveryDays: 18, status: 'Confirmed' }))!;
+
+  // Retail, still a live quote: one piece, a flat discount, delivery charged.
+  const pf10 = await makeProforma({
+    buyer: 'WLK', days: 4, sentDays: 3, status: 'Sent',
+    lines: [{ code: 'MW-2501', qty: 1 }],
+    charges: [
+      { name: 'Home delivery', amount: 900, gstRatePct: 18 },
+      { name: 'Festive discount', kind: 'DISCOUNT', amount: 2000, gstRatePct: 18 },
+    ],
+  });
+  console.log(`  10 proformas (3 open, 1 rejected, 6 accepted), 6 orders`);
+  console.log(`    domestic: ${pf8.number} -> ${dord1.number} (CGST+SGST), ${pf9.number} -> ${dord2.number} (IGST), ${pf10.number} open (B2C)`);
 
   // --- hand-over photos ---------------------------------------------------
   let photoCount = 0;
@@ -977,16 +1168,25 @@ async function main() {
   }
 
   // --- money --------------------------------------------------------------
+  // Through the one pricing engine, so a domestic order's value includes its charges
+  // and its GST. Summing qty x price here would make every receipt below the wrong size.
+  const ourState = (await prisma.company.findUnique({ where: { id: 1 } }))?.state ?? null;
   const value = async (orderId: number) => {
-    const o = await prisma.order.findUnique({ where: { id: orderId }, include: { lines: true } });
-    return round(o!.lines.reduce((a, l) => a + l.qty * l.unitPrice, 0));
+    const o = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { lines: true, charges: true, buyer: { select: { market: true, state: true } } },
+    });
+    return round(documentValueOf(o as never, ourState));
   };
   const v1 = await value(ord1.id);
   const v2 = await value(ord2.id);
   const v3 = await value(ord3.id);
   const v4 = await value(ord4.id);
+  const d1 = await value(dord1.id);
+  const d2 = await value(dord2.id);
 
-  const receipt = (buyerCode: 'AB' | 'HG' | 'MW', orderId: number | null, amount: number, days: number, ref: string) =>
+  const CCY: Record<string, string> = { AB: 'GBP', HG: 'USD', MW: 'EUR', JF: 'INR', UD: 'INR', WLK: 'INR' };
+  const receipt = (buyerCode: BuyerCode, orderId: number | null, amount: number, days: number, ref: string) =>
     prisma.ledgerEntry.create({
       data: {
         partyType: 'BUYER',
@@ -995,7 +1195,7 @@ async function main() {
         partyName: buyers[buyerCode].name,
         kind: 'PAYMENT',
         amount: round(amount),
-        currency: buyerCode === 'AB' ? 'GBP' : buyerCode === 'HG' ? 'USD' : 'EUR',
+        currency: CCY[buyerCode] ?? 'INR',
         date: ago(days),
         ref,
         createdById: admin.id,
@@ -1010,6 +1210,11 @@ async function main() {
   await receipt('HG', ord2.id, round(v2 * 0.3), 52, 'SWIFT 30% advance');
   // Möbelwerk: paid more than the order needs — the surplus waits on account.
   await receipt('MW', ord3.id, round(v3 * 1.1), 28, 'SEPA advance (over-remitted)');
+  // Domestic: the dealer paid half of the GST-inclusive total, the Mumbai order is
+  // wholly unpaid so the receivable shows the tax as well as the goods.
+  await receipt('JF', dord1.id, round(d1 * 0.5), 20, 'NEFT 50% advance');
+  // The Mumbai order is left wholly unpaid on purpose, so the receivable there shows
+  // the tax as well as the goods.
 
   // Jobwork: part-pay the polishers, leave the coaters running.
   await prisma.ledgerEntry.create({
@@ -1043,10 +1248,14 @@ async function main() {
   // Document counters continue from what the demo used.
   await prisma.docSequence.update({ where: { key: 'PI' }, data: { lastNo: piNo } });
   await prisma.docSequence.update({ where: { key: 'ORD' }, data: { lastNo: ordNo } });
+  await prisma.docSequence.update({ where: { key: 'DPI' }, data: { lastNo: dpiNo } });
+  await prisma.docSequence.update({ where: { key: 'DORD' }, data: { lastNo: dordNo } });
   await prisma.docSequence.update({ where: { key: 'OP' }, data: { lastNo: opNo } });
 
   console.log(`  ${photoCount} hand-over photos, ${opNo} material sheets`);
   console.log('\nOrder values:');
+  console.log(`  ${dord1.number}  INR ${d1.toLocaleString('en-IN')}  (domestic, CGST+SGST)`);
+  console.log(`  ${dord2.number}  INR ${d2.toLocaleString('en-IN')}  (domestic, IGST)`);
   for (const [n, v, c] of [
     [ord1.number, v1, 'GBP'],
     [ord2.number, v2, 'USD'],

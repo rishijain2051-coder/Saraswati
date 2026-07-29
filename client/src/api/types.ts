@@ -43,6 +43,38 @@ export interface Buyer {
   phone?: string | null;
   address?: string | null;
   isActive: boolean;
+  /** Trade or end customer. Independent of `market`, so all four combinations exist. */
+  channel: 'B2B' | 'B2C' | string;
+  /** OVERSEAS sells at FOB in their currency, zero-rated; DOMESTIC at Non-FOB with GST. */
+  market: 'OVERSEAS' | 'DOMESTIC' | string;
+  gstNo?: string | null;
+  /** Compared with the company's state to decide CGST+SGST versus IGST. */
+  state?: string | null;
+}
+
+/** Who WE are. Singleton, edited in Master Data -> Company. */
+export interface Company {
+  id: number;
+  legalName: string;
+  tradeName?: string | null;
+  addressL1?: string | null;
+  addressL2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  pincode?: string | null;
+  country: string;
+  gstNo?: string | null;
+  panNo?: string | null;
+  iecNo?: string | null;
+  cinNo?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  website?: string | null;
+  bankDetails?: string | null;
+  /** Letterhead logo, a filename in uploads. Served from `/uploads/<name>`. */
+  logoFilename?: string | null;
+  /** Present when saving left the tax split in a state worth mentioning. */
+  warning?: string;
 }
 
 export interface Meta {
@@ -200,6 +232,9 @@ export interface ProductDetail {
   piecesPerCarton?: number | null;
   volumeBeforePackingCbm?: number | null;
   volumeAfterPackingCbm?: number | null;
+  /** Tax classification for domestic sales. No effect on costing or on an export. */
+  hsnCode?: string | null;
+  gstRatePct?: number;
   itemType?: AttributeValue | null;
   productType?: AttributeValue | null;
   size?: AttributeValue | null;

@@ -1,9 +1,12 @@
-import { Badge, Breadcrumb, Card, Col, List, Row, Statistic, Tag, Typography } from 'antd';
+import { Badge, Breadcrumb, Card, Col, List, Row, Space, Statistic, Tag, Typography } from 'antd';
 import { HomeOutlined, FileDoneOutlined, FileTextOutlined, ShopOutlined, InboxOutlined, ProfileOutlined, WalletOutlined } from '@ant-design/icons';
 import { Link, useNavigate } from 'react-router-dom';
 import dayjs from 'dayjs';
-import { useOpsDashboard, PROFORMA_STATUS_COLOR } from '../../api/ops';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '../../api/client';
+import { useOpsDashboard, PROFORMA_STATUS_COLOR, type DeliveryStatusResponse } from '../../api/ops';
 import { num } from '../../util/format';
+import ForexSummaryCard, { useForexSummary } from '../../components/ForexSummaryCard';
 
 const { Title, Text } = Typography;
 
@@ -19,6 +22,10 @@ const SECTIONS = [
 export default function OperationsHome() {
   const navigate = useNavigate();
   const { data: d } = useOpsDashboard();
+
+  const { data: forex } = useForexSummary();
+  // Cheap and derived; the dashboard is the natural place to notice a slipping order.
+  const { data: delivery } = useQuery<DeliveryStatusResponse>({ queryKey: ['delivery-status'], queryFn: async () => (await api.get('/orders/delivery-status')).data });
 
   return (
     <div>
@@ -152,6 +159,38 @@ export default function OperationsHome() {
           </Col>
         ))}
       </Row>
+
+      {/* Only worth the space when something is actually late or slipping. */}
+      {delivery && ((delivery.counts.LATE ?? 0) > 0 || (delivery.counts.AT_RISK ?? 0) > 0) && (
+        <Card size="small" style={{ marginTop: 16 }} title="Delivery">
+          <Space size={28} wrap>
+            <Link to="/operations/delivery">
+              <Space size={6}>
+                <Text type="secondary">Late</Text>
+                <Text strong style={{ fontSize: 20, color: '#c62828' }}>
+                  {delivery.counts.LATE ?? 0}
+                </Text>
+              </Space>
+            </Link>
+            <Link to="/operations/delivery">
+              <Space size={6}>
+                <Text type="secondary">At risk</Text>
+                <Text strong style={{ fontSize: 20, color: '#ef6c00' }}>
+                  {delivery.counts.AT_RISK ?? 0}
+                </Text>
+              </Space>
+            </Link>
+            <Link to="/operations/delivery">See the delivery tracker</Link>
+          </Space>
+        </Card>
+      )}
+
+      {/* Only worth the space when money is actually owed in another currency. */}
+      {forex?.hasForeignExposure && (
+        <div style={{ marginTop: 16 }}>
+          <ForexSummaryCard compact />
+        </div>
+      )}
     </div>
   );
 }

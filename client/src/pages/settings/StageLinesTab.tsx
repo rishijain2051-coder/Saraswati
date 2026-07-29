@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { App, Button, Card, Empty, Input, Modal, Popconfirm, Space, Switch, Tag, Typography } from 'antd';
+import { App, Button, Card, Empty, Input, InputNumber, Modal, Popconfirm, Space, Switch, Tag, Tooltip, Typography } from 'antd';
 import { PlusOutlined, DeleteOutlined, EditOutlined, ArrowUpOutlined, ArrowDownOutlined, StarFilled } from '@ant-design/icons';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, apiError } from '../../api/client';
@@ -14,10 +14,10 @@ interface Draft {
   isDefault: boolean;
   isActive: boolean;
   notes: string;
-  steps: string[];
+  steps: { name: string; defaultDays: number | null }[];
 }
 
-const blank = (): Draft => ({ code: '', name: '', isDefault: false, isActive: true, notes: '', steps: ['Raw joining'] });
+const blank = (): Draft => ({ code: '', name: '', isDefault: false, isActive: true, notes: '', steps: [{ name: 'Raw joining', defaultDays: null }] });
 
 /**
  * Stage lines are the production routes a product can travel. Editing one is
@@ -36,7 +36,14 @@ export default function StageLinesTab() {
 
   const save = useMutation({
     mutationFn: (d: Draft) => {
-      const body = { code: d.code.trim(), name: d.name.trim(), isDefault: d.isDefault, isActive: d.isActive, notes: d.notes.trim() || null, steps: d.steps.map((s) => s.trim()).filter(Boolean) };
+      const body = {
+        code: d.code.trim(),
+        name: d.name.trim(),
+        isDefault: d.isDefault,
+        isActive: d.isActive,
+        notes: d.notes.trim() || null,
+        steps: d.steps.map((s) => ({ name: s.name.trim(), defaultDays: s.defaultDays })).filter((s) => s.name),
+      };
       return d.id ? api.patch(`/stage-lines/${d.id}`, body) : api.post('/stage-lines', body);
     },
     onSuccess: () => {
@@ -57,17 +64,18 @@ export default function StageLinesTab() {
   });
 
   const edit = (l: StageLine) =>
-    setDraft({ id: l.id, code: l.code, name: l.name, isDefault: l.isDefault, isActive: l.isActive, notes: l.notes ?? '', steps: l.steps.map((s) => s.name) });
+    setDraft({ id: l.id, code: l.code, name: l.name, isDefault: l.isDefault, isActive: l.isActive, notes: l.notes ?? '', steps: l.steps.map((s) => ({ name: s.name, defaultDays: s.defaultDays ?? null })) });
 
   const onSave = () => {
     if (!draft) return;
     if (!draft.code.trim()) return message.error('Give the line a short code, e.g. X.');
     if (!draft.name.trim()) return message.error('Give the line a name.');
-    if (draft.steps.map((s) => s.trim()).filter(Boolean).length === 0) return message.error('Add at least one stage.');
+    if (draft.steps.map((s) => s.name.trim()).filter(Boolean).length === 0) return message.error('Add at least one stage.');
     save.mutate(draft);
   };
 
-  const setStep = (i: number, value: string) => setDraft((d) => (d ? { ...d, steps: d.steps.map((s, j) => (j === i ? value : s)) } : d));
+  const setStep = (i: number, patch: Partial<{ name: string; defaultDays: number | null }>) =>
+    setDraft((d) => (d ? { ...d, steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)) } : d));
   const moveStep = (i: number, dir: -1 | 1) =>
     setDraft((d) => {
       if (!d) return d;
@@ -188,13 +196,23 @@ export default function StageLinesTab() {
               {draft.steps.map((s, i) => (
                 <Space.Compact key={i} style={{ width: '100%', marginBottom: 6 }}>
                   <Input style={{ width: 40, textAlign: 'center' }} value={i + 1} disabled />
-                  <Input value={s} placeholder="Stage name" onChange={(e) => setStep(i, e.target.value)} />
+                  <Input value={s.name} placeholder="Stage name" onChange={(e) => setStep(i, { name: e.target.value })} />
+                  <Tooltip title="How long this stage usually takes. Used to auto-schedule an order backwards from its delivery date; left empty it takes an equal share of what is left.">
+                    <InputNumber
+                      style={{ width: 104 }}
+                      min={0}
+                      placeholder="days"
+                      value={s.defaultDays ?? undefined}
+                      onChange={(v) => setStep(i, { defaultDays: v ?? null })}
+                      addonAfter="d"
+                    />
+                  </Tooltip>
                   <Button icon={<ArrowUpOutlined />} disabled={i === 0} onClick={() => moveStep(i, -1)} />
                   <Button icon={<ArrowDownOutlined />} disabled={i === draft.steps.length - 1} onClick={() => moveStep(i, 1)} />
                   <Button danger icon={<DeleteOutlined />} disabled={draft.steps.length === 1} onClick={() => setDraft({ ...draft, steps: draft.steps.filter((_, j) => j !== i) })} />
                 </Space.Compact>
               ))}
-              <Button size="small" icon={<PlusOutlined />} onClick={() => setDraft({ ...draft, steps: [...draft.steps, ''] })}>
+              <Button size="small" icon={<PlusOutlined />} onClick={() => setDraft({ ...draft, steps: [...draft.steps, { name: '', defaultDays: null }] })}>
                 Add stage
               </Button>
             </div>
